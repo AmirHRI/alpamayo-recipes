@@ -70,11 +70,15 @@ def evaluate(cfg: DictConfig) -> None:
             cfg.model.checkpoint_path = cfg.evaluate.eval_ckpt
         elif issubclass(model_cls, TrainableAlpamayoR1):
             if "from_pretrained_vlm" in cfg.model._target_:
-                # 2B expert: full Stage-2 checkpoint (vlm.* + expert.* + action_*)
+                # 2B expert: full Stage-2 checkpoint (vlm.* + expert.* + action_*).
+                # The Stage-2 checkpoint already contains the VLM weights, so skip
+                # reloading the Stage-1 VLM checkpoint.
                 cfg.model.stage2_checkpoint_path = cfg.evaluate.eval_ckpt
+                cfg.model.stage1_vlm_checkpoint_path = None
             else:
                 # 10B standard: HF from_pretrained on Stage-2 checkpoint dir
                 cfg.model.pretrained_model_name_or_path = cfg.evaluate.eval_ckpt
+                cfg.model.stage1_vlm_checkpoint_path = None
         else:
             raise ValueError(f"Unsupported model class: {model_cls}")
     model = hyu.instantiate(cfg.model, _convert_="partial")

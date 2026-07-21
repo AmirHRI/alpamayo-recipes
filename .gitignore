@@ -17,12 +17,15 @@ a1_sft/
 a1_5_sft/
 a1_5_eval/
 .venv/
+**/.venv/
 venv/
 env/
 
 # ---- Training / experiment artifacts ----
 outputs/
+outputs/*
 output_*/
+output_stage*
 training/
 wandb/
 *.log

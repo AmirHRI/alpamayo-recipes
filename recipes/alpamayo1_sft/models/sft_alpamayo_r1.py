@@ -17,7 +17,7 @@ import json
 from collections import defaultdict
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import einops
 import torch
@@ -102,18 +102,18 @@ class TrainableAlpamayoR1(AlpamayoR1):
         stop_grad_from_vlm: bool = True,
         stage1_vlm_checkpoint_path: str | None = None,
     ):
+        if stage1_vlm_checkpoint_path is not None:
+            raise ValueError(
+                "stage1_vlm_checkpoint_path is only supported by "
+                "TrainableAlpamayoR1.from_pretrained()"
+            )
+
         super().__init__(config, pretrained_modules, original_vocab_size)
 
         self.cotrain_vlm = cotrain_vlm
         self.stop_grad_from_vlm = stop_grad_from_vlm
 
-        # we only need the text config for the expert model
-        if stage1_vlm_checkpoint_path is not None:
-            self.vlm = load_alpamayo1_vlm(stage1_vlm_checkpoint_path, self.vlm)
-
-        if not self.cotrain_vlm:
-            for param in self.vlm.parameters():
-                param.requires_grad = False
+        self._set_vlm_trainability()
         # print the param count
         logger.info("Model parameter count:")
         param_count = misc.get_param_count(self)
@@ -180,14 +180,22 @@ class TrainableAlpamayoR1(AlpamayoR1):
         # 5. Build model:
         #    - VLM = 2B architecture, random init
         #    - expert = expert_num_layers-layer transformer, random init
-        #    - stage1_vlm_checkpoint_path handled inside __init__ → load_alpamayo1_vlm
         model = cls(
             ar1_config,
             pretrained_modules=pretrained_modules or None,
             cotrain_vlm=cotrain_vlm,
             stop_grad_from_vlm=stop_grad_from_vlm,
-            stage1_vlm_checkpoint_path=stage1_vlm_checkpoint_path,
         )
+
+        # 6. Overwrite the randomly initialised VLM with the Stage-1 fine-tuned
+        #    weights (single-file or sharded safetensors handled in load_alpamayo1_vlm).
+        if stage1_vlm_checkpoint_path is not None:
+            model.vlm = load_alpamayo1_vlm(
+                stage1_vlm_checkpoint_path,
+                model.vlm,
+                preserve_model_device_and_dtype=True,
+            )
+            model._set_vlm_trainability()
 
         if stage2_checkpoint_path is not None:
             # Eval path: load every saved tensor from the Stage-2 checkpoint
@@ -207,6 +215,34 @@ class TrainableAlpamayoR1(AlpamayoR1):
             )
 
         return model
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        *model_args: Any,
+        **kwargs: Any,
+    ) -> Self:
+        stage1_vlm_checkpoint_path = kwargs.pop("stage1_vlm_checkpoint_path", None)
+        model = super().from_pretrained(
+            pretrained_model_name_or_path,
+            *model_args,
+            **kwargs,
+        )
+
+        if stage1_vlm_checkpoint_path is not None:
+            model.vlm = load_alpamayo1_vlm(
+                stage1_vlm_checkpoint_path,
+                model.vlm,
+                preserve_model_device_and_dtype=True,
+            )
+
+        model._set_vlm_trainability()
+        return model
+
+    def _set_vlm_trainability(self) -> None:
+        for param in self.vlm.parameters():
+            param.requires_grad = self.cotrain_vlm
 
     def _process_traj_future_training(self, traj_data: dict[str, Any]) -> dict[str, Any]:
         """Process the trajectory future data for training."""
