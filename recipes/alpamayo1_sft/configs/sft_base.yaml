@@ -13,6 +13,7 @@ data:
     local_dir: ???
     chunk_ids: "0-99"
     use_default_keyframe: true
+    clip_uuid_filter: null
     vla_preprocess_args:
       generation_mode: false
   val_dataset:
@@ -21,6 +22,7 @@ data:
     local_dir: ???
     chunk_ids: "99-100"
     use_default_keyframe: true
+    clip_uuid_filter: null
     vla_preprocess_args:
       generation_mode: true
 paths:

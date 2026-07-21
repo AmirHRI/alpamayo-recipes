@@ -1,6 +1,6 @@
 key: null
-team: ???
-project: ???
+team: zrb20
+project: alpamayo1-sft-cosmos2b
 group: ${run_name}
 name: ${run_name}
 output_dir: ${paths.output_dir}

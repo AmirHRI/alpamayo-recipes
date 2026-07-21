@@ -1,7 +1,41 @@
+# ---- Python ----
 __pycache__/
-outputs/*
-*.egg-info
-output_stage*
-recipes/alpamayo1_5_eval/outputs/*
-# uv virtual environments created inside recipe directories
-**/a1_5_eval_test/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# ---- Virtual environments ----
+# (venvs already self-ignore via their own .gitignore, but be explicit)
+a1_sft/
+a1_5_sft/
+a1_5_eval/
+.venv/
+venv/
+env/
+
+# ---- Training / experiment artifacts ----
+outputs/
+output_*/
+training/
+wandb/
+*.log
+*.ckpt
+*.safetensors
+*.pt
+*.bin
+
+# ---- Local data / caches ----
+.cache/
+*.tmp
+tea_debug.log
+
+# ---- OS / editor ----
+.DS_Store
+Thumbs.db

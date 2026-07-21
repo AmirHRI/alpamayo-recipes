@@ -1,0 +1,29 @@
+defaults:
+  - sft_base
+  - /models/cosmos_reason2_2b_expert@model
+  - /wandb: cosmos2b_stage2
+  - _self_
+
+data:
+  train_dataset:
+    chunk_ids: "0-186"
+  val_dataset:
+    chunk_ids: "186-205"
+
+trainer:
+  report_to: wandb
+  # VLM is frozen so no gradient checkpointing or ZeRO needed
+  gradient_checkpointing: false
+  deepspeed: null
+  ddp_find_unused_parameters: true
+  per_device_train_batch_size: 4   # 1×2×4=8 effective, same as default
+  gradient_accumulation_steps: 1
+  learning_rate: 1e-4
+  warmup_steps: 100
+  num_train_epochs: 3
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage2_cosmos2b
+
+evaluate:
+  eval_ckpt: null

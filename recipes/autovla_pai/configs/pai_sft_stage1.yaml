@@ -1,0 +1,161 @@
+name: autovla-pai-sft-stage1
+description: >
+  Stage 1 SFT of AutoVLA (Qwen3-VL-8B) on Physical AI AV (PAI) dataset.
+  Trains VLM + transformer proposal head jointly.
+  No map polylines, no control head, no FM refiner.
+  Starts from wo_control_head.ckpt (Stage 1 nuPlan weights, no Stage 3 overhead).
+
+# ── PAI-specific data config (used by autovla_pai/train.py) ──────────────────
+pai:
+  pai_dir:          /data/datasets/physical_ai_av
+  train_chunk_ids:  "0-185"     # ~17 670 clips
+  val_chunk_ids:    "186-205"   #  ~1 896 clips
+
+# ── Model config (mirrors nuPlan Stage 1 transformer config) ─────────────────
+model:
+  simplified_prompt: true
+  include_acceleration: true
+  cameras:
+    - front_camera
+  action_mode: alpamayo
+  model_type: qwen3_vl
+  use_cot: false
+  pretrained_model_path: /data/sungyeonpark/ckpts/Qwen3-VL-8B-Instruct
+  train_vision_backbone: false
+  train_lm_backbone: true           # fine-tune the full LM backbone
+  codebook_cache_path: codebook_cache/nuplan_agent_vocab.pkl
+  trajectory:
+    num_poses: 8
+    interval_length: 0.5
+    time_horizon: 4.0
+    format: delta
+  tokens:
+    ignore_index: -100
+    assistant_id: [151644, 77091]   # <|im_start|> + assistant
+  video:
+    min_pixels: 109760
+    max_pixels: 109760
+  alpamayo:
+    trajectory_tokenizer: raw
+    use_flow_matching: true
+    n_waypoints: 8
+    predict_z: false
+    flow_matching_normalization: hybrid
+    # Normalization stats from nuPlan (reused; FM loss weight=0 so they don't affect training)
+    delta_median: [1.9273672103881836, 0.00505890604108572]
+    delta_mad:    [1.4997866960338442, 0.7348284578457333]
+    soft_clip_C:  [24.0, 6.0]
+    flow_matching_steps: 16
+    flow_matching_weight: 0         # Stage 1: supervised losses only, no FM
+    difficulty_weighting: false
+    use_history_trajectory: true
+    history_trajectory_format: raw
+    use_history_encoder: true
+    history_encoder_dim: 128
+    flow_matching_conditioning: plan_token
+    map_polylines:
+      enabled: false                # PAI has no HD-map polylines
+    swin_branch:
+      enabled: false
+    proposal_head:
+      enabled: true
+      train_alone: true
+      architecture: transformer
+      d_model: 256
+      n_heads: 4
+      n_layers: 3
+      ffn_dim: 512
+      dropout: 0.1
+      n_plan_tokens: 4
+      ego_state_dim: 12
+      use_ego_token: true
+      sigma0: 0.5
+      sigma0_infer: 0.0
+      dy_weight: 3.0
+      loss_weight: 1.0
+      proposal_grad_to_vlm: true
+      proposal_grad_to_vlm_scale_fixed: true
+      proposal_grad_to_vlm_warmup: 0
+      proposal_grad_to_vlm_scale: 0.7
+      proposal_grad_to_vlm_scale_start: 0.0
+      proposal_grad_to_vlm_scale_ramp_epochs: 0
+      proposal_grad_to_vlm_scale_ramp_start_epoch: 0
+    fm_net:
+      hidden_dim: 512
+      num_blocks: 6
+      cond_proj_dim: 256
+      time_embed_dim: 128
+      time_fourier_dim: 64
+
+# ── No Stage 3 structured reward ─────────────────────────────────────────────
+structured_rft:
+  enabled: false
+  control_head:
+    enabled: false
+  candidate_head:
+    enabled: false
+  proposal_fm_refiner:
+    enabled: false
+
+# ── Training config ───────────────────────────────────────────────────────────
+training:
+  devices: [0, 1, 2, 3]
+  checkpoint_dir: /data/achahe/alpamayo-recipes/recipes/autovla_pai/training/output_sft_stage1
+
+  # Load Stage 1 VLM + proposal head weights from the nuPlan ablation ckpt.
+  # This ckpt has no control_head keys, so there are no unexpected keys.
+  resume_from_checkpoint: /data/sungyeonpark/autovla/ckpts/paper/pool_size/wo_control_head.ckpt
+  resume_training_mode: weights_only   # fresh optimizer/scheduler
+
+  freeze_fm_net: true                  # fm_net is Stage 2; keep frozen in Stage 1
+
+  batch_size: 1                        # per-GPU; 4 GPUs = 16 total
+  accumulate_grad_batches: 2           # effective batch = 32 (matches nuPlan Stage 1)
+
+  learning_rate: 1.0e-5                # slightly lower than nuPlan 2e-5 (fine-tuning)
+  flow_matching_learning_rate: 5.0e-5  # for proposal head / alpamayo modules
+  fm_ema_decay: 0.999
+  vlm_min_lr_ratio: 0.5
+  fm_min_lr_ratio: 0.05
+
+  epochs: 5
+  early_stopping_monitor: val_loss
+  early_stopping_patience: 10
+
+  lr_warmup_step: auto
+  total_steps: auto
+  lr_decay_epochs: 5
+
+  num_workers: 4
+  weight_decay: 0.0
+  train_sample_size: null
+  checkpoint_every_n_epochs: 1
+
+  # Loss weights (match nuPlan Stage 1 transformer config)
+  vlm_ce_loss_weight: 0.1
+  proposal_supervised_loss_weight: 0.0
+  proposal_xy_loss_weight: 0.1
+  proposal_endpoint_loss_weight: 0.5
+  proposal_asym_dx_weight: 0.25
+  proposal_curvature_loss_weight: 0.0
+
+  # Diagnostics
+  log_proposal_xy_diagnostics: true
+  log_proposal_attn_every: 100
+
+# ── Inference (for val dataloader batch size) ─────────────────────────────────
+inference:
+  batch_size: 4
+  num_workers: 4
+  sample:
+    max_length: 2048
+    max_new_tokens: 512
+    temperature: 0.0
+    top_k: 0
+    top_p: 1.0
+
+# ── W&B logging ───────────────────────────────────────────────────────────────
+wandb:
+  enable: true
+  project: AutoVLA-PAI
+  name: autovla-pai-sft-stage1

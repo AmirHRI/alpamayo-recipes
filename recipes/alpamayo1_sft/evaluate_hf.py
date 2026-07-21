@@ -69,7 +69,12 @@ def evaluate(cfg: DictConfig) -> None:
         if issubclass(model_cls, TrainableReasoningVLA):
             cfg.model.checkpoint_path = cfg.evaluate.eval_ckpt
         elif issubclass(model_cls, TrainableAlpamayoR1):
-            cfg.model.pretrained_model_name_or_path = cfg.evaluate.eval_ckpt
+            if "from_pretrained_vlm" in cfg.model._target_:
+                # 2B expert: full Stage-2 checkpoint (vlm.* + expert.* + action_*)
+                cfg.model.stage2_checkpoint_path = cfg.evaluate.eval_ckpt
+            else:
+                # 10B standard: HF from_pretrained on Stage-2 checkpoint dir
+                cfg.model.pretrained_model_name_or_path = cfg.evaluate.eval_ckpt
         else:
             raise ValueError(f"Unsupported model class: {model_cls}")
     model = hyu.instantiate(cfg.model, _convert_="partial")
@@ -114,7 +119,8 @@ def evaluate(cfg: DictConfig) -> None:
         with torch.autocast("cuda", dtype=dtype_map[cfg.evaluate.torch_dtype]):
             metric_runner.run(model, data, output_batch)
 
-        batch_size = len(data["image_frames"])
+        # Use ego trajectory tensor — always [B, ...] regardless of model stage
+        batch_size = data["ego_history_xyz"].shape[0]
         gathered_batch_size = accelerator.gather_for_metrics(
             torch.tensor([batch_size], device=accelerator.device, dtype=torch.long)
         )

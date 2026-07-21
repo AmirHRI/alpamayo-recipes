@@ -22,7 +22,6 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from torch.utils.data import Dataset
 
-
 class PAIDataset(Dataset):
     """Dataset for loading and processing Alpamayo samples."""
 
@@ -43,6 +42,7 @@ class PAIDataset(Dataset):
         num_future_steps: int = 64,
         time_step: float = 0.1,
         reasoning_metadata: str | None = None,
+        clip_uuid_filter: str | None = None,
     ):
         """Initialize dataset.
 
@@ -67,6 +67,11 @@ class PAIDataset(Dataset):
             time_step: Seconds per step between trajectory samples.
             reasoning_metadata: Filename under ``local_dir`` for the reasoning parquet, in PAI
                 dataset it is "reasoning/ood_reasoning.parquet". If None, no reasoning data will be loaded.
+            clip_uuid_filter: Optional path to a text file with one clip UUID per line (e.g. an
+                LCDrive manifest such as ``lcdrive_train_clip_uuids.txt``). When set, the dataset is
+                restricted to the intersection of the chunk-selected clips and these UUIDs. This
+                enables training/validating on the exact official LCDrive split while still only
+                scanning the ``chunk_ids`` that are present on disk.
         """
         self.avdi = PhysicalAIAVDatasetLocalInterface(
             local_dir=local_dir,
@@ -76,6 +81,16 @@ class PAIDataset(Dataset):
             reasoning_metadata=reasoning_metadata,
         )
         self.clip_ids = self.avdi.get_all_clip_ids()
+        if clip_uuid_filter is not None:
+            with open(clip_uuid_filter, "r", encoding="utf-8") as f:
+                allowed = {line.strip() for line in f if line.strip()}
+            before = len(self.clip_ids)
+            self.clip_ids = [cid for cid in self.clip_ids if str(cid) in allowed]
+            print(
+                f"[PAIDataset] clip_uuid_filter='{clip_uuid_filter}': "
+                f"kept {len(self.clip_ids)}/{before} clips "
+                f"({len(allowed)} UUIDs in filter)."
+            )
         self.include_extr_intr = include_extr_intr
         self.use_default_keyframe = use_default_keyframe
         self.reshape_tensors_for_rl = reshape_tensors_for_rl

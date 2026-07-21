@@ -1,0 +1,26 @@
+defaults:
+  - sft_base
+  - /models/cosmos_reason2_2b@model
+  - /wandb: default
+  - _self_
+
+# Val split is chunk-based: every clip in a val chunk is held out entirely.
+# With chunks 0-205 downloaded, use 0-185 for training and 186-205 for validation.
+data:
+  train_dataset:
+    chunk_ids: "0-186"   # chunks 0–185 (range-end is exclusive)
+  val_dataset:
+    chunk_ids: "186-205"     # chunks 186-205 held-out for validation
+
+trainer:
+  report_to: wandb
+  lr_multiplier:
+    vlm.model.visual: 0.1
+  ddp_find_unused_parameters: false
+  gradient_accumulation_steps: 4
+  learning_rate: 1e-5
+  warmup_steps: 500
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage1_cosmos2b
+evaluate:
+  eval_ckpt: null

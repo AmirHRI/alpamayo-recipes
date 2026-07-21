@@ -78,9 +78,11 @@ def load_alpamayo1_vlm(checkpoint_path: str, model: Any):
     # Load fine-tuned vlm.* weights from the checkpoint directory.
     checkpoint_dir = Path(checkpoint_path)
     index_path = checkpoint_dir / "model.safetensors.index.json"
+    single_shard_path = checkpoint_dir / "model.safetensors"
     vlm_state_dict: dict[str, torch.Tensor] = {}
 
     if index_path.exists():
+        # Sharded checkpoint (large models: 8B+)
         with index_path.open("r", encoding="utf-8") as f:
             weight_map: dict[str, str] = json.load(f).get("weight_map", {})
 
@@ -95,6 +97,11 @@ def load_alpamayo1_vlm(checkpoint_path: str, model: Any):
             for key in keys:
                 if key in shard_sd:
                     vlm_state_dict[key] = shard_sd[key]
+
+    elif single_shard_path.exists():
+        # Single-file checkpoint (small models: 2B)
+        shard_sd = load_safetensors_file(str(single_shard_path), device="cpu")
+        vlm_state_dict = {k: v for k, v in shard_sd.items() if k.startswith("vlm.")}
 
     if not vlm_state_dict:
         raise ValueError(f"No vlm.* tensors found in checkpoint: {checkpoint_dir}")
@@ -168,6 +175,147 @@ class TrainableReasoningVLA(ReasoningVLA, TrajectoryFusionWithFutureMixin):
     ) -> None:
         super().__init__(config, pretrained_modules, original_vocab_size, print_param_count)
 
+    @staticmethod
+    def _read_alpamayo_config(checkpoint_path: str) -> dict[str, Any]:
+        """Read trajectory tokenizer and image-resolution settings from an Alpamayo config.json.
+
+        Accepts two directory layouts:
+
+        * **Local download** (``huggingface-cli download … --local-dir /path``):
+          ``/path/config.json`` exists directly.
+        * **HuggingFace hub cache** (``~/.cache/huggingface/hub/`` or a custom
+          ``HF_HUB_CACHE``): ``/path/snapshots/<sha>/config.json``.  The latest
+          snapshot (alphabetically last SHA) is used.
+
+        Args:
+            checkpoint_path: Path to the checkpoint root (flat local dir or HF
+                hub cache model directory such as
+                ``hub/models--nvidia--Alpamayo-R1-10B``).
+
+        Returns:
+            Dict with keys ``vlm_backend``, ``traj_tokenizer_cfg``,
+            ``hist_traj_tokenizer_cfg``, ``traj_vocab_size``,
+            ``tokens_per_history_traj``, ``tokens_per_future_traj``,
+            ``model_dtype``, ``attn_implementation``, ``min_pixels``,
+            ``max_pixels``, ``add_special_tokens``.
+        """
+        config_path = Path(checkpoint_path) / "config.json"
+        if not config_path.exists():
+            # HF hub cache layout: look inside snapshots/
+            snapshots_dir = Path(checkpoint_path) / "snapshots"
+            if snapshots_dir.is_dir():
+                candidates = sorted(snapshots_dir.iterdir())
+                if candidates:
+                    config_path = candidates[-1] / "config.json"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"config.json not found under: {checkpoint_path}\n"
+                "Expected either a flat local dir or an HF hub cache directory."
+            )
+        with config_path.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        return {
+            "vlm_backend": cfg.get("vlm_backend", "qwenvl3"),
+            "traj_tokenizer_cfg": cfg.get("traj_tokenizer_cfg"),
+            "hist_traj_tokenizer_cfg": cfg.get("hist_traj_tokenizer_cfg"),
+            "traj_vocab_size": cfg.get("traj_vocab_size"),
+            "tokens_per_history_traj": cfg.get("tokens_per_history_traj"),
+            "tokens_per_future_traj": cfg.get("tokens_per_future_traj"),
+            "model_dtype": cfg.get("model_dtype", "bfloat16"),
+            "attn_implementation": cfg.get("attn_implementation", "flash_attention_2"),
+            "min_pixels": cfg.get("min_pixels"),
+            "max_pixels": cfg.get("max_pixels"),
+            "add_special_tokens": cfg.get("add_special_tokens", True),
+        }
+
+    @classmethod
+    def from_pretrained_vlm(
+        cls,
+        vlm_name_or_path: str,
+        alpamayo_config_path: str | None = None,
+        checkpoint_path: str | None = None,
+        **kwargs: Any,
+    ) -> "TrainableReasoningVLA":
+        """Load from any standard Qwen3-VL HuggingFace checkpoint (e.g. nvidia/Cosmos-Reason2-2B).
+
+        Unlike ``from_alpamayo_checkpoint``, this loads VLM weights directly from the
+        HuggingFace hub (no Alpamayo-specific checkpoint format required).
+
+        The trajectory tokenizer and image-resolution settings can be loaded from an
+        existing Alpamayo checkpoint via ``alpamayo_config_path`` — this is the
+        recommended way to ensure the tokenizer is identical to the original model.
+        Any key can still be overridden by passing it as a keyword argument.
+
+        Args:
+            vlm_name_or_path: HuggingFace model ID or local path for any Qwen3-VL
+                model, e.g. ``"nvidia/Cosmos-Reason2-2B"`` or a local dir.
+            alpamayo_config_path: Optional path to an Alpamayo checkpoint root (flat
+                local dir **or** HF hub cache model directory such as
+                ``hub/models--nvidia--Alpamayo-R1-10B``).  When supplied, all
+                trajectory tokenizer settings (``traj_tokenizer_cfg``,
+                ``hist_traj_tokenizer_cfg``, ``traj_vocab_size``,
+                ``tokens_per_{history,future}_traj``, ``min/max_pixels``, …) are
+                read from that checkpoint's ``config.json``.  Individual kwargs
+                still take precedence if explicitly passed.
+            checkpoint_path: Optional path to a fine-tuned Stage-1 checkpoint
+                directory (produced by ``train_hf.py``).  When set, the model
+                skeleton is first built from ``vlm_name_or_path`` / ``alpamayo_config_path``,
+                then the ``vlm.*`` weights are loaded from this checkpoint — identical
+                to what ``from_alpamayo_checkpoint`` does, but starting from a
+                Cosmos/Qwen base instead of Alpamayo-R1-10B.  This is used by
+                ``evaluate_hf.py`` which sets ``cfg.model.checkpoint_path``.
+            **kwargs: Any ``ReasoningVLAConfig`` field (e.g. ``traj_vocab_size``,
+                ``tokens_per_future_traj``, ``min_pixels``, …) to override the
+                defaults or the values read from ``alpamayo_config_path``.
+
+        Returns:
+            Initialised ``TrainableReasoningVLA`` with pretrained VLM weights and
+            the configured trajectory tokenizers.
+        """
+        # Start from Alpamayo config if provided, else use sensible defaults
+        if alpamayo_config_path is not None:
+            config_kwargs = cls._read_alpamayo_config(alpamayo_config_path)
+        else:
+            config_kwargs = {
+                "vlm_backend": "qwenvl3",
+                "traj_tokenizer_cfg": None,
+                "hist_traj_tokenizer_cfg": None,
+                "traj_vocab_size": 4000,
+                "tokens_per_history_traj": 48,
+                "tokens_per_future_traj": 128,
+                "model_dtype": "bfloat16",
+                "attn_implementation": "flash_attention_2",
+                "min_pixels": None,
+                "max_pixels": None,
+                "add_special_tokens": True,
+            }
+
+        # Explicit kwargs override whatever was loaded / defaulted
+        config_kwargs.update(kwargs)
+
+        # Fall back to DeltaTrajectoryTokenizer if no future tokenizer cfg provided
+        if config_kwargs.get("traj_tokenizer_cfg") is None:
+            config_kwargs["traj_tokenizer_cfg"] = {
+                "_target_": "alpamayo_r1.models.delta_tokenizer.DeltaTrajectoryTokenizer",
+                "num_bins": config_kwargs["traj_vocab_size"],
+                "load_weights": False,
+            }
+
+        config = instantiate(
+            {
+                "_target_": f"alpamayo_r1.models.base_model.{cls.config_class.__name__}",
+                "_recursive_": False,
+                "_convert_": "all",
+                "vlm_name_or_path": vlm_name_or_path,
+                **config_kwargs,
+            }
+        )
+        model = cls.from_pretrained_submodules(config)
+        if checkpoint_path is not None:
+            logger.info(f"Loading fine-tuned VLM weights from Stage-1 checkpoint: {checkpoint_path}")
+            model = load_alpamayo1_vlm(checkpoint_path, model)
+        return model
+
     @classmethod
     def from_alpamayo_checkpoint(
         cls,
@@ -198,25 +346,8 @@ class TrainableReasoningVLA(ReasoningVLA, TrajectoryFusionWithFutureMixin):
         if not checkpoint_config_path.exists():
             raise FileNotFoundError(f"Missing config file: {checkpoint_config_path}")
 
-        with checkpoint_config_path.open("r", encoding="utf-8") as f:
-            checkpoint_config = json.load(f)
-
-        config_kwargs = {
-            "vlm_name_or_path": vlm_name_or_path,
-            "vlm_backend": checkpoint_config.get("vlm_backend", "qwenvl3"),
-            "traj_tokenizer_cfg": checkpoint_config.get("traj_tokenizer_cfg"),
-            "hist_traj_tokenizer_cfg": checkpoint_config.get("hist_traj_tokenizer_cfg"),
-            "traj_vocab_size": checkpoint_config.get("traj_vocab_size"),
-            "tokens_per_history_traj": checkpoint_config.get("tokens_per_history_traj"),
-            "tokens_per_future_traj": checkpoint_config.get("tokens_per_future_traj"),
-            "model_dtype": checkpoint_config.get("model_dtype", "bfloat16"),
-            "attn_implementation": checkpoint_config.get(
-                "attn_implementation", "flash_attention_2"
-            ),
-            "min_pixels": checkpoint_config.get("min_pixels"),
-            "max_pixels": checkpoint_config.get("max_pixels"),
-            "add_special_tokens": checkpoint_config.get("add_special_tokens", True),
-        }
+        config_kwargs = cls._read_alpamayo_config(checkpoint_path)
+        config_kwargs["vlm_name_or_path"] = vlm_name_or_path
         config = instantiate(
             {
                 "_target_": f"alpamayo_r1.models.base_model.{cls.config_class.__name__}",

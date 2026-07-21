@@ -1,0 +1,60 @@
+[project]
+name = "autovla-pai"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+  # ── Alpamayo infrastructure ──────────────────────────────────────────────
+  "alpamayo_r1",          # PAI metrics, action_space, geometry
+  "alpamayo-recipes",     # PAIDataset, MetricRunner, DistanceMetrics
+
+  # ── VLM / tensor stack (match versions validated on this machine) ────────
+  "torch==2.8.0",
+  "torchvision>=0.23.0",
+  "transformers>=4.57.0",
+  "accelerate>=1.5.0",
+  "tokenizers>=0.22.0",
+  "safetensors>=0.5.0",
+
+  # ── AutoVLA / SKIPlan runtime deps (nuplan-devkit excluded) ─────────────
+  # Install SKIPlan itself editable with --no-deps (see README):
+  #   uv pip install --python autovla_env/bin/python --no-deps -e /home/achahe/SKIPlan
+  "pytorch-lightning>=2.2.0",
+  "lightning-utilities>=0.14.0",
+  "torchmetrics>=1.7.0",
+  "peft",
+  "qwen-vl-utils>=0.0.10",
+  "einops>=0.8.0",
+  "timm>=1.0.0",
+  "opencv-python>=4.9.0",
+  "pyquaternion>=0.9.9",
+  "shapely>=2.0.0",
+
+  # ── Data / utilities ─────────────────────────────────────────────────────
+  "pandas",
+  "scipy",
+  "numpy",
+  "Pillow",
+  "pyyaml",
+  "tqdm",
+  "matplotlib",
+  "huggingface-hub>=0.34.0,<1.0",
+  "wandb>=0.17.0",
+]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["autovla_pai*"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[tool.uv.sources]
+alpamayo_r1     = { git = "https://github.com/NVlabs/alpamayo.git" }
+alpamayo-recipes = { path = "../../src", editable = true }
+
+[tool.ruff]
+line-length = 100
