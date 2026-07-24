@@ -25,8 +25,14 @@ mkdir -p "$OUT_DIR"
 cd "$RECIPE_DIR"
 
 # ── Weights & Biases ────────────────────────────────────────────────
-# WANDB_API_KEY must be available (export it in ~/.bashrc or the submit env).
-export WANDB_API_KEY="${WANDB_API_KEY:?set WANDB_API_KEY before submitting}"
+# Auth resolves via (1) WANDB_API_KEY if exported in the submit env, else
+# (2) ~/.netrc created by `wandb login`. Don't hard-fail if the env var is
+# unset, so the job still runs from a shell that didn't export it.
+if [[ -n "${WANDB_API_KEY:-}" ]]; then
+    export WANDB_API_KEY
+else
+    echo "[slurm] WANDB_API_KEY not set; falling back to ~/.netrc for W&B auth."
+fi
 
 # Single-GPU: SLURM allocates one GPU and sets CUDA_VISIBLE_DEVICES for us.
 # Unique master port per job to avoid collisions on shared nodes.
