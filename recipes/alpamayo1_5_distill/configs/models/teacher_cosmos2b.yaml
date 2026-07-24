@@ -1,0 +1,6 @@
+# A cheap stand-in teacher (Cosmos-Reason2-2B) for fast pipeline smoke tests.
+# Produces 2048-d hidden vectors. Swap for `teacher_ar1_5_10b` for real runs
+# (the 10B is the actual distillation teacher).
+_target_: alpamayo1_5_distill.models.distill_base_model.DistillReasoningVLA.from_pretrained_vlm
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format

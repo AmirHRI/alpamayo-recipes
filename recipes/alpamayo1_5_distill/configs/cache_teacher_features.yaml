@@ -1,0 +1,35 @@
+# Offline teacher-feature cache config (nav-demo smoke default).
+#
+# Consumed by scripts/generate_teacher_features.py. Reuses alpamayo1_5_sft's
+# shared config groups (sft_base -> collate_fn, trainer defaults) via
+# hydra.searchpath. The teacher runs WITH chain-of-thought in context
+# (distill_teacher_nav processor); the cached hidden at <traj_future_start> is
+# what the CoT-free student later matches.
+#
+# Default teacher = the 2B stand-in (fast). For a real cache, override:
+#   model=/models/teacher_ar1_5_10b
+defaults:
+  - sft_base
+  - /models@model: teacher_cosmos2b
+  - /vla_processor@data.cache_dataset.vla_preprocess_args: distill_teacher_nav
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+data:
+  cache_dataset:
+    _target_: alpamayo1_5_distill.data.distill_dataset.DistillNavDataset
+    _recursive_: false
+    local_dir: /data/datasets/physical_ai_av/
+    annotations_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
+    chunk_ids: [1519, 1657, 1984, 2368]
+    teacher_cache_path: null   # building the cache, not reading it
+    inject_cot: true           # teacher must see the annotation CoT
+    vla_preprocess_args:
+      generation_mode: false
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+task_name: alpamayo_1_5_distill_cache

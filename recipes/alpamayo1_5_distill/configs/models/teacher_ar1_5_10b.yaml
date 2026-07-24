@@ -1,0 +1,7 @@
+# The real teacher: released Alpamayo-1.5-10B, loaded as a DistillReasoningVLA so
+# it exposes `extract_tfs_hidden`. No projector (teacher_hidden_dim unset) — the
+# teacher only produces the raw hidden the student learns to match. Uses the
+# A1-format snapshot so the `alpamayo_r1.*` config namespace resolves in this env.
+_target_: alpamayo1_5_distill.models.distill_base_model.DistillReasoningVLA.from_alpamayo_checkpoint
+checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+vlm_name_or_path: Qwen/Qwen3-VL-8B-Instruct

@@ -1,0 +1,11 @@
+# Student: Cosmos-Reason2-2B VLM + latent-reasoning distillation head.
+# `teacher_hidden_dim` MUST equal the width of the cached teacher hidden vectors
+# (printed by scripts/generate_teacher_features.py and stored in the cache's
+# .meta.json). 4096 = Alpamayo-1.5-10B VLM width; 2048 = the 2B stand-in teacher.
+_target_: alpamayo1_5_distill.models.distill_base_model.DistillReasoningVLA.from_pretrained_vlm
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+checkpoint_path: null
+teacher_hidden_dim: 4096
+latent_loss_weight: 1.0
+latent_cosine_weight: 0.1

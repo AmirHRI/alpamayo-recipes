@@ -30,6 +30,7 @@ Each recipe folder contains its own README with installation and training instru
 | [`recipes/alpamayo1_sft/`](recipes/alpamayo1_sft/README.md)         | Alpamayo 1 supervised fine-tuning (HuggingFace Trainer + DeepSpeed)                     |
 | [`recipes/alpamayo1_5_sft/`](recipes/alpamayo1_5_sft/README.md)     | Alpamayo 1.5 SFT (HuggingFace Trainer + DeepSpeed)                                      |
 | [`recipes/alpamayo1_5_sft_qwen3_5/`](recipes/alpamayo1_5_sft_qwen3_5/README.md) | Alpamayo 1.5 SFT with a Qwen 3.5 (0.8B/2B) VLM backbone (experimental)      |
+| [`recipes/alpamayo1_5_distill/`](recipes/alpamayo1_5_distill/README.md) | Alpamayo 1.5 latent-reasoning distillation (10B → Cosmos-2B, VLM backbone)          |
 | [`recipes/alpamayo1_x_rl/`](recipes/alpamayo1_x_rl/README.md)       | Alpamayo 1 and 1.5 RL post-training (Cosmos-RL / GRPO)                                  |
 | [`recipes/alpamayo1_5_quant/`](recipes/alpamayo1_5_quant/README.md) | Alpamayo 1.5 quantization (Model Optimizer Toolkit / FP8 / NVFP4 + FP8 Mixed Precision) |
 
