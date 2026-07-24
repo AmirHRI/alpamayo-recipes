@@ -159,6 +159,65 @@ CUDA_VISIBLE_DEVICES=0 python profile_2b_inference.py \
   model.stage1_vlm_checkpoint_path=/path/to/output_stage1_cosmos2b_lcdrive/checkpoint-1500
 ```
 
+### Does downsizing actually pay off? (real 10B vs. real 2B, both trained)
+
+The comparisons above are all *architecture-only* (untrained checkpoints) —
+useful for isolating backbone efficiency, but not for the practical question
+of whether a 2B backbone is actually worth deploying. Since a real trained
+checkpoint exists for Cosmos-Reason2-2B, the released, fully-trained
+**Alpamayo-1.5-10B** (`nvidia/Alpamayo-1.5-10B`, 11.079B params, loaded via
+`config=sft_stage2_nav`, its native config/checkpoint format — the
+`alpamayo1_5.*` release-package config namespace, not `alpamayo_r1.*`, so
+point `model.pretrained_model_name_or_path` at a converted "A1-format"
+snapshot rather than the raw release download) makes a like-for-like
+comparison possible — same n=20 methodology, same real PAI sample:
+
+| | Alpamayo-1.5-10B (real) | Cosmos-Reason2-2B (real, checkpoint-1500) |
+|---|---|---|
+| Params | 11.079B | 2.580B |
+| Weights / peak VRAM | 20.65 / 21.56 GiB | 5.56 / 6.19 GiB |
+| Mean latency | 1365.4 ms (0.73 Hz) | 330.2 ms (3.03 Hz) |
+| **Median latency** | **1046.8 ms (0.96 Hz)** | **310.6 ms (3.22 Hz)** |
+| Std. dev | 780.5 ms (~57% of mean) | 139.3 ms (~42% of mean) |
+| Min / Max | 455.0 / 2374.1 ms | 155.1 / 774.8 ms |
+| Generated tokens (mean) | 63.5 | 8.3–21.7 across samples |
+| Diffusion loop, per step | 19.6 ms | 4.1 ms |
+
+**Downsizing to 2B is a real, roughly 3.4x median-latency win once both
+models are actually trained** (1047ms → 311ms) — not just an artifact of
+comparing a trained model against an untrained one. VRAM drops by a similar
+~3.5x. The 10B also generates a longer rollout on average before stopping
+(63.5 vs. single digits to ~20 tokens) and shows *even higher* relative
+variance (~57% of its mean vs. ~42%) — its run-to-run spread is wide enough
+that the 25th/75th percentiles (631ms / 2289ms) span most of the full
+min/max range, suggesting a bimodal-ish "stops early" vs. "rambles" split
+rather than a smooth distribution. The same tail-latency caveat from the
+Cosmos-Reason2-2B section applies here, more so: a 2.3x median-to-max ratio
+is a bigger deal for a bigger, already-slower model.
+
+**Methodological note:** this table reports the directly-measured overall
+latency and phase split (VLM-generate vs. diffusion-loop time, both
+instrumented on the real timed calls) rather than the script's
+prefill/per-token/"projected trained-model latency" decomposition. That
+decomposition calibrates by forcing generation caps of 1 and 64 tokens and
+assumes the 64-cap run actually produces 64 tokens — true for an untrained
+model (which never learns to stop), not guaranteed for an already-trained
+one that may stop early even under a synthetic cap. Since a real trained
+checkpoint's actual latency is being measured directly here, that
+projection is unnecessary for this comparison anyway.
+
+Reproduce (needs the A1-format-converted checkpoint, not the raw
+`nvidia/Alpamayo-1.5-10B` download, to match `alpamayo_r1`'s config
+namespace):
+```bash
+CUDA_VISIBLE_DEVICES=0 python profile_2b_inference.py \
+  config=sft_stage2_nav num_traj_samples=1 n_warmup=1 n_timed=20 instrument=1 \
+  model.pretrained_model_name_or_path=/path/to/models--nvidia--Alpamayo-1.5-10B-A1-format \
+  data.val_dataset.local_dir=/path/to/physical_ai_av/ \
+  data.val_dataset.annotations_path=/path/to/nav_demo_samples.json \
+  data.val_dataset.chunk_ids=[2368]
+```
+
 ### Why the expert's denoising step is slower
 
 `torch.profiler` on a single `expert.forward()` call (8 layers: 6
