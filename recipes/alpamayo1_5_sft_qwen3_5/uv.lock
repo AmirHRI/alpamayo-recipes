@@ -92,7 +92,7 @@ wheels = [
 [[package]]
 name = "alpamayo-r1"
 version = "0.1.0"
-source = { git = "https://github.com/AmirHRI/alpamayo.git?rev=d556ad32a1d752deb647f3d813500280649c92eb#d556ad32a1d752deb647f3d813500280649c92eb" }
+source = { git = "https://github.com/AmirHRI/alpamayo.git?rev=84c681632c7aa3b6a9f15b32c54ed1d9928445df#84c681632c7aa3b6a9f15b32c54ed1d9928445df" }
 dependencies = [
     { name = "accelerate" },
     { name = "av" },
@@ -161,7 +161,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = ">=1.12.0" },
-    { name = "alpamayo-r1", git = "https://github.com/AmirHRI/alpamayo.git?rev=d556ad32a1d752deb647f3d813500280649c92eb" },
+    { name = "alpamayo-r1", git = "https://github.com/AmirHRI/alpamayo.git?rev=84c681632c7aa3b6a9f15b32c54ed1d9928445df" },
     { name = "alpamayo-recipes", editable = "../../src" },
     { name = "av", specifier = ">=16.0.1" },
     { name = "deepspeed", specifier = "==0.19.1" },

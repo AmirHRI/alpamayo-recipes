@@ -57,24 +57,23 @@ The local clone adds:
   VLM backend.
 - `models/alpamayo_r1.py`: wires the above into
   `sample_trajectories_from_data_with_vlm_rollout` (the closed-loop inference
-  rollout).
+  rollout), and rebuilds its `attention_mask` as a standard 2D boolean
+  key-padding mask instead of a dense 4D additive-bias tensor —
+  `flash_attention_2`'s padding fast path (`_get_unpad_data`/`_upad_input`)
+  hard-requires the 2D form and silently computes out-of-bounds indices when
+  given the 4D one (the masked key range was already identical across every
+  query row, so this is a lossless, more portable representation, not a
+  behavior change).
 
 ## Status
 
 **Validated (real GPU, real Qwen/Qwen3.5-{0.8B,2B} checkpoints, real PAI
-camera data, both Stage 1 and Stage 2):**
+camera data):**
 - `scripts/build_base_checkpoint.py` for all four model configs.
 - `TrainableReasoningVLA.forward()` (Stage 1) and `TrainableAlpamayoR1.forward()`
-  (Stage 2) — the actual training path — for both the 0.8B and 2B tiers.
-
-**Known open issue:** `profile_qwen3_5_inference.py` (closed-loop rollout via
-`sample_trajectories_from_data_with_vlm_rollout`) crashes inside the expert's
-flash-attention call, downstream of the dense 4D `attention_mask` this method
-builds to handle per-sample variable-length generation stopping points across
-a batch — likely a flash-attention/padding-utility incompatibility with that
-specific mask shape, not yet root-caused. Does not affect training
-(`train_hf.py`/the forward-pass tests above), only closed-loop *inference*
-profiling/deployment.
+  (Stage 2) — the training path — for both the 0.8B and 2B tiers.
+- `profile_qwen3_5_inference.py` — the closed-loop inference rollout — for
+  both tiers, single-sample and batched (`num_traj_samples>1`).
 
 ## Installation
 

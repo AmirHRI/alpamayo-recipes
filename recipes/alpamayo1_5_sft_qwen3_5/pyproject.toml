@@ -62,7 +62,7 @@ override-dependencies = ["deepspeed==0.19.1", "transformers==5.14.1"]
 # (see `alpamayo_r1/models/hybrid_cache.py`), branched from the same commit
 # every other recipe's uv.lock pins alpamayo-r1 to
 # (4b96c546ce3416e7b1e4d86e7649662852c3c1ac), plus this recipe's patch on top.
-alpamayo_r1 = { git = "https://github.com/AmirHRI/alpamayo.git", rev = "d556ad32a1d752deb647f3d813500280649c92eb" }
+alpamayo_r1 = { git = "https://github.com/AmirHRI/alpamayo.git", rev = "84c681632c7aa3b6a9f15b32c54ed1d9928445df" }
 alpamayo-recipes = { path = "../../src", editable = true }
 
 [tool.ruff]
