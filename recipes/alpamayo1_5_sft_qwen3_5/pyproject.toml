@@ -19,10 +19,15 @@ dependencies = [
   "torchvision>=0.23.0",
   "transformers==5.14.1",
   "flash-attn>=2.8.3",
-  # Optional fast-path kernels for Qwen 3.5's Gated-DeltaNet (linear-attention)
-  # layers; falls back to a pure-PyTorch path if absent, just slower.
-  # "flash-linear-attention",
-  # "causal-conv1d",
+  # Fast-path kernels for Qwen 3.5's Gated-DeltaNet (linear-attention) layers.
+  # Without these, Qwen3_5's own code silently falls back to a pure-PyTorch
+  # path -- confirmed via profiling this matters: it roughly halves the
+  # expert's per-denoising-step cost (24.0ms -> 10.8ms/step on a 2B backbone)
+  # and ~4x's VLM prefill (256ms -> 64ms), though per-token decode cost during
+  # generation barely changes (the recurrent single-step update benefits far
+  # less than the parallel/chunked prefill formulation).
+  "flash-linear-attention>=0.5.1",
+  "causal-conv1d>=1.6.2",
   "rich>=14.3.3",
   "wandb>=0.25.0",
   "torchmetrics==1.8.2",
@@ -51,7 +56,7 @@ dev = [
 ]
 
 [tool.uv]
-no-build-isolation-package = ["flash-attn"]
+no-build-isolation-package = ["flash-attn", "causal-conv1d"]
 # alpamayo_r1's own pyproject.toml pins transformers==4.57.1 (needed by the
 # qwenvl3 path other recipes use); override it here since this recipe's fork
 # (see [tool.uv.sources] below) only needs to satisfy the Qwen 3.5 path.
