@@ -75,6 +75,81 @@ camera data):**
 - `profile_qwen3_5_inference.py` — the closed-loop inference rollout — for
   both tiers, single-sample and batched (`num_traj_samples>1`).
 
+## Performance vs. Cosmos-Reason2-2B
+
+Stage-2, untrained checkpoints, same H100, same real PAI sample,
+`num_traj_samples=1`, `flash-linear-attention`/`causal-conv1d` fast-path
+kernels installed (see "Fast-path kernels" below):
+
+| | Cosmos-Reason2-2B | Qwen3.5-2B | Δ |
+|---|---|---|---|
+| Params | 2.580B | 2.680B | +4% |
+| Weights VRAM | 5.56 GiB | 5.61 GiB | +0.9% |
+| Peak VRAM (allocated) | 6.19 GiB | 6.17 GiB | ~even |
+| Latency (best) | 1705 ms | 2547 ms | **+49% slower** |
+| VLM prefill (16-img encode) | 84.4 ms | 64.3 ms | 24% *faster* |
+| Per generated token | 12.48 ms | 18.26 ms | +46% slower |
+| Expert, per denoising step | 4.1 ms | 10.8 ms | +163% slower |
+
+**VRAM is a wash; latency isn't.** The gap isn't in vision encoding — Qwen
+3.5's native-multimodal encoder prefills faster. It's concentrated in
+per-token decode and especially the action expert's diffusion loop.
+
+### Why the expert's denoising step is slower
+
+`torch.profiler` on a single `expert.forward()` call (8 layers: 6
+Gated-DeltaNet + 2 full-attention, matching Qwen 3.5's native 3:1 ratio):
+
+| | Calls | CPU time/call | CUDA time/call | CPU:GPU ratio |
+|---|---|---|---|---|
+| `ChunkGatedDeltaRuleFunction` (6 DeltaNet layers) | 6 | 798 µs | 46.5 µs | **~17x** |
+| `FlashAttnFunc` (2 attention layers) | 2 | 130 µs | 22.3 µs | ~6x |
+
+Whole-call totals: **12.25ms CPU vs. 1.77ms actual CUDA** — overwhelmingly
+dispatch-bound, not compute-bound. The GPU kernel itself isn't slow (46.5µs
+for conv+gating+delta-rule-update+norm vs. attention's 22.3µs for a single
+matmul-softmax-matmul is a reasonable ~2x for doing more work); the cost is
+`flash-linear-attention`'s (`fla`) Python-side dispatch overhead around that
+kernel, paid 6x per step (one per DeltaNet layer) in a workload (64 tokens,
+10 short steps, batch 1) that's exactly the regime where fixed per-call
+overhead dominates instead of amortizing.
+
+**Tested, didn't fix it:** `torch.compile(mode="reduce-overhead")` (CUDA
+graphs) produced 21 graph breaks across 22 sub-graphs and then failed
+outright (`CUDAGraphs ... overwritten by a subsequent run`). Root cause via
+`torch._dynamo.explain()`: `fla`'s `chunk_gated_delta_rule` is explicitly
+decorated `@torch.compiler.disable` by its own maintainers, and its fused
+RMSNormGated backward calls `cuda_utils.get_device_properties` (an untraceable
+C-extension builtin) — both break the graph right at the boundary of the
+expensive op, so CUDA-graph capture can't span across it. This is a `fla`
+library-maturity gap (deliberately opted out, not just unsupported), not a
+config flag away from fixed.
+
+**Tested, small real win:** `torch.no_grad()` (used everywhere in this
+codebase — profiling scripts and the upstream `FlowMatching.sample`'s
+`@torch.no_grad()` alike) vs. `torch.inference_mode()`: ~9% less total CPU
+dispatch time (12.25ms → 11.18ms per expert call), CUDA time unchanged as
+expected. Worth adopting (zero downside for a pure-inference path) but
+doesn't move the core `fla` gap — `chunk_gated_delta_rule` is still ~731µs
+CPU for ~46.5µs GPU (~15.7x, barely down from ~17x). Not yet applied to any
+file in this repo; **documented here, not implemented**, pending a decision
+on whether it's worth the diff given how small the win is.
+
+**Practical mitigations that don't require touching `fla`:** the fixed
+per-call overhead is paid once per `expert.forward()` regardless of batch
+size, and `sample_trajectories_from_data_with_vlm_rollout` already batches
+`num_traj_samples` into a single call — so a larger `num_traj_samples`, or
+fewer `num_inference_steps` (default 10) if trajectory quality tolerates it,
+amortizes/reduces how many times that tax gets paid.
+
+### Fast-path kernels
+
+`flash-linear-attention`/`causal-conv1d` are real dependencies here (not
+optional) — without them, Qwen 3.5's own code silently falls back to a
+pure-PyTorch path for every Gated-DeltaNet layer, which is substantially
+slower still (confirmed while benchmarking: ~2x on the expert's
+per-denoising-step cost, ~4x on VLM prefill).
+
 ## Installation
 
 ```bash
