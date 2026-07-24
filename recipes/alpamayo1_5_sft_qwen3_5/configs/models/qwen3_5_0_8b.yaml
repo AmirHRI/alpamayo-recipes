@@ -1,0 +1,10 @@
+_target_: alpamayo1_5_sft_qwen3_5.models.sft_base_model.TrainableReasoningVLA.from_pretrained_vlm
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
+# Read all trajectory tokenizer and image-resolution settings directly from the
+# Alpamayo-1.5-10B config.json (traj_vocab_size, tokens_per_{history,future}_traj,
+# traj_tokenizer_cfg, hist_traj_tokenizer_cfg, min/max_pixels, etc.).
+# The A1-format flat dir has config.json directly and is AlpamayoR1-compatible.
+alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+# Set by evaluate_hf.py to load fine-tuned VLM weights from a Stage-1 checkpoint.
+# Leave null for normal training (from_pretrained_vlm will load from vlm_name_or_path).
+checkpoint_path: null

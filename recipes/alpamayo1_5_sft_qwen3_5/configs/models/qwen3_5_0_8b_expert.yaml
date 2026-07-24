@@ -1,0 +1,20 @@
+_target_: alpamayo1_5_sft_qwen3_5.models.sft_alpamayo_r1.TrainableAlpamayoR1.from_pretrained_vlm
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots/2fc06364715b967f1860aea9cf38778875588b17
+alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+stage1_vlm_checkpoint_path: null
+stage2_checkpoint_path: null   # set by evaluate_hf.py at eval time
+cotrain_vlm: false
+stop_grad_from_vlm: true
+# 8 layers (6 linear-attention + 2 full-attention, preserving the VLM's native
+# 3:1 Gated-DeltaNet:attention ratio) ≈ 166M ≈ 19% of the 0.873B VLM (measured
+# directly from the real Qwen/Qwen3.5-0.8B safetensors: 21.6M/linear-layer,
+# 18.4M/full-attention-layer -- these differ from Qwen3-VL/Cosmos-Reason2's
+# per-layer size and from each other, so this is NOT the "63M/layer" figure
+# used by the Cosmos-Reason2 experts).
+# NOTE: hidden_size is intentionally left at this VLM's own native 1024 (not
+# forced to 2048 the way the Cosmos-Reason2 experts are) -- see the docstring
+# on TrainableAlpamayoR1.from_pretrained_vlm. Consequence: action_in_proj /
+# action_out_proj / diffusion do NOT seed-load from the 10B checkpoint here
+# (shape mismatch, 1024 vs 2048) and fall back to random init, same as the
+# expert's own transformer layers.
+expert_num_layers: 8

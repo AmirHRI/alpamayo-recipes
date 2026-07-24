@@ -1,0 +1,56 @@
+# Stage 2 action-expert training on the Qwen3.5-0.8B backbone for Alpamayo-1.5.
+#
+# Mirrors alpamayo1_5_sft's sft_stage2_cosmos2b.yaml. The frozen VLM is loaded
+# from the Stage 1 checkpoint produced by sft_stage1_qwen3_5_0_8b.yaml. For a
+# smoke test we reuse the 20-sample demo annotations; swap `annotations_path`/
+# `chunk_ids` for the real LCDrive nav data once available.
+defaults:
+  - sft_base
+  - /models/qwen3_5_0_8b_expert@model
+  - /wandb: default
+  - override /vla_processor@data.train_dataset.vla_preprocess_args: nav
+  - override /vla_processor@data.val_dataset.vla_preprocess_args: nav
+  - _self_
+
+model:
+  # null → use the base VLM for now. Point at output_stage1_qwen3_5_0_8b/checkpoint-N
+  # once Stage 1 has been trained.
+  stage1_vlm_checkpoint_path: null
+
+data:
+  train_dataset:
+    _target_: alpamayo.data.pai_nav.PAIDatasetWithNav
+    _recursive_: false
+    local_dir: /data/datasets/physical_ai_av/
+    annotations_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
+    chunk_ids: [1519, 1657, 1984, 2368]   # demo chunks present on disk (widen with real LCDrive nav data)
+    vla_preprocess_args:
+      generation_mode: false
+  val_dataset:
+    _target_: alpamayo.data.pai_nav.PAIDatasetWithNav
+    _recursive_: false
+    local_dir: /data/datasets/physical_ai_av/
+    annotations_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
+    chunk_ids: [2368]   # demo chunk present on disk
+    vla_preprocess_args:
+      generation_mode: true
+
+trainer:
+  report_to: wandb
+  # VLM is frozen so no gradient checkpointing or ZeRO needed
+  gradient_checkpointing: false
+  deepspeed: null
+  ddp_find_unused_parameters: true
+  per_device_train_batch_size: 4   # 1×2×4=8 effective, same as default
+  gradient_accumulation_steps: 1
+  learning_rate: 1e-4
+  warmup_steps: 100
+  num_train_epochs: 3
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft_qwen3_5/training/output_stage2_qwen3_5_0_8b
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_sft_stage2_qwen3_5_0_8b
