@@ -79,21 +79,33 @@ camera data):**
 
 Stage-2, untrained checkpoints, same H100, same real PAI sample,
 `num_traj_samples=1`, `flash-linear-attention`/`causal-conv1d` fast-path
-kernels installed (see "Fast-path kernels" below):
+kernels installed (see "Fast-path kernels" below), `torch.inference_mode()`
+(both profiling scripts use this — see "torch.inference_mode()" below):
 
-| | Cosmos-Reason2-2B | Qwen3.5-2B | Δ |
+| | Cosmos-Reason2-2B | Qwen3.5-0.8B | Qwen3.5-2B |
 |---|---|---|---|
-| Params | 2.580B | 2.680B | +4% |
-| Weights VRAM | 5.56 GiB | 5.61 GiB | +0.9% |
-| Peak VRAM (allocated) | 6.19 GiB | 6.17 GiB | ~even |
-| Latency (best) | 1705 ms | 2547 ms | **+49% slower** |
-| VLM prefill (16-img encode) | 84.4 ms | 64.3 ms | 24% *faster* |
-| Per generated token | 12.48 ms | 18.26 ms | +46% slower |
-| Expert, per denoising step | 4.1 ms | 10.8 ms | +163% slower |
+| Params | 2.580B | 1.024B | 2.680B |
+| Weights VRAM | 5.56 GiB | 2.13 GiB | 5.61 GiB |
+| Peak VRAM (allocated) | 6.19 GiB | 2.57 GiB | 6.17 GiB |
+| **Latency (best)** | **1628 ms** | **2307 ms** (+42%) | **2381 ms** (+46%) |
+| Planning rate | 0.61 Hz | 0.43 Hz | 0.42 Hz |
+| VLM prefill (16-img encode) | 84.8 ms | 36.4 ms | 64.6 ms |
+| Per generated token | 11.48 ms | 17.21 ms | 17.00 ms |
+| Expert, per denoising step | 4.1 ms | 10.4 ms | 11.7 ms |
+| Projected, trained model (1-tok rollout) | 144.6 ms (6.92 Hz) | 166.5 ms (6.01 Hz) | 207.3 ms (4.82 Hz) |
 
-**VRAM is a wash; latency isn't.** The gap isn't in vision encoding — Qwen
-3.5's native-multimodal encoder prefills faster. It's concentrated in
-per-token decode and especially the action expert's diffusion loop.
+**VRAM tracks params (0.8B is meaningfully lighter; 2B is a wash vs. Cosmos);
+latency doesn't.** Both Qwen 3.5 tiers are slower than Cosmos-Reason2-2B by
+roughly the same ~42-46% — and, more strikingly, **0.8B is barely faster than
+2B** (2307ms vs. 2381ms, ~3% apart) despite having <40% of the parameters.
+At batch=1, single-sequence autoregressive decode (95% of this workload) is
+memory-bandwidth-bound, not FLOPs-bound — reading a smaller weight matrix
+per step doesn't buy much when the bottleneck is per-step overhead and
+memory traffic, not compute. Don't expect the 0.8B tier to be proportionally
+cheaper to *serve* at batch=1 just because it's proportionally cheaper to
+*hold in VRAM*. The gap over Cosmos isn't in vision encoding either — Qwen
+3.5's native-multimodal encoder prefills faster at both sizes. It's
+concentrated in per-token decode and the action expert's diffusion loop.
 
 ### Why the expert's denoising step is slower
 
@@ -125,15 +137,34 @@ expensive op, so CUDA-graph capture can't span across it. This is a `fla`
 library-maturity gap (deliberately opted out, not just unsupported), not a
 config flag away from fixed.
 
-**Tested, small real win:** `torch.no_grad()` (used everywhere in this
-codebase — profiling scripts and the upstream `FlowMatching.sample`'s
-`@torch.no_grad()` alike) vs. `torch.inference_mode()`: ~9% less total CPU
-dispatch time (12.25ms → 11.18ms per expert call), CUDA time unchanged as
-expected. Worth adopting (zero downside for a pure-inference path) but
-doesn't move the core `fla` gap — `chunk_gated_delta_rule` is still ~731µs
-CPU for ~46.5µs GPU (~15.7x, barely down from ~17x). Not yet applied to any
-file in this repo; **documented here, not implemented**, pending a decision
-on whether it's worth the diff given how small the win is.
+### `torch.inference_mode()`
+
+Applied: both `profile_qwen3_5_inference.py` and (the sibling
+`alpamayo1_5_sft` recipe's) `profile_2b_inference.py` now use
+`torch.inference_mode()` instead of `torch.no_grad()` for the timed calls.
+Zero downside for a pure-inference path, and its benefit propagates through
+nested `@torch.no_grad()`-decorated calls it wraps (e.g. the upstream
+`FlowMatching.sample()`) without needing to touch those decorators —
+`inference_mode`'s view-tracking/version-counter skip is a separate, broader
+guard than `no_grad`'s, and stays active for the whole enclosed call whether
+or not something inside redundantly re-enters `no_grad()`.
+
+In isolation (a single `expert.forward()` call, no VLM involved), this cut
+~9% of total CPU dispatch time (12.25ms → 11.18ms) with CUDA time unchanged,
+as expected — it's a fixed tax reduction on every op's dispatch, not
+specific to why `fla`'s wrapper in particular is heavy. At the full-pipeline
+level (the table above already reflects `inference_mode` throughout), the
+before/after:
+
+| | `no_grad()` | `inference_mode()` | Δ |
+|---|---|---|---|
+| Cosmos-Reason2-2B (best) | 1705 ms | 1628 ms | -4.5% |
+| Qwen3.5-2B (best) | 2547 ms | 2381 ms | -6.5% |
+
+Consistent with the isolated-call measurement, and it doesn't move the core
+`fla` gap (`chunk_gated_delta_rule` is still ~731µs CPU for ~46.5µs GPU,
+~15.7x, barely down from ~17x) — but it's a real, free win worth having
+regardless, so it's applied for real rather than just documented.
 
 **Practical mitigations that don't require touching `fla`:** the fixed
 per-call overhead is paid once per `expert.forward()` regardless of batch

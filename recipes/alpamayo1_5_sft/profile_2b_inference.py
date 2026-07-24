@@ -195,7 +195,7 @@ def main() -> None:
             return_extra=False,
         )
         kw["max_generation_length"] = max_gen if max_gen is not None else full_len
-        with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
+        with torch.inference_mode(), torch.autocast("cuda", dtype=dtype):
             out = model.sample_trajectories_from_data(data=call_batch, **kw)
         return out
 
