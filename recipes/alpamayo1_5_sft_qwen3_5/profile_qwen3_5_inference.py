@@ -60,6 +60,9 @@ def main() -> None:
             f"data.val_dataset.chunk_ids=[{chunk}]",
             "data.val_dataset.clip_uuid_filter=null",
         ]
+    # Forward any dotted key=value (e.g. model.stage1_vlm_checkpoint_path=...)
+    # as a Hydra override; the script-specific keys above never contain ".".
+    overrides += [f"{k}={v}" for k, v in argv.items() if "." in k]
 
     cfg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):

@@ -21,6 +21,12 @@
 #   # Stage 1 base VLM:
 #   CUDA_VISIBLE_DEVICES=0 a1_5_sft/bin/python profile_2b_inference.py \
 #       config=sft_stage1_cosmos2b_lcdrive num_traj_samples=1
+#
+#   # Any dotted key=value (containing ".") is forwarded as a Hydra override,
+#   # e.g. to profile a trained checkpoint instead of base weights:
+#   CUDA_VISIBLE_DEVICES=0 a1_5_sft/bin/python profile_2b_inference.py \
+#       config=sft_stage2_cosmos2b \
+#       model.stage1_vlm_checkpoint_path=training/output_stage1_cosmos2b_lcdrive/checkpoint-1500
 
 import os
 import sys
@@ -58,6 +64,9 @@ def main() -> None:
             f"data.val_dataset.chunk_ids=[{chunk}]",
             "data.val_dataset.clip_uuid_filter=null",
         ]
+    # Forward any dotted key=value (e.g. model.stage1_vlm_checkpoint_path=...)
+    # as a Hydra override; the script-specific keys above never contain ".".
+    overrides += [f"{k}={v}" for k, v in argv.items() if "." in k]
 
     cfg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
     with initialize_config_dir(config_dir=cfg_dir, version_base=None):

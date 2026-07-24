@@ -107,6 +107,58 @@ cheaper to *serve* at batch=1 just because it's proportionally cheaper to
 3.5's native-multimodal encoder prefills faster at both sizes. It's
 concentrated in per-token decode and the action expert's diffusion loop.
 
+### Effect of training (Cosmos-Reason2-2B, real Stage-1 checkpoint)
+
+Everything above uses an **untrained** VLM, which never learns to predict
+`<traj_future_start>` and so always runs to the `max_new_tokens` ceiling
+(128 tokens) — the README already flagged this as unrealistic and gave a
+linear (prefill + tokens × per-token-cost) *projection* for a trained model.
+A real Stage-1 checkpoint (`alpamayo1_5_sft`'s
+`output_stage1_cosmos2b_lcdrive/checkpoint-1500`, LCDrive-trained, Cosmos-
+Reason2-2B only — no trained Qwen 3.5 checkpoint exists yet) lets that
+projection be checked against reality instead of just trusted:
+
+| | Untrained | Trained (checkpoint-1500) |
+|---|---|---|
+| Generated tokens (mean) | 128.0 (ceiling, every run) | 8.3–21.7 across samples (see below) |
+| Latency | 1628 ms (low run-to-run variance) | 155–775 ms (**high** run-to-run variance) |
+| Weights / peak VRAM | 5.56 / 6.19 GiB | 5.56 / 6.19 GiB (unchanged, expected) |
+
+The token count *and* the latency swing by a wide margin between the three
+sample runs above (n=1, n=10, n=20 timed iterations gave mean generated
+tokens of 8.3, 21.7, and 16.6 respectively) — because
+`sample_trajectories_from_data_with_vlm_rollout` samples with
+`do_sample=True`, and training didn't collapse rollout length to a fixed
+short value, it made *when to stop* a genuine, sample-dependent random
+variable. So "best of a few runs" is cherry-picking, not a representative
+number. Honest statistics from **n=20** timed iterations:
+
+| | |
+|---|---|
+| Mean | 330.2 ms (3.03 Hz) |
+| Median | 310.6 ms (3.22 Hz) |
+| Std. dev | 139.3 ms (~42% of the mean) |
+| Min / Max | 155.1 ms / 774.8 ms |
+| p25 / p75 | 234.8 ms / 381.3 ms |
+
+**Training gets you roughly a 5x speedup on the median (1628ms → 311ms), not
+the ~10x an optimistic best-of-3 would suggest, and it trades a
+low-variance-but-slow untrained model for a fast-on-average-but-highly-
+variable trained one.** That variance is itself an operationally relevant
+finding, not noise to average away: a real-time closed-loop planner cares
+about worst-case latency, and this one's worst observed case (775ms) is
+~2.6x its median. If bounded latency matters more than average latency for
+deployment, that's a reason to consider constraining the stopping
+decision (e.g. `do_sample=False` for it specifically, or a hard cap tighter
+than 128 tokens) rather than assuming training alone fixes tail latency.
+
+Reproduce with (any dotted `key=value` is forwarded as a Hydra override):
+```bash
+CUDA_VISIBLE_DEVICES=0 python profile_2b_inference.py \
+  config=sft_stage2_cosmos2b num_traj_samples=1 n_warmup=2 n_timed=20 instrument=1 \
+  model.stage1_vlm_checkpoint_path=/path/to/output_stage1_cosmos2b_lcdrive/checkpoint-1500
+```
+
 ### Why the expert's denoising step is slower
 
 `torch.profiler` on a single `expert.forward()` call (8 layers: 6
