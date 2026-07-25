@@ -201,6 +201,102 @@ class DistillReasoningVLA(TrainableReasoningVLA):
         )
         return self._gather_tfs_hidden(input_ids, outputs.hidden_states[-1])
 
+    @torch.no_grad()
+    def extract_tfs_hidden_generated(
+        self,
+        tokenized_data: dict[str, Any],
+        ego_history_xyz: torch.Tensor | None = None,
+        ego_history_rot: torch.Tensor | None = None,
+        max_new_tokens: int | None = None,
+        do_sample: bool = False,
+        temperature: float = 0.6,
+        top_p: float = 0.98,
+        return_text: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, str]:
+        """Teacher-side: let the teacher GENERATE its own CoT, then read the hidden.
+
+        This mirrors the deployed rollout
+        (``AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout``): the VLM
+        generates free text (its chain-of-thought) with the discrete-trajectory
+        vocab masked out, and stops at ``<traj_future_start>``. We then run one
+        clean forward over the generated prefix ``[context + CoT + <traj_future_start>]``
+        and take the last-layer hidden at that token — the same single-forward
+        gather the student uses, so teacher and student targets are computed
+        identically.
+
+        Requires no ground-truth CoT (the teacher was trained to produce it), so
+        it works on any clip. Processes ONE sample at a time (batch size 1), which
+        keeps the per-row image inputs unambiguous. Greedy (``do_sample=False``) by
+        default for a reproducible, deterministic cache target.
+        """
+        from transformers import StoppingCriteriaList
+        from transformers.generation.logits_process import LogitsProcessorList
+
+        from alpamayo_r1.models.alpamayo_r1 import ExpertLogitsProcessor
+        from alpamayo_r1.models.token_utils import StopAfterEOS, to_special_token
+
+        tokenized_data = dict(tokenized_data)
+        input_ids = tokenized_data.pop("input_ids")
+        assert input_ids.shape[0] == 1, "extract_tfs_hidden_generated expects batch size 1"
+        input_ids = self.fuse_traj_tokens(
+            input_ids,
+            {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot},
+        )
+
+        eos_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+        if max_new_tokens is None:
+            max_new_tokens = self.config.tokens_per_future_traj
+
+        gcfg = self.vlm.generation_config
+        gcfg.do_sample = do_sample
+        gcfg.temperature = temperature
+        gcfg.top_p = top_p
+        gcfg.num_return_sequences = 1
+        gcfg.max_new_tokens = max_new_tokens
+        gcfg.return_dict_in_generate = True
+        gcfg.output_logits = False
+        gcfg.pad_token_id = self.tokenizer.pad_token_id
+
+        stopping = StoppingCriteriaList([StopAfterEOS(eos_token_id=eos_id)])
+        logits_processor = LogitsProcessorList(
+            [
+                ExpertLogitsProcessor(
+                    traj_token_offset=self.future_token_start_idx,
+                    traj_vocab_size=self.config.traj_vocab_size,
+                )
+            ]
+        )
+
+        # 1. generate CoT, stopping at <traj_future_start> (attention_mask kept for gen)
+        gen = self.vlm.generate(
+            input_ids=input_ids,
+            generation_config=gcfg,
+            stopping_criteria=stopping,
+            logits_processor=logits_processor,
+            **tokenized_data,
+        )
+        row = gen.sequences[0]
+        matches = (row == eos_id).nonzero(as_tuple=True)[0]
+        end = int(matches[0]) if len(matches) else int(row.shape[0] - 1)
+        trunc = row[: end + 1].unsqueeze(0)  # [1, end+1]; last token = <traj_future_start>
+
+        # 2. one clean forward over the generated prefix -> hidden at <traj_future_start>
+        fwd_kwargs = {k: v for k, v in tokenized_data.items() if k != "attention_mask"}
+        outputs = self.vlm(
+            input_ids=trunc,
+            attention_mask=torch.ones_like(trunc),
+            output_hidden_states=True,
+            use_cache=False,
+            **fwd_kwargs,
+        )
+        hidden = self._gather_tfs_hidden(trunc, outputs.hidden_states[-1])  # [1, H]
+
+        if return_text:
+            gen_only = row[input_ids.shape[1] : end + 1]
+            return hidden, self.tokenizer.decode(gen_only, skip_special_tokens=False)
+        return hidden
+
     # -------------------------------------------------------------- KD losses
     def _latent_loss(self, h_student: torch.Tensor, h_teacher: torch.Tensor) -> torch.Tensor:
         """Smooth-L1 + cosine on the projected student vs cached teacher hidden."""

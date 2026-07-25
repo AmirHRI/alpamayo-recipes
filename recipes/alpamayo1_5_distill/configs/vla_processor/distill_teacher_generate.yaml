@@ -1,0 +1,15 @@
+# Teacher GENERATION processor (no route/nav): `cot` is the LAST component, so in
+# generation mode the assistant turn ends with `<|cot_start|>` (ask_for_component)
+# and the teacher GENERATES its own reasoning, then emits `<|traj_future_start|>`.
+# The extractor reads the hidden at that (generated) token -> reasoning-conditioned.
+#
+# This is why `cot` must be last and traj_future is NOT in the order: if traj_future
+# were last, the prompt would pre-fill `<|traj_future_start|>` and the teacher would
+# never reason before the handoff. components_prompt asks for cot THEN trajectory.
+_target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+chat_template_version: r1_5
+components_order: ["image", "traj_history", "prompt", "cot"]
+components_prompt: ["cot", "traj_future"]
+label_components: ["traj_future"]
+include_camera_ids: false
+include_frame_nums: false

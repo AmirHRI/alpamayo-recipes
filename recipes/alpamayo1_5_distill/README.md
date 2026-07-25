@@ -25,8 +25,10 @@ Autoregressive **reasoning tokens are the single biggest latency cost** — yet
 reasoning is where the teacher's driving competence lives. Latent-reasoning
 distillation resolves the tension:
 
-- The **teacher** runs *with* chain-of-thought in context (a single forward, CoT
-  teacher-forced from PAI's reasoning parquet / nav annotations).
+- The **teacher generates its own chain-of-thought** (it was trained to) and
+  stops at `<traj_future_start>`, exactly as at deployment — so its hidden there
+  is reasoning-conditioned with **no ground-truth CoT required** (works on every
+  clip). GT CoT teacher-forcing is available as a fallback where it exists.
 - The **student** stays **text-silent** (no `cot` in its prompt), so its rollout
   collapses to ~1 token.
 - We distil the teacher's **CoT-conditioned hidden state at `<traj_future_start>`**
@@ -61,23 +63,30 @@ eval / generation are unaffected when no teacher feature is supplied.
 - **`models/distill_base_model.py`** — `DistillReasoningVLA(TrainableReasoningVLA)`:
   adds `output_hidden_states=True`, locates the `<traj_future_start>` column
   per row (by value, robust to left-padding), computes the latent loss, and
-  holds the projector. Also serves as the *teacher* via `extract_tfs_hidden`
-  (no projector, no CE — just the raw hidden).
+  holds the projector. Also serves as the *teacher* (no projector, no CE): either
+  `extract_tfs_hidden_generated` (the teacher generates its own CoT, then a clean
+  forward reads the hidden at the *generated* `<traj_future_start>`) or
+  `extract_tfs_hidden` (GT-CoT teacher-forced, single forward).
 - **`data/distill_dataset.py`** — `DistillPAIDataset` / `DistillNavDataset`:
   attach the cached `teacher_tfs_hidden` to each sample (keyed by
   `f"{clip_id}::{t0_us}"`, so the offline teacher pass and the training pass line
   up sample-for-sample) and, for the nav path, inject the annotation `cot` before
   preprocessing so a teacher-side processor can teacher-force it.
-- **`scripts/generate_teacher_features.py`** — offline cache builder: runs the
-  frozen teacher once, caches the `<traj_future_start>` hidden as safetensors +
-  a `.meta.json` sidecar (records `teacher_hidden_dim`).
+- **`scripts/generate_teacher_features.py`** — offline cache builder. Caches the
+  `<traj_future_start>` hidden as safetensors + a `.meta.json` sidecar
+  (`teacher_hidden_dim`, `mode`). **Resumable** (checkpoints every `save_every`,
+  skips cached keys), **shardable** (`num_shards`/`shard`), prefetches frames with
+  a DataLoader (`num_workers`), and skips the teacher's throwaway 8B init with
+  `no_init_weights()` (load ~200s → ~12s).
 - **`configs/`**:
-  - `cache_teacher_features.yaml` — teacher cache config (teacher runs *with* CoT
-    via `vla_processor/distill_teacher_nav`).
+  - `cache_teacher_features_lcdrive.yaml` — LCDrive-train cache (`mode=generate`,
+    `vla_processor/distill_teacher_generate`); `cache_teacher_features.yaml` —
+    nav-demo cache (`mode=teacher_force`, GT CoT).
   - `sft_stage1_distill_cosmos2b.yaml` — student Stage-1 (CoT-free) + latent KD.
   - `models/{teacher_ar1_5_10b,teacher_cosmos2b,cosmos_reason2_2b_distill}.yaml`.
-  - `vla_processor/{distill_teacher,distill_teacher_nav}.yaml` — teacher-side
-    processors that add `cot` to `components_order`.
+  - `vla_processor/distill_teacher_generate.yaml` — `cot`-**last** processor that
+    makes the teacher generate reasoning before the handoff; `distill_teacher{,_nav}.yaml`
+    — GT-CoT (`cot`-in-order) processors for the teacher-force path.
   - Shared groups (`sft_base`, `deepspeed`, existing `models`/`vla_processor`)
     resolve from `alpamayo1_5_sft/configs` via `hydra.searchpath`.
 
@@ -91,21 +100,39 @@ export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
 ```
 
-**1. Generate the teacher feature cache** (real 10B teacher, CoT in context):
+**1. Generate the teacher feature cache** — the teacher **generates its own CoT**
+(no GT CoT needed) and we cache the reasoning-conditioned hidden. For the LCDrive
+train split:
 
 ```bash
 cd recipes/alpamayo1_5_distill
 CUDA_VISIBLE_DEVICES=0 $VENV/python -m alpamayo1_5_distill.scripts.generate_teacher_features \
-    config=cache_teacher_features \
+    config=cache_teacher_features_lcdrive \
     teacher=teacher_ar1_5_10b \
-    out=/path/to/teacher_features.safetensors
+    mode=generate num_workers=8 save_every=500 \
+    out=/data/.../alpamayo1_5_distill/training/teacher_lcdrive_train.safetensors
 # prints teacher_hidden_dim (=4096 for the 10B) -> set it in the student config
 ```
 
-For a plain-PAI / LCDrive corpus (no nav annotations), point
-`data.cache_dataset` at `DistillPAIDataset` with
-`reasoning_metadata=reasoning/ood_reasoning.parquet` and the
-`vla_processor/distill_teacher` (non-nav) processor.
+- **Scale.** LCDrive train ≈ **38,340 clips** at ~**1.1 samples/s** (10B, 1 GPU) ⇒
+  **~10 h**. The run is **resumable** (checkpoints every `save_every`, skips
+  already-cached keys on restart) and **shardable** across GPUs — launch N copies
+  with `num_shards=N shard=k` (`k=0..N-1`) to different `out=` files, then merge.
+  Only a 10B fits on a free 80 GB GPU, so a single card can't be split; use
+  separate GPUs for shards.
+- **Why `mode=generate` + the `distill_teacher_generate` processor.** The teacher
+  only reasons if the prompt asks for CoT **and** the assistant turn ends with
+  `<|cot_start|>` — so that processor puts `cot` **last** in `components_order`.
+  A `traj_future`-last prompt (the shipped `default`/`nav` processors) pre-fills
+  `<|traj_future_start|>` and the teacher skips reasoning entirely (empty CoT).
+  Example greedy CoTs: *"Stop for the red traffic light since the signal is red"*,
+  *"Adapt speed for the right curve since the lane bends right ahead"*.
+- **Greedy by default** (`do_sample=false`) for a reproducible, deterministic
+  cache target. The `.meta.json` sidecar records `teacher_hidden_dim` and `mode`.
+
+For the small **nav-demo** smoke path (annotations carry GT CoT), the
+`cache_teacher_features.yaml` config with `mode=teacher_force` instead
+teacher-forces the GT CoT via `vla_processor/distill_teacher_nav`.
 
 **2. Train the CoT-free student** with the latent loss:
 
@@ -139,12 +166,20 @@ KV. At eval, stack the latency levers distillation pays for: fewer camera frames
   slowly per sample — hence the higher `latent_proj` LR multiplier in the
   config; a full run (warmup + many steps) is needed for it to converge.
 - **The real teacher path** loads `nvidia/Alpamayo-1.5-10B` (~21 GB) via
-  `from_alpamayo_checkpoint`, teacher-forces CoT, and emits a
+  `from_alpamayo_checkpoint` (in ~12 s with `no_init_weights`) and emits a
   `teacher_hidden_dim=4096` cache — matching the student config default.
+- **Generation-based extraction validated** on real nav *and* LCDrive clips: with
+  the `cot`-last processor the 10B generates coherent, scene-specific reasoning
+  before `<traj_future_start>` (e.g. *"Turn left due to green left-turn signal"*,
+  *"Keep distance to the lead vehicle since it is directly ahead in our lane"*),
+  and the hidden is captured there. Throughput ~1.1 samples/s (10B, 1 GPU) with
+  8 prefetch workers ⇒ the full 38,340-clip LCDrive-train cache ≈ ~10 h.
+  ⚠️ A `traj_future`-last prompt yields **empty** CoT — the `cot`-last processor
+  is required (see step 1).
 - Configs compose via `hydra.searchpath` onto `alpamayo1_5_sft/configs` (both
   the cache builder and the real `torchrun -m alpamayo1_5_sft.train_hf
   --config-path pkg://alpamayo1_5_distill/configs` launch); the student trains
-  CoT-free while the teacher cache is built with CoT.
+  CoT-free while the teacher cache is built from the teacher's own CoT.
 
 ## Scope & follow-ups
 
