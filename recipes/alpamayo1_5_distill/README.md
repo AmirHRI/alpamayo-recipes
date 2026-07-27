@@ -10,7 +10,139 @@ recipe's student/teacher model classes, trainer, and shared config groups, and
 adds only the distillation-specific model subclass, dataset wrappers, offline
 teacher-feature cache script, and configs.
 
-## The idea: distil reasoning into the KV, not into tokens
+---
+
+## Background: how Alpamayo works
+
+### Two models joined by a KV cache
+
+Alpamayo is a vision-language-action model in two parts:
+
+1. a **VLM backbone** that reads the cameras, the ego history and a text prompt,
+   and — if the prompt asks for it — *writes out chain-of-thought reasoning*,
+   stopping at the special token `<traj_future_start>`; and
+2. an **action expert**, a separate transformer that produces the trajectory by
+   iterative denoising (flow matching) and never emits text.
+
+They are not joined by passing a summary vector. The expert **reads the VLM's KV
+cache directly** (the π0 / Pi-0 pattern):
+
+```
+  4 cams x 4 frames        ┌───────────────── VLM backbone ─────────────────┐
+  ego history        ────► │ [~2880 image tok][48 history][prompt]          │
+  text prompt              │             ↓ generates reasoning ↓            │
+                           │ [CoT tokens ....] <traj_future_start>          │
+                           └────────────────────┬───────────────────────────┘
+                                                │  KV cache, cropped at <tfs>
+                                                │  (K,V for every layer x position)
+                                                ▼
+  noise ──────────────────►┌───────────────── action expert ────────────────┐
+                           │ 64 action tokens attend NON-CAUSALLY over the  │
+                           │ VLM's cached K/V        x 10 Euler steps       │
+                           └────────────────────┬───────────────────────────┘
+                                                ▼
+                                     trajectory: 64 waypoints
+```
+
+The cache is cropped at `future_start_idx + 1` — everything **up to and
+including** `<traj_future_start>` (see the `kv_cache.crop(...)` call in
+[`sft_alpamayo_r1.py`](../alpamayo1_5_sft/models/sft_alpamayo_r1.py)). So that
+token is the handoff point: everything before it is the VLM's job, everything
+after it is the expert's.
+
+### The expert reads the cache layer-by-layer
+
+The handoff is not a single tensor — HF indexes the cache by `layer_idx`, so
+**expert layer *i* attends to VLM cache layer *i***:
+
+```
+        VLM KV cache                      action expert
+   layer  0  ──── K,V ──────────────────►  layer  0
+   layer  1  ──── K,V ──────────────────►  layer  1
+     ...                                     ...
+   layer 35  ──── K,V ──────────────────►  layer 35
+```
+
+This is why the expert must be **as deep as the VLM** (see the section below) —
+and why "which layer do we distil?" is a real question rather than a detail.
+
+### What one forward pass produces
+
+A transformer is a *stack* of layers, so a forward pass doesn't yield one output
+per token — it yields a **grid** of vectors, one at every (position, layer) pair:
+
+```
+                       token position  →
+             [images .....][history][prompt][CoT tokens][<tfs>]
+  layer 36 ┌────·─────·────────·───────·──────·───·───·────●──   ← "last layer"
+  layer 35 │    ·     ·        ·       ·      ·   ·   ·    ·
+    ...    │    ·     ·        ·       ·      ·   ·   ·    ·
+  layer  1 │    ·     ·        ·       ·      ·   ·   ·    ·
+  embedding└────·─────·────────·───────·──────·───·───·────·──
+```
+
+"Last layer" = the top row: the most processed representation, the one the model
+uses to predict its next token. Because attention is causal, the vector at a
+position has absorbed every token **before** it — so the cell at
+(`<traj_future_start>`, top layer), marked ●, is the model's most complete
+summary of the scene at the exact moment it hands off to the expert. For a
+teacher that just reasoned, that summary **includes its own chain-of-thought**.
+
+### Teacher vs. student
+
+Same structure, different size. Both were verified against the real checkpoints:
+
+| | teacher (Alpamayo-1.5-10B) | student (Cosmos-Reason2-2B) |
+|---|---|---|
+| VLM layers / hidden | 36 / 4096 | 28 / 2048 |
+| expert layers | 36 (= VLM depth) | 28 (= VLM depth) |
+| expert hidden / q-heads | 2048 / 16 | 1024 / 8 |
+| **KV per layer** | **8 × 128 = 1024** | **8 × 128 = 1024** |
+| expert params | 2.279 B | 0.473 B |
+
+The KV width being *identical* is what makes the two models' handoffs directly
+comparable — only the last-hidden width differs (4096 vs 2048).
+
+### Why latent-reasoning distillation makes sense
+
+The teacher's driving skill comes substantially from **reasoning out loud**: CoT
+gives it extra serial compute, letting it work through "the light is red, there's
+a lead vehicle" across successive token positions before committing to a
+trajectory. But those tokens are generated autoregressively, and generation is
+the single biggest latency cost (see the table below).
+
+Three ways to give a small student that competence:
+
+| approach | reasoning transferred? | latency cost |
+|---|---|---|
+| copy the teacher's trajectory only | ✗ — just the answer, not the thinking | none |
+| teach the student to emit CoT too | ✓ | ✗ ~11.5 ms **per token** |
+| **distil the reasoning-conditioned representation** | ✓ | **none** |
+
+The third works because of where the reasoning ends up. By the time the teacher
+reaches `<traj_future_start>`, its CoT has already been absorbed into the
+representation at that position — and that representation, not the text, is what
+the expert consumes. So we can train a **text-silent** student to reproduce it
+directly:
+
+```
+  TEACHER  (reasons)                        STUDENT  (text-silent)
+  ...[prompt][CoT tokens]<tfs>              ...[prompt]<tfs>
+  layer 36 ──────────────── ● 4096          layer 28 ────── ● 2048
+                            │                               │
+                            │                     Linear(2048 → 4096)
+                            │                               │
+                            └────── smooth-L1 + cosine ─────┘
+```
+
+The student must compress into one forward pass what the teacher spread across
+generated tokens. If it succeeds, the reasoning is **compiled into the KV** the
+expert reads, and the rollout collapses to ~1 token — the teacher's competence at
+the student's latency. That is the whole bet of this recipe.
+
+---
+
+## The latency budget, and the three decisions it forces
 
 Profiling (see `alpamayo1_5_sft_qwen3_5/README.md`) shows the trained-2B's
 ~311 ms median is dominated by the **VLM**, not the expert:
@@ -34,14 +166,6 @@ distillation resolves the tension:
 - We distil the teacher's **CoT-conditioned hidden state at `<traj_future_start>`**
   — the exact vector the action expert conditions on — into the student's hidden
   state at that token.
-
-At inference the action expert consumes the VLM KV cache cropped at
-`future_start_idx + 1` (i.e. up to and including `<traj_future_start>`; see
-[`sft_alpamayo_r1.py`](../alpamayo1_5_sft/models/sft_alpamayo_r1.py) around the
-`kv_cache.crop(...)` call). The last-layer hidden at that position is the single
-best summary of the context handed to the expert. Matching it **compiles the
-teacher's reasoning into the KV the expert reads**, with no reasoning tokens
-emitted at run time.
 
 ## Two verified enablers (checked against the real configs)
 
