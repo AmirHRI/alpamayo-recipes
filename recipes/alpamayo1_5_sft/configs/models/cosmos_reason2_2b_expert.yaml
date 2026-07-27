@@ -14,9 +14,16 @@ stop_grad_from_vlm: true
 # Depth is not a size knob. HF indexes the KV cache by `layer_idx`, so expert
 # layer i attends to VLM cache layer i. The previous setting (7 layers on a
 # 28-layer VLM) therefore left cache layers 7-27 unread — the action head saw
-# only the VLM's 7 shallowest layers. The 10B avoids this by omitting
-# `num_hidden_layers` from its expert_cfg (expert 36 == VLM 36) and shrinking
-# width instead (hidden 2048 of 4096, 16 query heads of 32).
+# only the VLM's 7 shallowest layers. Measured by instrumenting Cache.update
+# during a real Stage-2 forward:
+#     7-layer expert  -> reads cache layers [0..6],  21 of 28 stranded
+#     28-layer expert -> reads cache layers [0..27], 0 stranded
+#     real 10B teacher-> reads cache layers [0..35], 0 stranded
+#
+# The 10B avoids this by omitting `num_hidden_layers` from its expert_cfg and
+# shrinking width instead. Verified against the released checkpoint's own
+# tensors: expert.layers.0..35 (36, no gaps), q_proj [2048,2048] (16 heads),
+# k_proj [1024,2048] (8 kv-heads x 128 — identical to its VLM), 2.279 B params.
 #
 # Applying the same rule at 2B, and keeping the parameter budget:
 #   depth      28  = VLM depth              (null → inherit)

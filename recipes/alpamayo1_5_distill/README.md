@@ -64,9 +64,15 @@ HF indexes the KV cache by `layer_idx`, so **expert layer *i* attends to VLM cac
 layer *i***. Probing the Stage-2 forward confirmed the consequence empirically:
 
 ```
-7-layer expert  → reads cache layers [0..6]      → 21 of 28 VLM layers STRANDED
-28-layer expert → reads cache layers [0..27]     → 0 stranded
+7-layer expert   → reads cache layers [0..6]   → 21 of 28 VLM layers STRANDED
+28-layer expert  → reads cache layers [0..27]  → 0 stranded
+real 10B teacher → reads cache layers [0..35]  → 0 stranded   (36 expert = 36 VLM)
 ```
+
+(All three measured by instrumenting `Cache.update` during a real Stage-2
+forward. The 10B's geometry was additionally confirmed against its released
+tensors: `expert.layers.0..35`, no gaps; `q_proj [2048,2048]`; `k_proj
+[1024,2048]` — 8 kv-heads × 128, identical to its VLM; 2.279 B params.)
 
 The 2B recipe had sized its expert by copying the 10B's *parameter ratio* (~20%)
 via depth (`expert_num_layers: 7`), which silently cut the action head off from
