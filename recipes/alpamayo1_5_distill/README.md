@@ -142,6 +142,91 @@ the student's latency. That is the whole bet of this recipe.
 
 ---
 
+## Related architecture: MolmoAct2's action expert
+
+MolmoAct2 solves the same problem — conditioning a flow-matching action expert on
+a VLM — and independently reaches several of the same answers. Useful both as
+corroboration and as a list of things Alpamayo does differently.
+
+### What is identical
+
+| | MolmoAct2 | Alpamayo |
+|---|---|---|
+| interpolation | `x_t = (1−t)·ε + t·a` | `noisy_x = t·x + (1−t)·noise` |
+| velocity target | `u* = a − ε` | `target = x − noise` |
+| loss | MSE on predicted velocity | `mse_loss(target, pred)` |
+| **expert depth** | **L = 36 = VLM depth** | 36 = VLM depth (measured) |
+| conditioning granularity | expert block ℓ ← VLM layer ℓ's K/V | expert layer ℓ ← cache layer ℓ |
+| gradient flow | conditioning path detached from the VLM | `stop_grad_from_vlm=True` → `.detach()` |
+
+The flow-matching formulation is the *same equation*. And MolmoAct2 states the
+expert-depth-equals-VLM-depth rule explicitly (L = 36 for both) — precisely the
+invariant the 2B recipe was violating before the fix documented above.
+
+### What differs
+
+**1. Separate self- + cross-attention vs. one fused attention.**
+
+```
+  Alpamayo block ℓ                     MolmoAct2 block ℓ
+  ────────────────                     ─────────────────
+  ONE self-attention over              SA  (actions ↔ actions)   + gate
+    [ VLM prefix ‖ action tokens ]     CA  (actions → K̃_ℓ, Ṽ_ℓ)  + gate
+  MLP                                  MLP                        + gate
+```
+
+Alpamayo's single softmax normalises over the VLM prefix *and* the action tokens
+together, so the two **compete for attention mass**, and one set of Q/K/V
+projections serves both roles. MolmoAct2 gives each its own softmax, its own
+parameters, and a learned gate — it can attend fully to context *and* fully to
+action structure independently.
+
+**2. Per-layer DiT time conditioning vs. input-only.** Alpamayo injects the
+diffusion timestep **once**, at the input: Fourier features concatenated onto the
+action features inside `action_in_proj`. The expert itself is built by
+`AutoModel.from_config(...)` — a stock Qwen3 decoder with **no time awareness at
+all**, so `t` must propagate implicitly through all 36 layers. MolmoAct2 derives
+AdaRMS shift/scale/gate parameters from `t` and applies them to **all three
+residual branches of every block**. This is the clearest quality-relevant gap;
+DiT-style adaptive-norm conditioning is well established to beat input-only
+conditioning in diffusion transformers.
+
+**3. Learned KV adapters vs. a shape constraint.** MolmoAct2 maps the VLM's keys
+and values into the expert's cross-attention width with learned linear adapters
+`P_K`, `P_V` (separate from the VLM's own attention projections). Alpamayo has no
+adapter — the expert consumes the cached K/V **directly**, which is only possible
+because `num_key_value_heads` (8) and `head_dim` (128) are constrained to match
+the VLM. Alpamayo therefore pays zero parameters and zero extra compute, but
+cannot freely choose the expert's attention geometry; MolmoAct2 pays a small
+adapter cost (amortisable — the VLM K/V are fixed per observation, so the
+projection can be computed once and reused across all denoising steps) and buys
+complete freedom over expert width, head count, and depth mapping.
+
+**4. Action masking.** MolmoAct2 masks padded action steps and dimensions (`m` in
+its loss) for variable-length chunks across embodiments. Alpamayo's action space
+is a fixed `(64, 2)`, so no mask is needed — a domain difference, not a gap.
+
+### Implications for this recipe
+
+- **Two independent votes for per-layer KV as the KD target.** MolmoAct2's stated
+  rationale for rejecting "a shallow projection of the final hidden state" is
+  exactly the argument for matching teacher **K/V per layer** rather than the
+  single last-layer vector this recipe currently uses (see the caveat under
+  *Expert depth must equal VLM depth*).
+- **Both detach the conditioning path**, so in neither architecture does the
+  action loss train the VLM. The VLM's contribution to driving quality can only
+  be bought by training it *directly* — which is what this recipe does.
+- **Port candidates, ranked** (none implemented here):
+  1. *DiT/AdaRMS time conditioning* — best value/risk; contained (wrap the expert
+     blocks with modulation driven by the existing Fourier time embedding),
+     doesn't touch the KV interface. Would invalidate existing expert checkpoints.
+  2. *KV adapters* — decouple expert width **and** depth from the VLM, which would
+     make the prune plan below trivial and let the expert shrink past the 8 × 128
+     floor.
+  3. *Separate SA/CA* — largest change, least certain payoff; try last.
+
+---
+
 ## The latency budget, and the three decisions it forces
 
 Profiling (see `alpamayo1_5_sft_qwen3_5/README.md`) shows the trained-2B's
