@@ -91,8 +91,18 @@ kernels installed (see "Fast-path kernels" below), `torch.inference_mode()`
 | Planning rate | 0.61 Hz | 0.43 Hz | 0.42 Hz |
 | VLM prefill (16-img encode) | 84.8 ms | 36.4 ms | 64.6 ms |
 | Per generated token | 11.48 ms | 17.21 ms | 17.00 ms |
-| Expert, per denoising step | 4.1 ms | 10.4 ms | 11.7 ms |
+| Expert, per denoising step | 4.1 ms † | 10.4 ms | 11.7 ms |
 | Projected, trained model (1-tok rollout) | 144.6 ms (6.92 Hz) | 166.5 ms (6.01 Hz) | 207.3 ms (4.82 Hz) |
+
+† Measured with the Cosmos-2B expert as it was then configured: 7 layers × hidden
+2048. That expert read only 7 of the VLM's 28 KV-cache layers (HF indexes the
+cache by `layer_idx`, so expert layer *i* reads cache layer *i*), and
+`alpamayo1_5_sft` has since been changed to a full-depth 28 × 1024 expert, which
+costs **~13.6 ms/step** — ~2.9× more for the same parameter count, because depth,
+not FLOPs, dominates at batch-1. See
+[`alpamayo1_5_distill/README.md`](../alpamayo1_5_distill/README.md). The two Qwen
+3.5 columns are unaffected: that recipe still uses its own 8-layer expert and has
+the same latent depth-vs-coverage tradeoff unresolved.
 
 **VRAM tracks params (0.8B is meaningfully lighter; 2B is a wash vs. Cosmos);
 latency doesn't.** Both Qwen 3.5 tiers are slower than Cosmos-Reason2-2B by

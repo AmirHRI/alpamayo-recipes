@@ -151,7 +151,30 @@ Profiling (see `alpamayo1_5_sft_qwen3_5/README.md`) shows the trained-2B's
 |---|---|---|
 | VLM prefill | ~85 ms | 16 images (4 cams × 4 frames) × ~180 tok ≈ 3 k tokens |
 | VLM autoregressive rollout | ~95–250 ms (high variance) | # reasoning tokens × 11.5 ms/token |
-| Diffusion loop | ~41 ms | 10 Euler steps × 4.1 ms |
+| Diffusion loop | ~41 ms → **~136 ms** | 10 Euler steps × 4.1 ms → **13.6 ms** (see below) |
+
+> **The diffusion row is superseded.** The 4.1 ms/step figure was measured with the
+> old 7-layer expert, which read only 7 of 28 VLM cache layers. Making the expert
+> full-depth (the fix below) costs **~2.9× per denoising step** — same FLOPs and
+> parameter count, but 4× the sequential layers and 4× the cross-attention KV
+> traffic, and at batch-1 over 64 action tokens the expert is launch-latency-bound
+> rather than FLOP-bound:
+>
+> | expert | params | KV read/step | ms/step | ×10 steps | cache layers read |
+> |---|---|---|---|---|---|
+> | 7 × 2048 (old) | 443 M | 86 MB | 4.68 | 47 ms | 7/28 ✗ |
+> | 28 × 1024 (current) | 473 M | 344 MB | 13.59 | 136 ms | 28/28 ✓ |
+>
+> (Isolated microbenchmark of `expert.forward` against a synthetic 3000-position
+> cache; the 4.68 ms reproduces the 4.1 ms measured end-to-end, validating it. The
+> full profiler on the current arch reports 19.3 ms/step under its own conditions —
+> a random-init VLM that rolls out to the 128-token cap, so a longer cache. Both
+> runs shared the GPU, so treat the ~2.9× **ratio** as the result, not the absolutes.)
+>
+> **This makes diffusion step-reduction a prerequisite, not a nice-to-have**: at
+> 136 ms the loop alone exceeds the whole 100 ms budget. Cutting 10 → 2 steps
+> (`diffusion_kwargs={"inference_step": 2}`, already plumbed) brings it to ~27 ms.
+> A cheaper alternative that needs no retrain is noted under *Scope & follow-ups*.
 
 Autoregressive **reasoning tokens are the single biggest latency cost** — yet
 reasoning is where the teacher's driving competence lives. Latent-reasoning
@@ -350,6 +373,18 @@ KV. At eval, stack the latency levers distillation pays for: fewer camera frames
   co-resident teacher, and logit-KD (the natural next VLM term if the latent-only
   objective underperforms). Attention-map KD is deliberately skipped (it would
   force `eager`/`sdpa` attention, hurting both training and deploy latency).
+- **Strided cache map — full depth at shallow-expert cost.** Making the expert
+  full-depth is only a *means*; the requirement is that the action head sees all
+  of the VLM's layers. Those can be decoupled. HF picks the cache layer from each
+  attention module's `layer_idx`, so remapping a **7-layer** expert's indices to
+  `[0, 4, 9, 13, 18, 22, 27]` makes it read the full 28-layer depth while doing
+  exactly the shallow expert's compute — a strided map changes *which* cache index
+  is read, not the FLOPs or the KV volume, so it lands at **4.68 ms/step (47 ms
+  for 10 steps), ~2.9× cheaper than the current 28-layer expert, with the same
+  full-depth coverage**. Cost: a small patch (reassign `layer_idx` after
+  construction; the map is injective so no write conflicts) and a departure from
+  the teacher's strict 1:1 layer correspondence, whose training impact is
+  unmeasured. Worth benchmarking on a quiet GPU before adopting.
 
 See the design menu (all VLM/expert/orchestration options with pros/cons) that
 this recipe was distilled from in the planning notes.
