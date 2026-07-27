@@ -58,6 +58,34 @@ where `h_S` / `h_T` are the student/teacher hidden states at `<traj_future_start
 and `P` is the projector. The CE term is the unchanged Stage-1 objective, so
 eval / generation are unaffected when no teacher feature is supplied.
 
+## Expert depth must equal VLM depth (fixed in `alpamayo1_5_sft`)
+
+HF indexes the KV cache by `layer_idx`, so **expert layer *i* attends to VLM cache
+layer *i***. Probing the Stage-2 forward confirmed the consequence empirically:
+
+```
+7-layer expert  → reads cache layers [0..6]      → 21 of 28 VLM layers STRANDED
+28-layer expert → reads cache layers [0..27]     → 0 stranded
+```
+
+The 2B recipe had sized its expert by copying the 10B's *parameter ratio* (~20%)
+via depth (`expert_num_layers: 7`), which silently cut the action head off from
+the VLM's 21 deepest layers. The 10B never does this — its `expert_cfg` omits
+`num_hidden_layers` (expert 36 == VLM 36) and shrinks **width** instead. The 2B
+expert now mirrors that rule (depth 28, hidden 1024, 8 query heads, `kv_heads` /
+`head_dim` inherited), at essentially the same budget: **0.473 B vs 0.443 B**.
+
+Two things follow for distillation:
+
+- The single-vector objective above targets the **last layer**, which is *not* in
+  the KV cache at all (K/V at layer ℓ are projected from layer ℓ's *input*, so the
+  cache is built from layers 0..L−1; the final output feeds only the LM head). It
+  shapes the expert's input indirectly, via gradients through the stack.
+- The direct alternative is now well-defined across the whole stack: match teacher
+  **K/V at the `<traj_future_start>` column**, layer-mapped 36 → 28. Widths already
+  agree (8 × 128 = 1024 both sides), so it needs **no projector** — and with the
+  mirrored expert every one of those layers actually reaches the trajectory.
+
 ## What's in this recipe
 
 - **`models/distill_base_model.py`** — `DistillReasoningVLA(TrainableReasoningVLA)`:

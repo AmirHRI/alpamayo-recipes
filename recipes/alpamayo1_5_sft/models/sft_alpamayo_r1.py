@@ -85,6 +85,29 @@ def _load_modules_from_checkpoint(
         logger.warning(f"No {label} found in {checkpoint_dir}")
         return
 
+    # `strict=False` tolerates missing/unexpected *keys* but still raises on a
+    # shape mismatch for a key present in both. The action projections are sized
+    # by the expert's hidden_size, so any expert-width change makes the 10B's
+    # copies unloadable -- drop those rather than crash, leaving them at their
+    # (freshly initialised) values.
+    target_sd = model.state_dict()
+    skipped: list[str] = []
+    for key in list(state_dict):
+        tgt = target_sd.get(key)
+        if tgt is not None and tgt.shape != state_dict[key].shape:
+            skipped.append(f"{key} {tuple(state_dict[key].shape)}->{tuple(tgt.shape)}")
+            del state_dict[key]
+    if skipped:
+        logger.warning(
+            f"Skipped {len(skipped)} {label} with mismatched shapes "
+            f"(kept randomly initialised): {', '.join(skipped[:6])}"
+            + (" ..." if len(skipped) > 6 else "")
+        )
+
+    if not state_dict:
+        logger.warning(f"All {label} from {checkpoint_dir} were shape-incompatible; loaded none")
+        return
+
     result = model.load_state_dict(state_dict, strict=False, assign=True)
     logger.info(
         f"Loaded {len(state_dict)} {label} from {checkpoint_dir} "
@@ -129,7 +152,10 @@ class TrainableAlpamayoR1(AlpamayoR1):
         stage2_checkpoint_path: str | None = None,
         cotrain_vlm: bool = False,
         stop_grad_from_vlm: bool = True,
-        expert_num_layers: int = 7,
+        expert_num_layers: int | None = None,
+        expert_hidden_size: int | None = None,
+        expert_intermediate_size: int | None = None,
+        expert_num_attention_heads: int | None = None,
     ) -> "TrainableAlpamayoR1":
         """Load TrainableAlpamayoR1 with a custom (e.g. 2B) VLM backbone.
 
@@ -155,9 +181,24 @@ class TrainableAlpamayoR1(AlpamayoR1):
                 ALL tensors (``vlm.*``, ``expert.*``, ``action_*``) are loaded.
             cotrain_vlm: Keep VLM trainable during Stage 2 (default False).
             stop_grad_from_vlm: Detach VLM KV cache before passing to expert.
-            expert_num_layers: Transformer layers in the expert.
-                7 layers ≈ 0.44 B, matching the ~20 % VLM/expert ratio of
-                the original Alpamayo-1.5-10B (1.71 B expert / 8.8 B VLM).
+            expert_num_layers: Transformer layers in the expert. ``None`` (the
+                default) inherits the VLM's depth, mirroring Alpamayo-1.5-10B,
+                whose ``expert_cfg`` deliberately omits ``num_hidden_layers``.
+                **Depth is not a free parameter**: HF indexes the KV cache by
+                ``layer_idx``, so expert layer *i* attends to VLM cache layer *i*
+                and an expert shallower than the VLM leaves every deeper cache
+                layer unread by the action head. Shrink the expert via *width*
+                (below), the way the 10B does, not via depth.
+            expert_hidden_size: Expert width. ``None`` keeps the 10B's 2048.
+                The 10B uses half its VLM's width (2048 of 4096); the 2B mirror
+                is 1024 of 2048.
+            expert_intermediate_size: Expert MLP width. ``None`` keeps the 10B's
+                8256 (≈4.03 × hidden).
+            expert_num_attention_heads: Expert query heads. ``None`` keeps the
+                10B's 16. The 10B halves its VLM's query heads (32 → 16); the 2B
+                mirror is 16 → 8. ``num_key_value_heads`` and ``head_dim`` are
+                never overridden — they must match the VLM to stay KV-cache
+                compatible.
         """
         from hydra.utils import instantiate
 
@@ -168,9 +209,30 @@ class TrainableAlpamayoR1(AlpamayoR1):
         # 2. Override the VLM path so ReasoningVLA.__init__ builds a 2B architecture
         ar1_config.vlm_name_or_path = vlm_name_or_path
 
-        # 3. Set expert depth (controls ~0.44B size and KV-head compatibility)
+        # 3. Size the expert. Any key left out of `expert_cfg` is inherited from
+        #    the VLM's text_config (see AlpamayoR1.__init__). The 10B omits both
+        #    `num_hidden_layers` and `num_key_value_heads` on purpose: the expert
+        #    must be as DEEP as the VLM (expert layer i reads VLM cache layer i,
+        #    so a shallower expert strands the deeper cache layers) and must keep
+        #    the VLM's KV geometry to consume the cache at all. Only width shrinks.
         ar1_config.expert_cfg = dict(ar1_config.expert_cfg or {})
-        ar1_config.expert_cfg["num_hidden_layers"] = expert_num_layers
+        if expert_num_layers is None:
+            ar1_config.expert_cfg.pop("num_hidden_layers", None)  # inherit VLM depth
+        else:
+            ar1_config.expert_cfg["num_hidden_layers"] = expert_num_layers
+        for _key, _val in (
+            ("hidden_size", expert_hidden_size),
+            ("intermediate_size", expert_intermediate_size),
+            ("num_attention_heads", expert_num_attention_heads),
+        ):
+            if _val is not None:
+                ar1_config.expert_cfg[_key] = _val
+        # Drop any inherited override of the KV geometry so it always tracks the
+        # VLM: the cached K/V are [B, num_key_value_heads, T, head_dim] and the
+        # expert's own K/V must match to be concatenated onto them. (For the 2B
+        # this is a no-op -- both are 8 x 128 -- but it keeps other backbones safe.)
+        for _key in ("num_key_value_heads", "head_dim"):
+            ar1_config.expert_cfg.pop(_key, None)
 
         # 4. Instantiate trajectory tokeniser (has pretrained binning weights)
         pretrained_modules: dict[str, Any] = {}

@@ -8,4 +8,25 @@ stage1_vlm_checkpoint_path: null
 stage2_checkpoint_path: null   # set by evaluate_hf.py at eval time
 cotrain_vlm: false
 stop_grad_from_vlm: true
-expert_num_layers: 7   # 7 × 63 M ≈ 0.44 B → ~21% of 2B VLM (mirrors 10B ratio)
+
+# Expert geometry mirrors Alpamayo-1.5-10B: same DEPTH as the VLM, half the WIDTH.
+#
+# Depth is not a size knob. HF indexes the KV cache by `layer_idx`, so expert
+# layer i attends to VLM cache layer i. The previous setting (7 layers on a
+# 28-layer VLM) therefore left cache layers 7-27 unread — the action head saw
+# only the VLM's 7 shallowest layers. The 10B avoids this by omitting
+# `num_hidden_layers` from its expert_cfg (expert 36 == VLM 36) and shrinking
+# width instead (hidden 2048 of 4096, 16 query heads of 32).
+#
+# Applying the same rule at 2B, and keeping the parameter budget:
+#   depth      28  = VLM depth              (null → inherit)
+#   hidden   1024  = 2048 / 2               (10B: 2048 = 4096 / 2)
+#   inter    4128  = 6144 x 0.672           (10B: 8256 = 12288 x 0.672)
+#   q_heads     8  = 16 / 2                 (10B: 16 = 32 / 2)
+#   kv_heads/head_dim inherited from the VLM (8 x 128) — required for the expert
+#   to consume the VLM's cache; never overridden.
+# ≈ 0.47 B, vs 0.44 B for the old 7-layer expert, but reading all 28 cache layers.
+expert_num_layers: null
+expert_hidden_size: 1024
+expert_intermediate_size: 4128
+expert_num_attention_heads: 8
