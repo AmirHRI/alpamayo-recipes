@@ -373,18 +373,35 @@ KV. At eval, stack the latency levers distillation pays for: fewer camera frames
   co-resident teacher, and logit-KD (the natural next VLM term if the latent-only
   objective underperforms). Attention-map KD is deliberately skipped (it would
   force `eager`/`sdpa` attention, hurting both training and deploy latency).
-- **Strided cache map — full depth at shallow-expert cost.** Making the expert
-  full-depth is only a *means*; the requirement is that the action head sees all
-  of the VLM's layers. Those can be decoupled. HF picks the cache layer from each
-  attention module's `layer_idx`, so remapping a **7-layer** expert's indices to
-  `[0, 4, 9, 13, 18, 22, 27]` makes it read the full 28-layer depth while doing
-  exactly the shallow expert's compute — a strided map changes *which* cache index
-  is read, not the FLOPs or the KV volume, so it lands at **4.68 ms/step (47 ms
-  for 10 steps), ~2.9× cheaper than the current 28-layer expert, with the same
-  full-depth coverage**. Cost: a small patch (reassign `layer_idx` after
-  construction; the map is injective so no write conflicts) and a departure from
-  the teacher's strict 1:1 layer correspondence, whose training impact is
-  unmeasured. Worth benchmarking on a quiet GPU before adopting.
+- **Train full-depth, then prune — the plan for the expert's latency.** Rather
+  than trading coverage for speed upfront, keep the faithful 28-layer expert for
+  training and recover latency afterwards by dropping layers. This works because
+  **`layer_idx` travels with the module**: slicing the expert's `ModuleList`
+  leaves each surviving layer reading the exact cache layer it was trained
+  against. Verified on a toy model — keeping positions `[0,3,5,7]` of an 8-layer
+  expert yields `layer_idx == [0,3,5,7]`, and the forward reads cache indices
+  `[0,3,5,7]`. No patch required.
+
+  Pruning therefore *produces* a strided expert (e.g. 7 layers reading
+  `[0,4,9,13,18,22,27]`) with two advantages over choosing that map upfront: the
+  kept layers are selected by **measurement** rather than a uniform-stride guess,
+  and their weights were trained in full-depth context. Suggested procedure:
+  rank layers by ablation (drop one, measure minADE/corner-distance on val) or by
+  residual-contribution norm `‖out − in‖ / ‖in‖`; keep the top-K; then briefly
+  re-run Stage 2 to let them adapt (cheap — the VLM is frozen, only ~0.5 B trains).
+
+  Note the two levers multiply, so pruning may not even be needed:
+
+  | expert | 10 steps | 2 steps |
+  |---|---|---|
+  | 28 layers (current) | 136 ms | **27 ms** |
+  | 14 layers | ~70 ms | ~14 ms |
+  | 7 layers | ~40–77 ms | ~8–15 ms |
+
+  Caveat: 28 → 7 is a 4× depth cut, aggressive enough that recovery fine-tuning
+  is expected to be necessary rather than optional. If quality doesn't recover,
+  the pruned expert can itself be distilled from the full-depth one
+  (expert → expert), which is a cheaper problem than the VLM distillation above.
 
 See the design menu (all VLM/expert/orchestration options with pros/cons) that
 this recipe was distilled from in the planning notes.
