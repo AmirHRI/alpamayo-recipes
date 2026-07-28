@@ -19,6 +19,7 @@ from itertools import islice
 
 import hydra
 import hydra.utils as hyu
+import json
 import torch
 
 from omegaconf import DictConfig, OmegaConf
@@ -110,6 +111,12 @@ def evaluate(cfg: DictConfig) -> None:
     metric_counts = defaultdict(int)
     val_count = 0
 
+    # Per-clip metric records for post-hoc grouping (e.g. LCDrive scenario
+    # categories). Only collected on the main process; correct as-is for a
+    # single-process (nproc_per_node=1) run where each clip is seen exactly once.
+    per_clip_records: list[dict] = []
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
     for data in tqdm(dataloader_iter, total=total, disable=not is_main_process):
         output_batch = {}
         with torch.autocast("cuda", dtype=dtype_map[cfg.evaluate.torch_dtype]):
@@ -122,6 +129,23 @@ def evaluate(cfg: DictConfig) -> None:
         if is_main_process:
             val_count += int(gathered_batch_size.sum().item())
 
+        # Collect per-clip scalar metrics (shape [B]) keyed by clip_id.
+        if is_main_process:
+            clip_ids = data.get("clip_id", None)
+            if clip_ids is not None:
+                bsz = len(clip_ids)
+                per_metric = {}
+                for k, v in output_batch.items():
+                    if not k.startswith("metric/"):
+                        continue
+                    if isinstance(v, torch.Tensor) and v.ndim == 1 and v.shape[0] == bsz:
+                        per_metric[k[len("metric/") :]] = v.detach().float().cpu().tolist()
+                for i, cid in enumerate(clip_ids):
+                    rec = {"clip_id": cid}
+                    for mk, vals in per_metric.items():
+                        rec[mk] = vals[i]
+                    per_clip_records.append(rec)
+
         for k, v in output_batch.items():
             if not k.startswith("metric/"):
                 continue
@@ -132,6 +156,22 @@ def evaluate(cfg: DictConfig) -> None:
 
     if not is_main_process:
         return
+
+    # Write per-clip metrics so results can be grouped by scenario category etc.
+    if per_clip_records:
+        if world_size > 1:
+            logger.warning(
+                f"WORLD_SIZE={world_size} > 1: per-clip metrics reflect the main "
+                "process shard only. Run eval with nproc_per_node=1 for a complete "
+                "per-clip dump."
+            )
+        per_clip_path = cfg.evaluate.get("per_clip_output", None)
+        if per_clip_path is None:
+            per_clip_path = os.path.join(cfg.paths.output_dir, "lcdrive_val_per_clip_metrics.json")
+        os.makedirs(os.path.dirname(per_clip_path), exist_ok=True)
+        with open(per_clip_path, "w", encoding="utf-8") as f:
+            json.dump(per_clip_records, f)
+        logger.info(f"Wrote {len(per_clip_records)} per-clip metric records to {per_clip_path}")
 
     final_metrics_dict = {}
     for key in metric_sums.keys():

@@ -172,6 +172,10 @@ class PAIDataset(Dataset):
             cot_data = self.avdi.get_reasoning_data(clip_id, t0_us)
             sample_data.update(cot_data)
 
+        # Carry the clip UUID through the batch (non-tensor keys are collated as
+        # a per-sample list) so downstream eval can attribute metrics per clip.
+        sample_data["clip_id"] = str(clip_id)
+
         if self.vla_preprocess_func is not None:
             sample_data["tokenized_data"] = self.vla_preprocess_func(data=sample_data)
 

@@ -1,0 +1,16 @@
+# Released Alpamayo-1.5-10B loaded for TOKEN-trajectory evaluation only.
+#
+# Builds our TrainableReasoningVLA from the released 10B A1-format checkpoint via
+# `from_alpamayo_checkpoint`, which loads ONLY the `vlm.*` weights (the sharded
+# loader filters to the `vlm.` prefix) and instantiates the trajectory tokenizer
+# from the checkpoint config. The action expert / diffusion tensors are ignored,
+# so trajectories come purely from the VLM's discrete-token head — the same path
+# our 2B Stage-1 model uses, enabling an apples-to-apples minADE comparison.
+#
+# Trajectory tokenization matches our 2B (traj_vocab_size=4000,
+# tokens_per_future_traj=128, tokens_per_history_traj=48), all read from the 10B
+# config.json. The VLM backbone is Cosmos-Reason2-8B (processor/tokenizer +
+# architecture); weights come from the checkpoint, not from this path.
+_target_: alpamayo1_5_sft.models.sft_base_model.TrainableReasoningVLA.from_alpamayo_checkpoint
+checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
