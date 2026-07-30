@@ -144,7 +144,11 @@ class PhysicalAIAVDatasetLocalInterface:
             for ev in parsed:
                 if isinstance(ev, dict) and "event_start_timestamp" in ev:
                     ts_list.append(int(ev["event_start_timestamp"]))
-                    cot_list.append(str(ev.get("cot", "")))
+                    # The reasoning parquet names this field "coc" (chain-of-causation),
+                    # not "cot". Reading "cot" silently yielded "" for all 1740 clips,
+                    # so every sample got an empty reasoning string. Keep "cot" as a
+                    # fallback in case a future export renames it.
+                    cot_list.append(str(ev.get("coc", ev.get("cot", ""))))
             out[cid] = {
                 "event_t0s": np.asarray(ts_list, dtype=np.int64),
                 "cot": cot_list,
