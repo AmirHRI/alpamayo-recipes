@@ -23,6 +23,7 @@
 #   TRAIN_BS   per_device_train_batch_size (default 4)
 #   GRAD_ACC   gradient_accumulation_steps (default 1)
 #   MAX_STEPS  cap training steps for a smoke test (default: unset = full run)
+#   RESUME     resume from checkpoint: "true" (latest in output_dir) or a path
 
 set -euo pipefail
 
@@ -55,6 +56,12 @@ EXTRA_ARGS=()
 if [[ -n "${MAX_STEPS:-}" ]]; then
     # `max_steps` isn't in the base trainer struct, so append it with `+`.
     EXTRA_ARGS+=("+trainer.max_steps=${MAX_STEPS}")
+fi
+
+# Optional resume after an interrupted run. RESUME=true auto-detects the latest
+# checkpoint in output_dir; RESUME=/path/to/checkpoint-N resumes from a specific one.
+if [[ -n "${RESUME:-}" ]]; then
+    EXTRA_ARGS+=("+trainer.resume_from_checkpoint=${RESUME}")
 fi
 
 echo "[slurm] Stage-2 LCDrive: GPUS=${GPUS} TRAIN_BS=${TRAIN_BS} GRAD_ACC=${GRAD_ACC} " \

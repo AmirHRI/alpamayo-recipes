@@ -87,7 +87,17 @@ def train(cfg: DictConfig) -> None:
             include_hydra_config=True,
         )
 
-    trainer.train()
+    # Resume from a checkpoint when requested. Accepts either an explicit
+    # checkpoint dir or `true` (HF auto-detects the latest checkpoint in
+    # output_dir). Useful after a node reboot kills a long run.
+    resume_arg = cfg.trainer.get("resume_from_checkpoint", None)
+    if isinstance(resume_arg, str) and resume_arg.lower() in ("true", "false"):
+        resume_arg = resume_arg.lower() == "true"
+    if resume_arg:
+        logger.info(f"Resuming training from checkpoint: {resume_arg}")
+        trainer.train(resume_from_checkpoint=resume_arg)
+    else:
+        trainer.train()
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
