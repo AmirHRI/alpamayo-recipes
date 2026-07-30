@@ -1,0 +1,51 @@
+# Student: Cosmos-Reason2-2B VLM + KAVA latent slots supervised by the teacher's
+# compressed KV cache (arXiv:2510.02312).
+#
+# `teacher_hidden_dim` drives the parent's single-vector loss (lambda_1) and MUST
+# equal the width of the cached teacher hidden: 4096 = Alpamayo-1.5-10B, 2048 = the
+# 2B stand-in teacher. Set it to null to disable that term (KAVA reports the
+# CODI-style loss destabilising on long traces and uses lambda_1 = 0 on its hardest
+# dataset), leaving L_KV as the only distillation signal.
+_target_: alpamayo1_5_distill.models.kava_model.KaVaReasoningVLA.from_pretrained_vlm
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+checkpoint_path: null
+
+# lambda_1: the endpoint hidden match (KAVA's L_CODI analogue), inherited.
+teacher_hidden_dim: 4096
+latent_loss_weight: 1.0
+latent_cosine_weight: 0.1
+
+kava:
+  # M — must equal the collator's num_slots AND the cached tier's M.
+  num_slots: 16
+  # Depth of the teacher whose cache was recorded; builds the 28 -> 36 layer map.
+  teacher_layers: 36
+  # T — passes that produce the latents. 1 = the slots ride the single prefill pass,
+  # which the causal mask makes exactly free (nested-prefix invariance is measured at
+  # cos = 1.000000000, reasoning-setup-2b.md §9). T > 1 adds PCCoT Jacobi refinement:
+  # better per KAVA's Fig 7, but each extra iteration costs a pass, and with ~85 ms of
+  # the 100 ms budget already in prefill there is little room. Sweep it.
+  jacobi_iters: 1
+  # lambda_2 on L_KV.
+  kv_loss_weight: 1.0
+  # "l1" | "mse" | "smooth_l1" — the paper's best choice varies by dataset.
+  kv_loss_type: smooth_l1
+  # KAVA's "Layer-wise std" row: normalise each layer's residual by its teacher
+  # target's std. Qwen3-VL K/V magnitudes differ by orders of magnitude across depth
+  # ("massive activations"), so leaving this off lets the largest layers dominate.
+  kv_layerwise_std: true
+  # "projector" learns a per-layer 1024->1024 change of basis (~59M throwaway params,
+  # identity-initialised so training STARTS at the `direct` objective); "direct"
+  # matches raw K/V for free. Per-layer geometry already agrees (8 x 128 = 1024 on
+  # both sides) — what differs is the learned W_k/W_v basis, since unlike KAVA this
+  # is cross-model rather than self-distillation.
+  kv_align: projector
+  # null = uniform stride with endpoints preserved (28 -> 36).
+  kv_layer_map: null
+  # Seed the slots from the most frequent tokens in the teacher's own CoT. Measured
+  # to beat randn on this exact model (§9.1 C3: 3.71 vs 4.98 starting loss, ~3x
+  # faster convergence), reproducing Lester et al. (2021) below ~10B.
+  slot_init: vocab
+  slot_init_cot_text: null   # set to the cache_root holding cot_text.*.jsonl
+  slot_init_std: 0.02

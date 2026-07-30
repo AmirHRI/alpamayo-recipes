@@ -1,0 +1,20 @@
+# Teacher = Alpamayo-1.5-10B **with the action expert loaded**, for
+# `importance_source=expert`: R-KV's importance term is then the attention the action
+# expert pays each CoT token, i.e. the queries that actually read this cache at
+# inference rather than a text-answer proxy.
+#
+# Why a separate config from teacher_ar1_5_10b.yaml: that one targets
+# DistillReasoningVLA (a TrainableReasoningVLA — VLM only, ~8B, loads in ~12s and has
+# no expert/action_space/diffusion). This one loads the full checkpoint including the
+# 2.279B expert, so it is heavier; use it only for the expert-scored cache.
+#
+# The expert's 36 layers match the VLM's 36, which is what makes the score per-layer
+# meaningful (expert layer i cross-attends VLM cache layer i). expert_cot_importance
+# asserts that rather than assuming it.
+#
+# cotrain_vlm=false keeps the VLM frozen (this is a pure inference job anyway).
+_target_: alpamayo1_5_distill.models.expert_teacher.KaVaExpertTeacher.from_pretrained
+pretrained_model_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+dtype: auto
+cotrain_vlm: false
+stage1_vlm_checkpoint_path: null

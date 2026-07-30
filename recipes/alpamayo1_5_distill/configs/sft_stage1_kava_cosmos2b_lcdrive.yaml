@@ -1,0 +1,125 @@
+# Stage-1 KAVA distillation of the 2B Cosmos-Reason2 student on the OFFICIAL
+# LCDrive train split (UUID-filtered) — 38,340 train / 23,331 val clips.
+#
+# The student is text-silent: the `default` processor has no `cot` in
+# components_order, and K latent slots are spliced in where the CoT would be, just
+# before <|traj_future_start|> so they land inside the KV cache the action expert is
+# handed (cropped at future_start_idx + 1). Their per-layer K/V are matched against
+# the teacher's CoT cache after R-KV eviction to M entries.
+#
+# NOTE this replaces the nav-demo dataset the older sft_stage1_distill_cosmos2b.yaml
+# uses: that config keys the cache by `t0_relative` from an annotations JSON, which
+# does not intersect the LCDrive cache's (clip_id, DEFAULT_T0_US) key space.
+#
+# Prerequisites:
+#   1. scripts/generate_teacher_kv.py  (config=cache_teacher_kv_lcdrive)
+#   2. point kv_cache_root / kv_tier below at its output
+#   3. set model.kava.num_slots == the tier's M == data.collate_fn.num_slots
+#
+# Launch (from the alpamayo1_5_sft venv, PYTHONPATH includes recipes/). Use
+# train_kava, not train_hf: it swaps in KaVaTrainer, which logs the three loss terms
+# separately — "total went down" cannot tell you whether L_KV did anything.
+#   torchrun --nproc_per_node 8 -m alpamayo1_5_distill.train_kava \
+#     --config-path pkg://alpamayo1_5_distill/configs \
+#     --config-name sft_stage1_kava_cosmos2b_lcdrive \
+#     data.train_dataset.kv_cache_root=/data/achahe/.../teacher_kv_lcdrive
+defaults:
+  - sft_base
+  - /models/cosmos_reason2_2b_kava@model
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  kava:
+    # Seed the slots from the teacher's own CoT text, which lives in the same cache
+    # directory. Without this the model falls back to the first N vocabulary entries
+    # and prints a warning — a quiet loss of the measured vocab-init win.
+    slot_init_cot_text: ${data.train_dataset.kv_cache_root}
+
+data:
+  # Class-based collator (not _partial_) so the QwenProcessor is built ONCE per
+  # worker instead of on every batch, and so it can splice the slot placeholders.
+  # num_slots MUST match model.kava.num_slots.
+  collate_fn:
+    _target_: alpamayo1_5_distill.data.kava_dataset.KaVaCollator
+    # MUST override sft_base's `_partial_: true`. Left partial, hydra returns
+    # `partial(KaVaCollator, ...)` and HF Trainer calls it as `collate_fn(features)`,
+    # which would construct a fresh collator per batch with the batch itself landing
+    # in `model_config`. Instantiating it as an object is also what lets the
+    # QwenProcessor be built once per worker instead of on every call.
+    _partial_: false
+    num_slots: 16
+    chat_template_version: r1_5
+
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.kava_dataset.KaVaPAIDataset
+    _recursive_: false
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"     # scan all present chunks; UUID filter does the selection
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    use_default_keyframe: true
+    teacher_cache_path: null   # the tfs hidden rides in the KV cache instead
+    kv_cache_root: ???         # set to generate_teacher_kv.py's cache_root
+    kv_tier: compressed_M16_rkv0.1
+    num_slots: 16
+    attach_tfs_hidden: true
+    vla_preprocess_args:
+      generation_mode: false
+
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.kava_dataset.KaVaPAIDataset
+    _recursive_: false
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    use_default_keyframe: true
+    teacher_cache_path: null
+    kv_cache_root: null       # eval needs no teacher target; slots still run
+    kv_tier: null
+    num_slots: 16
+    vla_preprocess_args:
+      generation_mode: true
+
+  # Training is I/O-bound on decoding 16 video frames/sample, and now also reads
+  # ~2.4 MB of cached KV per sample. More workers + prefetch keep the GPU fed.
+  dataloader_num_workers: 12
+  dataloader_prefetch_factor: 4
+  dataloader_persistent_workers: true
+
+trainer:
+  report_to: none
+  lr_multiplier:
+    vlm.model.visual: 0.1
+    # Randomly/vocab-initialised heads that must learn fast relative to the
+    # pretrained backbone. The KV projectors start at identity, so they only need to
+    # learn a correction, not the whole map — a smaller multiplier than latent_proj.
+    latent_proj: 10.0
+    kv_projector: 5.0
+    slot_embeddings: 10.0
+    jacobi_proj: 5.0
+  ddp_find_unused_parameters: false
+
+  # ⚠️ REQUIRED: gradient checkpointing silently forces use_cache=False and detaches
+  # anything a forward hook captured on the first pass, so L_KV would compute a
+  # finite, decreasing-looking number and supervise nothing. KaVaReasoningVLA raises
+  # rather than let that happen. Stage-2 already runs with it off for its own reasons.
+  gradient_checkpointing: false
+
+  # Smaller than the plain Stage-1 LCDrive run (bs=8) because checkpointing is off
+  # and the K/V capture retains per-layer slot activations. Raise until it OOMs.
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 1e-5
+  warmup_steps: 500
+  num_train_epochs: 3
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_kava_cosmos2b_lcdrive
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_kava_stage1_cosmos2b_lcdrive

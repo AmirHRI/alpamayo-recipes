@@ -1,0 +1,49 @@
+# Teacher KV-CACHE build over the official LCDrive TRAIN split (UUID-filtered).
+#
+# Same data selection as sft_stage1_cosmos2b_lcdrive.yaml, so the cache keys
+# (clip_id, DEFAULT_T0_US) line up with the student's training samples one-for-one.
+#
+# What this records per clip (see scripts/generate_teacher_kv.py):
+#   full/                 pre-RoPE per-layer CoT K/V + both R-KV scores + tfs hidden
+#   compressed_M<M>_...   the top-M eviction the student trains against
+#   cot_text.shard<N>.jsonl   the teacher's reasoning as text
+#
+# ⚠️ `cot` MUST be the LAST component (distill_teacher_generate) so the assistant
+# turn ends with <|cot_start|> and the teacher reasons BEFORE the handoff token. A
+# traj_future-last prompt pre-fills <|traj_future_start|> and the teacher emits an
+# EMPTY CoT — the builder raises on an empty span, and cot_text.jsonl is where you
+# would see it first.
+#
+# Put cache_root on /data: the cache is O(100 GB) and /home is quota-capped at 100 GB.
+#
+# Run (shard across GPUs; ~1 sample/s/GPU for the 10B):
+#   for s in 0 1 2 3 4 5 6 7; do CUDA_VISIBLE_DEVICES=$s python -m \
+#     alpamayo1_5_distill.scripts.generate_teacher_kv \
+#     config=cache_teacher_kv_lcdrive teacher=teacher_ar1_5_10b \
+#     cache_root=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive \
+#     m=16 lam=0.1 eviction=rkv num_shards=8 shard=$s & done
+defaults:
+  - sft_base
+  - /models@model: teacher_ar1_5_10b
+  - /vla_processor@data.cache_dataset.vla_preprocess_args: distill_teacher_generate
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+data:
+  cache_dataset:
+    _target_: alpamayo1_5_distill.data.distill_dataset.DistillPAIDataset
+    _recursive_: false
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"     # scan all present chunks; the UUID filter selects LCDrive train
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    use_default_keyframe: true
+    teacher_cache_path: null   # building the cache, not reading it
+    vla_preprocess_args:
+      generation_mode: true
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+task_name: alpamayo_1_5_kava_cache_lcdrive

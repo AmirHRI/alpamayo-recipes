@@ -202,7 +202,7 @@ class DistillReasoningVLA(TrainableReasoningVLA):
         return self._gather_tfs_hidden(input_ids, outputs.hidden_states[-1])
 
     @torch.no_grad()
-    def extract_tfs_hidden_generated(
+    def generate_cot_prefix(
         self,
         tokenized_data: dict[str, Any],
         ego_history_xyz: torch.Tensor | None = None,
@@ -211,24 +211,24 @@ class DistillReasoningVLA(TrainableReasoningVLA):
         do_sample: bool = False,
         temperature: float = 0.6,
         top_p: float = 0.98,
-        return_text: bool = False,
         **kwargs: Any,
-    ) -> torch.Tensor | tuple[torch.Tensor, str]:
-        """Teacher-side: let the teacher GENERATE its own CoT, then read the hidden.
+    ) -> tuple[torch.Tensor, int]:
+        """Generate the teacher's CoT and return ``[context + CoT + <tfs>]``.
 
-        This mirrors the deployed rollout
+        Mirrors the deployed rollout
         (``AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout``): the VLM
         generates free text (its chain-of-thought) with the discrete-trajectory
-        vocab masked out, and stops at ``<traj_future_start>``. We then run one
-        clean forward over the generated prefix ``[context + CoT + <traj_future_start>]``
-        and take the last-layer hidden at that token — the same single-forward
-        gather the student uses, so teacher and student targets are computed
-        identically.
+        vocab masked out, and stops at ``<traj_future_start>``.
 
-        Requires no ground-truth CoT (the teacher was trained to produce it), so
-        it works on any clip. Processes ONE sample at a time (batch size 1), which
-        keeps the per-row image inputs unambiguous. Greedy (``do_sample=False``) by
-        default for a reproducible, deterministic cache target.
+        Split out of :meth:`extract_tfs_hidden_generated` so the KV-cache builder
+        can reuse the exact same generation — the two caches must describe the same
+        CoT, or the KV target and the endpoint target would disagree about what the
+        teacher reasoned.
+
+        Returns:
+            ``(trunc, prompt_len)`` — the truncated sequence ``[1, T]`` whose last
+            token is ``<traj_future_start>``, and the length of the prompt prefix
+            (so the caller can decode only the generated span).
         """
         from transformers import StoppingCriteriaList
         from transformers.generation.logits_process import LogitsProcessorList
@@ -238,7 +238,7 @@ class DistillReasoningVLA(TrainableReasoningVLA):
 
         tokenized_data = dict(tokenized_data)
         input_ids = tokenized_data.pop("input_ids")
-        assert input_ids.shape[0] == 1, "extract_tfs_hidden_generated expects batch size 1"
+        assert input_ids.shape[0] == 1, "generate_cot_prefix expects batch size 1"
         input_ids = self.fuse_traj_tokens(
             input_ids,
             {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot},
@@ -280,9 +280,46 @@ class DistillReasoningVLA(TrainableReasoningVLA):
         matches = (row == eos_id).nonzero(as_tuple=True)[0]
         end = int(matches[0]) if len(matches) else int(row.shape[0] - 1)
         trunc = row[: end + 1].unsqueeze(0)  # [1, end+1]; last token = <traj_future_start>
+        return trunc, int(input_ids.shape[1])
 
-        # 2. one clean forward over the generated prefix -> hidden at <traj_future_start>
-        fwd_kwargs = {k: v for k, v in tokenized_data.items() if k != "attention_mask"}
+    @torch.no_grad()
+    def extract_tfs_hidden_generated(
+        self,
+        tokenized_data: dict[str, Any],
+        ego_history_xyz: torch.Tensor | None = None,
+        ego_history_rot: torch.Tensor | None = None,
+        max_new_tokens: int | None = None,
+        do_sample: bool = False,
+        temperature: float = 0.6,
+        top_p: float = 0.98,
+        return_text: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor | tuple[torch.Tensor, str]:
+        """Teacher-side: let the teacher GENERATE its own CoT, then read the hidden.
+
+        One clean forward over the generated prefix
+        ``[context + CoT + <traj_future_start>]``, taking the last-layer hidden at
+        that token — the same single-forward gather the student uses, so teacher and
+        student targets are computed identically.
+
+        Requires no ground-truth CoT (the teacher was trained to produce it), so it
+        works on any clip. Processes ONE sample at a time (batch size 1), which keeps
+        the per-row image inputs unambiguous. Greedy (``do_sample=False``) by default
+        for a reproducible, deterministic cache target.
+        """
+        trunc, prompt_len = self.generate_cot_prefix(
+            tokenized_data,
+            ego_history_xyz=ego_history_xyz,
+            ego_history_rot=ego_history_rot,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        fwd_kwargs = {
+            k: v for k, v in tokenized_data.items() if k not in ("attention_mask", "input_ids")
+        }
         outputs = self.vlm(
             input_ids=trunc,
             attention_mask=torch.ones_like(trunc),
@@ -293,7 +330,7 @@ class DistillReasoningVLA(TrainableReasoningVLA):
         hidden = self._gather_tfs_hidden(trunc, outputs.hidden_states[-1])  # [1, H]
 
         if return_text:
-            gen_only = row[input_ids.shape[1] : end + 1]
+            gen_only = trunc[0, prompt_len:]
             return hidden, self.tokenizer.decode(gen_only, skip_special_tokens=False)
         return hidden
 

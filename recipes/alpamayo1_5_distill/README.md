@@ -320,9 +320,17 @@ Two things follow for distillation:
   cache is built from layers 0..L−1; the final output feeds only the LM head). It
   shapes the expert's input indirectly, via gradients through the stack.
 - The direct alternative is now well-defined across the whole stack: match teacher
-  **K/V at the `<traj_future_start>` column**, layer-mapped 36 → 28. Widths already
-  agree (8 × 128 = 1024 both sides), so it needs **no projector** — and with the
-  mirrored expert every one of those layers actually reaches the trajectory.
+  **K/V per layer**, layer-mapped 36 → 28. Widths already agree (8 × 128 = 1024 both
+  sides) — and with the mirrored expert every one of those layers actually reaches
+  the trajectory. This is what the **KAVA** section below implements.
+
+  > Earlier drafts of this README concluded from the matching widths that K/V
+  > matching "needs **no projector**". Matching *widths* is not matching *bases*:
+  > teacher and student are separately trained checkpoints, so their `W_k`/`W_v`
+  > need not agree even at identical geometry. Both variants are therefore wired
+  > (`kv_align: direct | projector`), with the projectors identity-initialised so
+  > `projector` starts at exactly the `direct` objective and the two form a clean
+  > ablation pair rather than two unrelated runs.
 
 ## What's in this recipe
 
@@ -355,6 +363,201 @@ Two things follow for distillation:
     — GT-CoT (`cot`-in-order) processors for the teacher-force path.
   - Shared groups (`sft_base`, `deepspeed`, existing `models`/`vla_processor`)
     resolve from `alpamayo1_5_sft/configs` via `hydra.searchpath`.
+
+### Added for KAVA
+
+- **`models/kv_distill.py`** — the pure math: R-KV scoring (`redundancy_score`,
+  `importance_score`, `combine_scores`), `select_top_m` / `evict_teacher_cache`,
+  `build_layer_map` (28 → 36), `KVProjectorBank`, `kv_matching_loss`.
+- **`models/kava_model.py`** — `KaVaReasoningVLA(DistillReasoningVLA)`: slot
+  embeddings, the `embed_tokens` injection hook, per-layer pre-RoPE K/V capture,
+  the PCCoT Jacobi loop, and `L_KV`.
+- **`models/teacher_kv.py`** — teacher-side capture (one forward split into two
+  segments; see below). Used only by the cache builder.
+- **`models/expert_teacher.py`** — `KaVaExpertTeacher` (a teacher carrying both the
+  action expert and CoT generation) plus `expert_cot_importance` / `score_from_qk` /
+  `build_noisy_action` for `importance_source=expert`.
+- **`data/kv_cache_io.py`** — the tiered per-sample store (`full/`,
+  `compressed_<tag>/`, `index.*.json`, `cot_text.*.jsonl`), mmap reads.
+- **`data/kava_dataset.py`** — `KaVaPAIDataset` and `KaVaCollator`
+  (`splice_slot_placeholders`, `pad_kv_to_budget`).
+- **`scripts/{cache_common,generate_teacher_kv,compress_teacher_kv,validate_kv_distill}.py`**
+  — shared builder plumbing (also now used by `generate_teacher_features.py`), the
+  KV cache builder, offline recompression, and the KV1–KV7 harness.
+- **`trainer.py` / `train_kava.py`** — `KaVaTrainer` logs the loss terms separately
+  and keeps weight decay off the soft prompt; `train_kava` rebinds the trainer in
+  `alpamayo1_5_sft.train_hf` rather than forking it.
+- **`configs/{cache_teacher_kv_lcdrive,sft_stage1_kava_cosmos2b_lcdrive}.yaml`**,
+  **`configs/models/cosmos_reason2_2b_kava.yaml`** and
+  **`configs/models/teacher_ar1_5_10b_expert.yaml`**.
+
+## KAVA: compressed KV-cache distillation
+
+`KAVA` (arXiv:2510.02312, ICLR 2026) supplies the supervision the single-vector
+objective cannot express. `K` continuous **latent slots** stand where the teacher's
+text CoT stood, and their per-layer, per-head **K and V** are matched against the
+teacher's CoT cache after **redundancy/importance-aware eviction** down to `K`
+entries:
+
+```
+S_{i,h,l} = λ · I_{i,h,l}  +  (1 − λ) · R_{i,h,l}          λ = 0.1
+L_KV      = mean over valid slots of  |sg[K̃_t] − A_l(K_s)|_p  +  |sg[Ṽ_t] − B_l(V_s)|_p
+L         = L_CE(traj)  +  λ₁ · L_latent(tfs hidden)  +  λ₂ · L_KV
+```
+
+`I` is the attention the *reader* pays each CoT token (MaxPooled over each GQA query
+group first — several queries share one cached pair, and a pair matters if any of
+them needs it); `R` is softmax-normalised negated mean pairwise key cosine. The
+paper's central claim is what makes this usable across two different models: a
+compressed cache has **lost token correspondence**, and that is fine — continuous
+latents can absorb structure that token- or hidden-level matching cannot express.
+
+Two readers can supply `I`, selected by `importance_source`:
+
+| | `vlm_post_cot` | `expert` |
+|---|---|---|
+| Queries | the `[<\|cot_end\|>, <\|traj_future_start\|>]` tokens (N_A ≈ 2) | the action expert's 64 noisy action tokens |
+| Teacher needed | VLM only (`teacher_ar1_5_10b`) | VLM + expert (`teacher_ar1_5_10b_expert`) |
+| Faithfulness | a text proxy for the reader | **the actual reader** — these queries consume this cache at inference |
+| Cost / sample | negligible | ~1 s (3 timesteps), 22.7 GiB peak |
+
+`expert` is the more faithful signal and is why this recipe can improve on KAVA's
+text-answer formulation: in a driving VLA the answer is not text at all.
+
+### Four places this departs from the paper
+
+1. **Cross-model, not self-distillation.** KAVA runs one model in two modes. Here
+   10B → 2B means depth differs (36 vs 28, hence the layer map) and the learned K/V
+   bases need not agree, hence `kv_align`.
+2. **The "answer" is not text.** The expert consumes the KV cache cropped at
+   `future_start_idx + 1`, so the KV target *is* the expert's input rather than a
+   proxy — and the slots must be spliced **before** `<|traj_future_start|>`, not
+   appended at the end as in `reasoning-setup-2b.md` §9's harness, or they fall
+   outside that crop. It also means R-KV's importance term has a *better* source here
+   than in the paper: `importance_source=expert` scores CoT tokens by the expert's own
+   cross-attention (see below).
+3. **`M` can exceed `N_C`.** Real driving CoT is ~40 tokens and the teacher is capped
+   at 128, so at `M=32` eviction is sometimes a near-no-op and short traces leave
+   slots with no target. Those are masked out of `L_KV` (`valid_mask`); KAVA never
+   meets this case. Mild compression is the paper's *good* regime, so this is
+   favourable, not a problem.
+4. **Keys are matched pre-RoPE.** `DynamicCache` stores post-RoPE keys; eviction
+   reorders which CoT token each slot targets, so any position-dependent component of
+   the target is arbitrary by construction. The hooks read `k_norm` instead.
+   *Measured honestly:* on this model the phase effect is **modest** — 6.8% rel-L2
+   pre- vs post-RoPE, 12.9% for the same keys rotated 3000 positions later, because
+   `rope_theta = 5e6` leaves the low-frequency dimensions nearly unrotated. So
+   pre-RoPE is a well-founded default that costs nothing, not a large measured win.
+
+### Why the teacher runs offline first
+
+Decisively cheaper, and it is the question worth answering before building anything:
+
+| | Offline (this recipe) | Online teacher |
+|---|---|---|
+| Teacher forwards | 38,340 (once) | 38,340 × epochs × sweep points |
+| CoT generation in the step loop | never | autoregressive, dominates step time |
+| Resident weights | student only | +21 GB (10B VLM + 2.279B expert) |
+| Sweeping `M`/`λ`/eviction | recompress from `full/`, CPU only | full re-run each time |
+
+It is *valid* because the PAI path is fully deterministic — no augmentation, no random
+frame sampling anywhere (the only `random` call in the data path is LingoQA's retry),
+`t0_us` is the constant `DEFAULT_T0_US = 5_100_000`, camera order is force-sorted, and
+generation is pinned greedy. The cost is disk and one ~10 h pass (~1.5 h over 8 shards).
+
+### What the teacher pass records
+
+One full forward, **split into two segments**, so the marginal cost over the existing
+single-vector cache run is negligible:
+
+- **segment A** `[context + CoT]` with `use_cache=True`; forward hooks on each layer's
+  `k_norm` / `v_proj` collect the CoT span's pre-RoPE K/V (sliced inside the hook, so
+  it costs kilobytes per layer rather than 36 full-sequence copies).
+- **segment B** the `[<|cot_end|>, <|traj_future_start|>]` tail against that cache —
+  yielding the `tfs` hidden, so one cache run feeds both objectives, and (for
+  `importance_source=vlm_post_cot`) `I` via **eager** attention and
+  `output_attentions=True`.
+
+After segment B the cache is exactly `[prompt + CoT + <tfs>]`, i.e. the same object
+`TrainableAlpamayoR1.forward` hands the expert after cropping at
+`future_start_idx + 1`. So `importance_source=expert` needs **no third prefill** — it
+reads that cache directly.
+
+#### Scoring by the expert's cross-attention
+
+`models/expert_teacher.py`. Two problems had to be solved rather than assumed away:
+
+- **The expert runs non-causal.** `expert_non_causal_attention: true` arrives as an
+  `is_causal=False` forward kwarg that only the *sdpa* path honours —
+  `eager_attention_forward` **ignores `is_causal` entirely** and applies whatever mask
+  `create_causal_mask` built. Capturing weights with `output_attentions=True` (which
+  requires eager) would therefore have returned **causal** attention the expert never
+  computes. Instead the attention is reconstructed directly: post-RoPE queries from a
+  `q_norm` hook against the post-RoPE keys the forward leaves in the cache, softmaxed
+  over the full key axis with no mask. `test_score_from_qk_matches_the_eager_reference`
+  pins that to eager's arithmetic; it is also cheaper, one layer's logits at a time
+  instead of 36 attention matrices at once.
+- **The expert's input is noisy.** `noisy_x` and `timesteps` are randomly sampled in
+  training, which an offline cache cannot tolerate. The timesteps are a fixed grid
+  (default `(0.0, 0.5, 1.0)`) and the noise comes from a seeded CPU generator, so a
+  clip always scores the same. The grid spans the flow: `t=1` is the clean action —
+  KAVA's "answer" end — and `t=0` is the pure noise the expert actually starts from at
+  inference. `build_noisy_action` asserts the diffusion is `FlowMatching` rather than
+  duck-typing the interpolation.
+
+`KaVaExpertTeacher` exists because `TrainableAlpamayoR1` (expert, action space,
+diffusion) and `DistillReasoningVLA` (CoT generation) are **siblings** under
+`ReasoningVLA`, not a chain — neither alone can build this cache. It borrows
+`generate_cot_prefix` directly rather than duplicating it, since that method only
+touches the shared `ReasoningVLA` surface.
+
+| Tier | Contents | Size |
+|---|---|---|
+| `full/` | `k_pre`, `v` `[36, 8, N_C, 128]` bf16 + `imp`, `red` + `tfs_hidden` | ~5.9 MB at N_C=40, ≤18.9 MB at the 128 cap |
+| `compressed_M16_rkv0.1/` | `k_pre`, `v` `[36, 8, M, 128]` + `sel_idx` + `tfs_hidden` | ~2.4 MB |
+| `cot_text.shard*.jsonl` | the teacher's reasoning as text | ~200 B |
+
+Training reads only the compressed tier (~19 MB/step at bs=8). `full/` exists so every
+`(M, λ, method)` point is re-derivable by `compress_teacher_kv.py` with **no teacher
+and no GPU**. Projected totals for LCDrive-train: ~226 GB (`full/`, N_C=40) + ~90 GB
+(`M=16`). **Put `cache_root` on `/data`** — `/home` is quota-capped at 100 GB.
+
+### Two things that fail silently, and how they are prevented
+
+- **`gradient_checkpointing: true`** forces `use_cache=False` *and* detaches
+  hook-captured tensors, so `L_KV` would be finite, look like it was descending, and
+  supervise nothing. `KaVaReasoningVLA._assert_capture_possible` raises instead; the
+  student config sets it `false`.
+- **`cot` not last in `components_order`** pre-fills `<|traj_future_start|>` and the
+  teacher emits an *empty* CoT. `find_cot_span` raises on an empty span, and
+  `cot_text.*.jsonl` is where you would notice first.
+
+### Validated on the real 2B — `scripts/validate_kv_distill.py`, 7/7
+
+```
+python -m alpamayo1_5_distill.scripts.validate_kv_distill 8 float32
+```
+
+| Check | Result |
+|---|---|
+| **KV1** rotate(hooked pre-RoPE K) == `DynamicCache` K; hooked V == cache V | rel-L2 **0.0** and **0.0** |
+| **KV2** eviction is per-(layer, head); ablations differ; order is temporal | **220/224** distinct index sets; `rkv`≠`attn`≠`cosine`; `crop` = first M; ascending |
+| **KV3** importance is a real attention distribution + GQA MaxPool | rows sum to 1.000000; 16 q-heads → 8 kv-heads (group 2) |
+| **KV4** `slot_pos` ↔ placeholders; `<tfs>` two columns after the last slot | slots provably inside the expert's crop |
+| **KV5** gradient reaches slots, backbone and projector through `L_KV` | ‖slots.grad‖ 2.6e1, non-zero 8/8, per-slot cosine max **0.58** (≈1.0 would be a broadcast bug) |
+| **KV6** self-consistency floor: `L_KV` driven toward 0 on a solvable target | 2.767 → **0.393** (14.2%) in 200 steps |
+| **KV7** cache round-trip; offline recompression reproduces the inline result | identical indices, rel-L2 0.0 |
+
+Two findings worth carrying forward:
+
+- **KV6's step budget is load-bearing.** At 30 steps it bottoms out near 44% of the
+  starting loss and reads as a failure; 200 steps with a decaying LR reaches 14%. The
+  slot → per-layer-K/V map is 28 layers deep and the slots attend to each other, so
+  this is slow optimisation, not a broken objective. Do not shorten it and conclude
+  the wiring is wrong.
+- **Low `L_KV` does not pin the slot embedding.** The recovered slots sit 17× away
+  from the ones that generated the target. That is the representational slack KAVA
+  relies on — and a reminder that `L_KV` constrains the *cache*, not the latent.
 
 ## How to run
 
@@ -418,6 +621,87 @@ KV. At eval, stack the latency levers distillation pays for: fewer camera frames
 (`num_frames=8`), a capped/silent rollout, and fewer diffusion steps
 (`diffusion_kwargs={"inference_step": 2}`, already plumbed).
 
+### The KAVA path
+
+**K1. Validate the machinery first** — it needs no data and no teacher, and it is
+where the two silent failure modes get caught:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $VENV/python -m alpamayo1_5_distill.scripts.validate_kv_distill 8 float32
+$VENV/python -m pytest tests/test_kava.py -q     # 35 GPU-free tests
+```
+
+**K2. Pilot the KV cache on 200 samples** before committing to the full run — `N_C`
+is what decides the disk bill and it cannot be predicted from configs:
+
+```bash
+ROOT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive
+CUDA_VISIBLE_DEVICES=0 $VENV/python -m alpamayo1_5_distill.scripts.generate_teacher_kv \
+    config=cache_teacher_kv_lcdrive teacher=teacher_ar1_5_10b \
+    cache_root=$ROOT m=16 lam=0.1 eviction=rkv mode=generate limit=200
+# prints per-tier MB/entry, the projected GB for 38,340 clips, and the N_C histogram
+```
+
+Check `cot_text.shard0.jsonl` is non-empty — an empty CoT means the
+`components_order` gotcha, and it shows up here before anything else.
+
+To score by the **action expert** instead of the post-CoT text (the faithful reader),
+swap in the expert-carrying teacher:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 $VENV/python -m alpamayo1_5_distill.scripts.generate_teacher_kv \
+    config=cache_teacher_kv_lcdrive teacher=teacher_ar1_5_10b_expert \
+    importance_source=expert expert_timesteps=0.0,0.5,1.0 expert_noise_seed=0 \
+    cache_root=$ROOT-expert m=16 lam=0.1 eviction=rkv limit=200
+```
+
+Keep the two caches in separate `cache_root`s: the eviction they imply differs
+substantially (agreement ~0.44 at `M < N_C`), so they are a real ablation pair, not
+interchangeable. `importance_source=none` gives diversity-only eviction and needs no
+answer queries at all.
+
+**K3. Build the full cache**, sharded across GPUs (each shard writes its own files,
+so no merge step):
+
+```bash
+for s in 0 1 2 3 4 5 6 7; do
+  CUDA_VISIBLE_DEVICES=$s $VENV/python -m alpamayo1_5_distill.scripts.generate_teacher_kv \
+      config=cache_teacher_kv_lcdrive teacher=teacher_ar1_5_10b cache_root=$ROOT \
+      m=16 lam=0.1 eviction=rkv num_shards=8 shard=$s &
+done; wait
+```
+
+**K4. Train.** Use `train_kava`, not `train_hf` — it swaps in `KaVaTrainer`, and
+without the per-term logging "total went down" cannot tell you whether `L_KV` did
+anything:
+
+```bash
+$VENV/torchrun --nproc_per_node 8 -m alpamayo1_5_distill.train_kava \
+    --config-path pkg://alpamayo1_5_distill/configs \
+    --config-name sft_stage1_kava_cosmos2b_lcdrive \
+    data.train_dataset.kv_cache_root=$ROOT
+```
+
+**K5. Sweep without re-running the teacher.** Every `(M, λ, method)` point is a
+different eviction of the same forward:
+
+```bash
+for m in 8 32; do $VENV/python -m alpamayo1_5_distill.scripts.compress_teacher_kv \
+    cache_root=$ROOT m=$m lam=0.1 eviction=rkv; done
+for e in cosine attn crop; do $VENV/python -m alpamayo1_5_distill.scripts.compress_teacher_kv \
+    cache_root=$ROOT m=16 eviction=$e; done
+# then: data.train_dataset.kv_tier=compressed_M32_rkv0.1 model.kava.num_slots=32 \
+#       data.collate_fn.num_slots=32   (all three must agree)
+```
+
+Also sweep `model.kava.{jacobi_iters,kv_loss_type,kv_loss_weight,kv_align,kv_layerwise_std}`.
+`jacobi_iters` is the one with a latency cost: `T=1` rides the single prefill pass for
+free, each further iteration adds a pass against ~85 ms of prefill in a 100 ms budget.
+
+**K6. The dead-slot gate.** After training, zero the slots at inference. If quality
+does not drop, the slots are decorative and `L_KV` achieved nothing, whatever the loss
+curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-splice.
+
 ## Status — verified end-to-end (real H100, real PAI data)
 
 - **Cache builder** runs with both a 2B stand-in teacher (dim 2048) and the real
@@ -446,6 +730,61 @@ KV. At eval, stack the latency levers distillation pays for: fewer camera frames
   the cache builder and the real `torchrun -m alpamayo1_5_sft.train_hf
   --config-path pkg://alpamayo1_5_distill/configs` launch); the student trains
   CoT-free while the teacher cache is built from the teacher's own CoT.
+
+### KAVA status
+
+- **Machinery validated, 7/7** on the real Cosmos-Reason2-2B — see the KV1–KV7 table
+  above. 35 GPU-free tests in `tests/test_kava.py` (they caught a mask-broadcast bug
+  in `kv_matching_loss` that would have crashed the first masked batch).
+- **Model wiring checked** on the real student: 28 layers → layer map
+  `[0, 1, 3, …, 32, 34, 35]`, `slot_embeddings [16, 2048]`, projector bank **58.7 M**
+  params, all four `lr_multiplier` prefixes matching real parameters, the projector
+  exactly the identity at init (rel-L2 0.0), and the gradient-checkpointing guard
+  firing.
+- **End-to-end forward + backward on real LCDrive data**, through the real config
+  (dataset → collator → `forward` → `backward`), with fabricated KV targets for two
+  clips — one at `N_C = 16` and one at `N_C = 7`, so both the full and the short-CoT
+  masking path run:
+
+  ```
+  batch: input_ids (2, 3142)  slot_pos row0 2993..3008  teacher_kv_k (2, 36, 8, 16, 128)
+  valid/row [16, 7]   slots precede <tfs>: True   labels off slots: True
+  loss=52.47  ce=29.16  latent=20.75  kv=2.56  n_valid_slots=11.5   (= (16+7)/2 ✓)
+  grads: slot_embeddings 43.2 · latent_proj 31.1 · kv_projector.k_proj.0 0.154
+         kv_projector.v_proj.27 0.115 · backbone k_proj.0 104.0
+  per-slot grads non-zero 16/16, pairwise cosine max 0.73  (≈1.0 would be broadcast)
+  ```
+
+  This caught a config bug worth remembering: `data.collate_fn` inherits
+  **`_partial_: true`** from `sft_base`, so a class-target collator comes back as
+  `partial(KaVaCollator, …)` and HF Trainer calls it as `collate_fn(features)` — the
+  batch lands in `model_config` and a fresh collator is built per batch. The KAVA
+  config sets `_partial_: false` explicitly.
+- **Not yet run:** the KV cache build itself, and therefore no training numbers. The
+  cache builder's teacher path shares `generate_cot_prefix` with the already-validated
+  single-vector builder, but the two-segment capture has not been exercised against
+  the 10B — do the 200-sample pilot (step **K2**) first.
+- **`importance_source="expert"` built and verified against the real 10B**
+  (`teacher_ar1_5_10b_expert`, expert loaded, 22.7 GiB peak):
+
+  | | Measured |
+  |---|---|
+  | expert depth == VLM depth (the per-layer correspondence this relies on) | 36 == 36 ✅ |
+  | score shape / non-negativity | `[36, 8, N_C]`, min 5.4e-5, max 3.7e-2 ✅ |
+  | reproducible at a fixed seed | bit-identical across runs ✅ |
+  | seed / timestep grid actually matter | rel 0.031 / 0.291 ✅ |
+  | genuinely a different signal from `vlm_post_cot` | rel **0.982** |
+  | changes *which* tokens survive (at `M=4 < N_C=11`) | agreement only **0.438** (rkv), **0.390** (attn-only) |
+  | per-head variety | **125** distinct index sets across 288 (layer, head) pairs |
+  | cost | ~**1.0 s/sample** for 3 timesteps |
+
+  ⚠️ Two things worth knowing. First, HF warns that `action_space.{accel,curvature}_{mean,std}`
+  and the Fourier `freqs` were "newly initialized" — that is **cosmetic**: they are
+  config-derived registered buffers, and the loaded values match `config.json`
+  (`accel_mean` 0.029053 vs 0.02902694, the difference being bf16 rounding under
+  `dtype: auto`). Second, at `M >= N_C` eviction is a no-op and *every* scoring method
+  agrees perfectly — so a short-CoT sample cannot demonstrate that the score works.
+  Compare methods at `M < N_C`.
 
 ## Scope & follow-ups
 

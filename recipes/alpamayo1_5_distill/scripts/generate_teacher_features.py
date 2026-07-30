@@ -45,28 +45,18 @@ Usage::
 """
 
 import os
-import sys
 import time
 
 import hydra.utils as hyu
 import torch
-from hydra import compose, initialize_config_dir
 from safetensors.torch import load_file as _load_safetensors
 
 from alpamayo1_5_distill.data.distill_dataset import save_teacher_cache
-
-
-def _to_device(x, device):
-    """Recursively move tensors (incl. those nested in dicts) to ``device``."""
-    if isinstance(x, torch.Tensor):
-        return x.to(device)
-    if isinstance(x, dict):
-        return {k: _to_device(v, device) for k, v in x.items()}
-    return x
+from alpamayo1_5_distill.scripts import cache_common
 
 
 def main() -> None:
-    argv = dict(a.split("=", 1) for a in sys.argv[1:] if "=" in a)
+    argv = cache_common.main_argv()
     config_name = argv.get("config", "cache_teacher_features")
     out_path = argv.get("out", "teacher_features.safetensors")
     limit = int(argv.get("limit", 0))  # 0 == all
@@ -79,50 +69,16 @@ def main() -> None:
     max_new_tokens = int(argv["max_new_tokens"]) if "max_new_tokens" in argv else None
     do_sample = argv.get("do_sample", "false").lower() in ("1", "true", "yes")
 
-    overrides = [f"{k}={v}" for k, v in argv.items() if ("." in k or "@" in k)]
-    if "teacher" in argv:
-        overrides.append(f"models@model={argv['teacher']}")
-
-    cfg_dir = os.path.abspath(
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configs")
-    )
-    with initialize_config_dir(config_dir=cfg_dir, version_base=None):
-        cfg = compose(config_name=config_name, overrides=overrides)
-
+    cfg = cache_common.compose_config(config_name, argv)
     device = torch.device("cuda")
 
     print(f"[cache] mode={mode} shard={shard}/{num_shards} out={out_path}", flush=True)
-    print("[cache] instantiating teacher ...", flush=True)
-    t0 = time.time()
-    # The teacher's 8B VLM skeleton is random-initialised on CPU by
-    # Qwen3VLForConditionalGeneration(config) and then FULLY overwritten by the
-    # checkpoint (load_alpamayo1_vlm, assign=True). Skipping that throwaway init
-    # cuts the load from ~200s to well under a minute.
-    from transformers.modeling_utils import no_init_weights
-
-    with no_init_weights():
-        model = hyu.instantiate(cfg.model, _convert_="partial")
-    model = model.to(device).eval()
-    model.requires_grad_(False)
-    print(f"[cache] teacher built in {time.time() - t0:.1f}s", flush=True)
+    model = cache_common.build_teacher(cfg, device)
 
     dataset = hyu.instantiate(
         cfg.data.cache_dataset, _convert_="partial", model_config=model.config
     )
-
-    # Build ONE reusable processor for collation. collate_fn_from_model_config
-    # rebuilds a QwenProcessor (AutoProcessor.from_pretrained + add 4000 tokens)
-    # on every call — a few seconds per sample. Building it once here removes that.
-    from alpamayo.processor.qwen_processor import QwenProcessor
-
-    _qp = QwenProcessor(
-        vlm_name_or_path=model.config.vlm_name_or_path,
-        traj_vocab_size=model.config.traj_vocab_size,
-        min_pixels=model.config.min_pixels,
-        max_pixels=model.config.max_pixels,
-        chat_template_version="r1_5",
-    )
-    _qp.build_processor()
+    _qp = cache_common.build_processor(model)
 
     # Resume: load any partial cache for this shard and skip its keys.
     features: dict[str, torch.Tensor] = {}
@@ -130,7 +86,7 @@ def main() -> None:
         features = dict(_load_safetensors(out_path))
         print(f"[cache] resuming: {len(features)} features already present in {out_path}", flush=True)
 
-    shard_idx = [i for i in range(len(dataset)) if i % num_shards == shard]
+    shard_idx = cache_common.shard_indices(len(dataset), num_shards, shard)
     todo = [i for i in shard_idx if dataset._sample_key(i) not in features]
     if limit:
         todo = todo[:limit]
@@ -140,39 +96,7 @@ def main() -> None:
         flush=True,
     )
 
-    # DataLoader prefetches + decodes camera frames in parallel workers so disk/CPU
-    # overlaps the GPU. Workers only touch CPU (frame load + tokenize); the GPU
-    # forward stays in the main process. Each item is (idx, collated-batch-of-1).
-    from torch.utils.data import DataLoader
-
-    class _IdxDataset:
-        def __init__(self, base, idxs):
-            self.base = base
-            self.idxs = idxs
-
-        def __len__(self):
-            return len(self.idxs)
-
-        def __getitem__(self, j):
-            i = self.idxs[j]
-            try:
-                s = self.base[i]
-            except Exception as ex:  # a bad clip shouldn't kill the whole run
-                print(f"[cache] idx={i} load error: {ex}", flush=True)
-                s = None
-            return i, s
-
-    def _collate_one(items):
-        i, s = items[0]
-        return (i, None) if s is None else (i, _qp.collate_fn([s]))
-
-    loader = DataLoader(
-        _IdxDataset(dataset, todo),
-        batch_size=1,
-        num_workers=num_workers,
-        collate_fn=_collate_one,
-        prefetch_factor=4 if num_workers else None,
-    )
+    loader = cache_common.sample_loader(dataset, todo, _qp, num_workers=num_workers)
 
     teacher_hidden_dim: int | None = None
     done = 0
@@ -182,7 +106,7 @@ def main() -> None:
         if batch is None:
             continue
         key = dataset._sample_key(idx)
-        batch = _to_device(batch, device)
+        batch = cache_common.to_device(batch, device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             if mode == "generate":
                 want_text = printed < log_texts
