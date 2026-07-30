@@ -298,13 +298,17 @@ vision+text batch: **78-token prefix (64 vision tokens) + K=8 slots** appended.
 
 ### Results
 
+Reproduce: `python -m alpamayo1_5_distill.scripts.validate_reasoning_slots [K] [dtype]`
+
 | Check | | Evidence |
 |---|---|---|
+| Placeholder token collides with nothing | ✅ | id 13 `'.'` vs `image/video/vision_start/vision_end` = 151655/151656/151652/151653; not in `all_special_ids` |
 | M-RoPE — vision keeps 2-D spatial ids | ✅ | over 64 vision tokens: `t` uniq=1, `h` uniq=8, `w` uniq=8 |
 | M-RoPE — slots are text-like, contiguous, correctly placed | ✅ | `t=h=w`, +1 each, first slot at `prefix_max + 1` |
-| **Nested-prefix invariance** (§2's load-bearing claim) | ✅ | `h(Q_1..Q_N)` for N=1,2,3,4,6 vs K=8: **cos = 1.000000000**, rel-L2 ≈ 2e-6 |
-| Slots don't contaminate the prefix | ✅ | prefix hiddens **bit-identical** with and without slots |
+| **Nested-prefix invariance** (§2's load-bearing claim) | ✅ | `h(Q_1..Q_N)` for N=1,2,4 vs K=8: **cos = 1.000000000**, rel-L2 ≈ 2e-6 |
+| Slots don't contaminate the prefix | ✅ | unchanged to round-off: **exactly 0** in bf16, rel-L2 ≈ 2.5e-6 in fp32 |
 | KV-cache equivalence | ✅ | prefill prefix → feed slots, vs one pass: cos = 0.99999994, rel-L2 ≈ 3e-6 |
+| **Splice instrument** (§7d gate) | ✅ | self-splice **exactly 0.000**; cross-splice rel-L2 = 0.166 |
 | Slot-only carry across frames (§4) | ✅ | see below |
 
 **The nested budget in §2 is exact, not approximate.** One backbone pass genuinely serves every
@@ -340,13 +344,25 @@ ids = torch.cat([ids, torch.full((1, K), PLACEHOLDER)], dim=1)
 
 # 2. swap the slot rows in via a forward hook on embed_tokens. This runs BEFORE
 #    the vision masked_scatter, so vision merge + deepstack are untouched.
+#    Index by an EXPLICIT position tensor, never `[-K:]` -- see below.
 def hook(mod, args, out):
-    out = out.clone(); out[:, -K:, :] = slots; return out
+    n = slot_pos.numel()
+    out = out.clone(); out[:, slot_pos, :] = slots[:n]; return out
 emb.register_forward_hook(hook)
 
 # 3. positions need no custom code: slots are ordinary text tokens, so
 #    get_rope_index gives them t=h=w continuing from the prefix automatically.
 ```
+
+**Do not use `out[:, -K:, :]`.** The trailing-K assumption holds only for a single prefill pass and
+breaks the moment a forward covers just the new tokens against a cache — i.e. exactly the Stage-4
+recurrence path. Switching to explicit positions immediately exposed a latent bug the trailing
+slice had been masking (it broadcast all K slots regardless of how many positions the current
+forward actually covered, silently corrupting the nested-prefix runs).
+
+Also verify the placeholder id collides with nothing `get_placeholder_mask` or the deepstack path
+keys on — a token that is special for some *other* reason would fail in the same silent way M-RoPE
+does. (Checked above: `'.'` = 13 is clean.)
 
 ### §4 recurrence: carrying slot KV across frames — works
 
@@ -364,10 +380,17 @@ for lyr in cache.layers:                      # keep just the slot positions
 | cache length after slicing | 86 → 8 ✅ |
 | carried size | 0.92 MB at bf16 for K=8 → **3.7 MB at K=32** — matches §4's estimate exactly |
 | frame *t+1* runs against the K-length cache | ✅ cache 8 → 94, finite |
-| carry **influences** frame *t+1* | ✅ rel diff **1.51** vs no-carry, **1.16** vs zero-carry |
+| carry is **connected**, not silently dropped | ✅ rel diff **1.51** vs no-carry, **1.16** vs zero-carry |
 
 The zero-carry control matters: it shows the effect comes from the carried *content*, not merely
 from the presence of K extra attendable positions.
+
+> ⚠️ **Read this as plumbing, not as a positive result.** "Carry influences the output" and "carry
+> helps" are different claims and only training separates them. On an **untrained** model — which has
+> never seen carried slot KV — a perturbation this large (rel > 1) most plausibly means the carried
+> state is **off-manifold and disrupting** the forward pass, not informing it. What §6 establishes is
+> the necessary precondition: the wiring is connected and fails loudly rather than silently. Nothing
+> more.
 
 ### 🔑 RoPE phase is frozen at cache-write time — two regimes
 
@@ -381,9 +404,44 @@ position it was written. Changing the offset assigned to the next frame changed 
 | **Fixed relative position** — slots always sit immediately before the current frame | ❌ requires **re-rotating** the cached keys ⇒ store them *pre*-RoPE and apply rotary on the fly (the Kamera mechanism named in §2). Custom cache class. |
 
 **Practical read:** over the 4–8-frame truncated-BPTT windows §4 specifies, monotonic positions
-drift only ~8 slots/frame ≈ 64 positions — comfortably inside the trained range. Combined with the
+drift only ~30 positions/frame — comfortably inside the trained range. Combined with the
 `if t % N_refresh == 0: drop cache` guard already in §4, which bounds drift for long rollouts, the
 pre-RoPE cache is likely **deferrable** until a long-horizon run actually shows degradation.
+
+### ❗ RoPE attenuation does *not* give you free forgetting
+
+If relative distance grows every frame under monotonic positions, does the carry's influence decay
+on its own? Measured directly — hold a frame-1 carry fixed, advance frame-2's positions by
+`age × 30`:
+
+| slot age | 1 frame | 2 frames | 4 frames | 8 frames |
+|---|---|---|---|---|
+| influence (rel vs no-carry) | 1.5080 | 1.4728 | 1.4703 | 1.4455 |
+
+Decay is **monotonic but negligible — ~4 % over 8 frames.** Two consequences:
+
+- **Good:** there is no sharp cliff, so nothing forces the pre-RoPE cache for short windows.
+- **Important:** monotonic positions are **not** doing any of the retention gate's job. Do not
+  count on RoPE attenuation as a forgetting mechanism — the learned gate `g` and `N_refresh` in §4
+  are carrying that load entirely, and remain load-bearing.
+
+⚠️ Measured on an **untrained** model whose carried state is plausibly off-manifold; the decay
+profile could differ once the slots are trained. Worth re-running at Stage 4.
+
+### The §7(d) splice instrument is validated
+
+The evaluation protocol for the whole causal-intervention line of work depends on extract→re-inject
+being lossless. It is:
+
+| Condition | Measured | Required |
+|---|---|---|
+| **self-splice** — re-inject the same scene's own slot KV | **0.000e+00 exactly** | exactly 0 ✅ |
+| **cross-splice** — inject a different scene's slot KV | rel-L2 = 0.166 | non-trivial ✅ |
+
+Self-splice hitting *exact* zero means the instrument itself introduces no drift, so any effect seen
+in a cross-splice experiment is attributable to the substituted content rather than to the splicing
+machinery. That gate is now green **before** training, which is when you want it — the same class of
+silent-failure risk as the M-RoPE bug, caught the same way.
 
 ### Measurement note — do not use absolute tolerances
 
@@ -392,9 +450,29 @@ A first pass in bf16 appeared to fail the nested-prefix and cache checks with er
 where bf16 ulp is 8, and ~4096 where it is 32. In fp32 the same checks give rel-L2 ≈ 2e-6. Use
 relative L2 / cosine, never an absolute threshold, when validating these.
 
+### Downstream consequence: massive activations ⇒ plan for outlier-aware quantization
+
+The ~1350-magnitude hidden states above are the known **massive-activations** phenomenon, and they
+are exactly what breaks naive low-precision quantization — the reason FlashDrive needed ParoQuant to
+"suppress outliers and prevent compounding errors" for W4A8. Since the Thor path assumes FP8/NVFP4,
+budget for **outlier-aware** quantization rather than vanilla per-tensor scaling.
+
+Second-order: massive activations frequently coincide with **attention-sink** dimensions. If sinks
+dominate attention mass over the prefix, diagnostic §7(b) — attention mass to slot KV vs vision KV —
+needs a **sink-excluded variant**, or slot attention will look misleadingly small.
+
 ### Not covered by these tests
 
 Forward-pass mechanics only. Untested: whether the carried state stays **stable** over long rollouts
 rather than blowing up or locking in (that is what the gate `g` and `N_refresh` are for), and
-everything in §7 that requires a trained model — the ablation health check, attention mass, linear
-probe, and the self-/cross-splice protocol.
+everything in §7 that requires a trained model — the ablation health check, attention mass, and the
+linear probe. Note the splice *instrument* is validated above, but the splice *experiment* (does
+cross-splice change actions in a directionally correct way?) still needs a trained model and an
+action head.
+
+### Next step, with a correction to §8 step 2
+
+Measure **latency vs K** — but not at this test's token count. 64 vision tokens is a far harsher
+case than reality: 32 slots on 64 vision tokens is **+50 %** sequence length, whereas on a realistic
+~1000-token multi-camera prefill it is **+3 %**. Measuring at 64 would badly understate how cheap
+slots are.
