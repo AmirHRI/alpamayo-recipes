@@ -212,6 +212,34 @@ if t % N_refresh == 0: drop cache      # bounded recompute — hard lock-in guar
 
 Train with **truncated BPTT** over short windows (4–8 frames) before attempting longer.
 
+### ⚠️ Both mechanisms are load-bearing — measurement in §9 says so
+
+§9 measured carry influence as a function of slot age: it decays **~4 % over 8 frames**, i.e. it is
+flat. RoPE attenuation provides *no meaningful natural forgetting*. Consequences:
+
+- **`N_refresh` is the primary staleness bound, not a backstop.** With no natural decay, a stale
+  belief retains essentially full influence right up until the hard reset. That makes the
+  VLADriveBench lock-in failure mode (Alpamayo hallucinating speed bumps; 4/4 route failures) *more*
+  concerning here, not less — budget `N_refresh` accordingly rather than treating it as a rare
+  safety valve.
+- **A scalar `g` is probably insufficient.** Any age-dependence must now be *learned explicitly*,
+  since the geometry supplies none: prefer **per-slot or per-layer gating**, or feed an explicit
+  age/staleness feature, over a single scalar.
+
+### 🔑 Sliding window vs. accumulating — decide before Stage 4
+
+The §9 trace (`86 → 8 → 94`) is a **sliding window of 1**: frame *t+1* carries only frame *t*'s
+slots. State that explicitly, because the alternative — accumulating `t, t+1, …` — has a very
+different risk profile:
+
+| | Carried length | Staleness | Lock-in risk |
+|---|---|---|---|
+| **Window of 1** (recommended default) | constant `K` | structurally bounded to one frame | lower |
+| Accumulating | grows `K` per frame | unbounded until `N_refresh` | **higher — and the 4 % decay result makes it worse**, since old slots never fade on their own |
+
+Recommend the **window of 1** as the default: it bounds staleness structurally rather than relying
+on a decay that was measured not to exist. Revisit only if a window of 1 proves too forgetful.
+
 ---
 
 ## 5. Losses
@@ -356,9 +384,16 @@ emb.register_forward_hook(hook)
 
 **Do not use `out[:, -K:, :]`.** The trailing-K assumption holds only for a single prefill pass and
 breaks the moment a forward covers just the new tokens against a cache — i.e. exactly the Stage-4
-recurrence path. Switching to explicit positions immediately exposed a latent bug the trailing
-slice had been masking (it broadcast all K slots regardless of how many positions the current
-forward actually covered, silently corrupting the nested-prefix runs).
+recurrence path.
+
+> **Provenance of the nested-invariance number.** While switching to explicit positions I briefly
+> omitted the `[:n]` slice, which **crashed loudly** (`shape mismatch: value tensor of shape
+> [8, 2048] cannot be broadcast to indexing result of shape [1, 1, 2048]`) — it never produced a
+> number, so there is no false-positive risk. The `cos = 1.000000000` figure comes from the earlier
+> fp32 script, whose hook (`out[:, -n:, :] = slots[:n]`) was correct for that test; the current
+> script re-measures it independently via explicit positions and agrees at rel-L2 ≈ 2e-6. The N set
+> shrank from {1,2,3,4,6} to {1,2,4} only to keep runtime down — nothing failed. Net: the
+> load-bearing claim is confirmed by **two independent injection paths**.
 
 Also verify the placeholder id collides with nothing `get_placeholder_mask` or the deepstack path
 keys on — a token that is special for some *other* reason would fail in the same silent way M-RoPE
@@ -449,6 +484,59 @@ A first pass in bf16 appeared to fail the nested-prefix and cache checks with er
 `8.0` and `32.0`. Those are **1 ulp**: hidden states reach magnitudes ~1350 ("massive activations"),
 where bf16 ulp is 8, and ~4096 where it is 32. In fp32 the same checks give rel-L2 ≈ 2e-6. Use
 relative L2 / cosine, never an absolute threshold, when validating these.
+
+### Gradient actually reaches Q — the check that decides whether Stage 0/1/2 mean anything
+
+Forward mechanics can all be right while the *training* path is silently broken: if gradient never
+reaches `Q`, Stages 0/1/2 still run, converge, and show no gain — and that reads as "reproduced the
+pause-token negative result" when it is a plumbing bug. Reproduce with
+`python -m alpamayo1_5_distill.scripts.validate_slot_gradients`.
+
+| Check | | Result |
+|---|---|---|
+| grad reaches `Q` at all | ✅ | `‖Q.grad‖ = 1.16e6`, non-zero at **8/8** slot indices |
+| every slot gets a **distinct** grad (no broadcast bug) | ✅ | per-slot norms span 1.9e5–9.4e5; pairwise cosine max **0.469**, mean 0.095 (≈1.0 would mean broadcast) |
+| grad flows through a **carried** cache (§4 BPTT) | ✅ | sliced carried keys stay attached to the graph |
+
+**`Q` is *not* in `model.parameters()`** — it is an `nn.Parameter` living outside the model, so it
+will be silently skipped by any optimizer built the usual way:
+
+```python
+optim = AdamW([{"params": model.parameters()},
+               {"params": [Q], "lr": lr_Q}])      # Q needs its own entry
+```
+
+#### ⚠️ Q's gradients are 40–1100× larger per element than the backbone's
+
+| | per-element grad norm | ratio vs `Q` |
+|---|---|---|
+| `Q` (16 k params) | 9.10e3 | — |
+| lm layer 0 `q_proj` | 2.25e2 | 40× |
+| lm layer 27 `mlp.down` | 3.15e1 | 289× |
+| lm layer 27 `q_proj` | 8.07e0 | 1128× |
+
+Partly structural: `Q` sits at the input, so its gradient accumulates through all 28 layers of
+backprop (visible in the layer-0 vs layer-27 spread too). Three practical consequences:
+
+1. **This likely inverts the usual "new params need a higher LR" intuition.** The signal reaching
+   `Q` is already very strong; a higher LR on top may be actively wrong. Start at parity or below
+   and tune from measurement.
+2. **Global grad-norm clipping needs watching.** A 16 k-parameter tensor contributing `1.16e6` of
+   norm can eat a disproportionate share of the clip budget and quietly scale down the backbone's
+   effective step. Consider clipping `Q` in its own group.
+3. **Adam largely normalises raw magnitude away** per-parameter, so this matters most for clipping,
+   weight decay, and any SGD-flavoured optimiser — less for the bare LR.
+
+⚠️ Measured against **3 representative weight matrices**, not the full-backbone gradient norm, and
+on an untrained model with a random-projection loss. Treat the ratios as order-of-magnitude.
+
+#### Truncated BPTT: you must detach at the window boundary
+
+G5 confirms the carried keys **remain attached to the autograd graph** after slicing. That is what
+makes BPTT *within* a window work — and it also means that without an explicit
+`cache.detach()`-equivalent at the truncation boundary, the graph will extend across every frame
+ever carried and memory will grow without bound. Standard truncated-BPTT hygiene, but the slicing
+operation gives no hint that it preserves the graph, so it is easy to miss.
 
 ### Downstream consequence: massive activations ⇒ plan for outlier-aware quantization
 
