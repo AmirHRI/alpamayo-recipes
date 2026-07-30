@@ -91,7 +91,17 @@ gap is ~700×.
 
 ```python
 # reasoning slots: K learnable embeddings at LM input dim
-Q = nn.Parameter(torch.randn(K, 2048) * 0.02)     # K=32 → 65,536 params
+# ✅ MEASURED (§9.1 C3): initialise from REAL TOKEN EMBEDDINGS, not randn.
+#    Vocab-init gave a lower starting loss (3.71 vs 4.98) and ~3x faster
+#    convergence than randn*0.02 -- reproducing Lester et al. (2021) on this
+#    model. Seed from frequent tokens in the teacher's CoT traces, so the slots
+#    start near the region of embedding space the text CoT they must internalise
+#    actually occupies.
+E = model.get_input_embeddings().weight              # [V, 2048]
+Q = nn.Parameter(E[seed_token_ids[:K]].clone())      # K=32 → 65,536 params
+# (randn * 0.02 is NOT badly scaled -- §9.1 C2 measures it at 2.0e-2 per-element
+#  RMS vs 3.19e-2 for real embeddings, only 1.59x apart. The argument for
+#  vocab-init is semantic placement, not scale.)
 ```
 
 **65k parameters — 0.003% of the 2.44B backbone.** The capacity does not come from these weights; it
@@ -515,20 +525,23 @@ optim = AdamW([{"params": model.parameters()},
 | lm layer 27 `mlp.down` | 3.15e1 | 289× |
 | lm layer 27 `q_proj` | 8.07e0 | 1128× |
 
-Partly structural: `Q` sits at the input, so its gradient accumulates through all 28 layers of
-backprop (visible in the layer-0 vs layer-27 spread too). Three practical consequences:
+> 🚨 **This comparison is not apples-to-apples — do not draw an LR conclusion from it.**
+> `∂L/∂W` is an outer product accumulated over ~86 sequence positions and normalised by a
+> 4.2 M-element tensor; `∂L/∂Q_i` is a single backprop path through one position normalised by
+> 2048. Much of the 40–1128× may be that normalisation difference rather than a real signal
+> asymmetry. The like-for-like control — `∂L/∂Q_i` vs `∂L/∂(embed output)` at ordinary **text
+> positions in the same forward** — is in **§9.1** below.
 
-1. **This likely inverts the usual "new params need a higher LR" intuition.** The signal reaching
-   `Q` is already very strong; a higher LR on top may be actively wrong. Start at parity or below
-   and tune from measurement.
-2. **Global grad-norm clipping needs watching.** A 16 k-parameter tensor contributing `1.16e6` of
-   norm can eat a disproportionate share of the clip budget and quietly scale down the backbone's
-   effective step. Consider clipping `Q` in its own group.
-3. **Adam largely normalises raw magnitude away** per-parameter, so this matters most for clipping,
-   weight decay, and any SGD-flavoured optimiser — less for the bare LR.
+What *does* survive regardless of the control:
+
+- **Global grad-norm clipping needs watching.** A 16 k-parameter tensor contributing `1.16e6` of
+  norm can eat a disproportionate share of the clip budget and quietly scale down the backbone's
+  effective step. **Clip `Q` in its own group.**
+- **Adam largely normalises raw magnitude away** per-parameter, so this is a **clipping and
+  weight-decay** concern rather than an LR one.
 
 ⚠️ Measured against **3 representative weight matrices**, not the full-backbone gradient norm, and
-on an untrained model with a random-projection loss. Treat the ratios as order-of-magnitude.
+on an untrained model with a random-projection loss. Order-of-magnitude only.
 
 #### Truncated BPTT: you must detach at the window boundary
 
@@ -557,6 +570,88 @@ everything in §7 that requires a trained model — the ablation health check, a
 linear probe. Note the splice *instrument* is validated above, but the splice *experiment* (does
 cross-splice change actions in a directionally correct way?) still needs a trained model and an
 action head.
+
+## §9.1 The like-for-like control, init scale, and a capacity floor test
+
+Reproduce: `python -m alpamayo1_5_distill.scripts.validate_slot_capacity`
+
+### C1 — the gradient asymmetry was mostly a normalisation artifact
+
+Comparing `∂L/∂Q_i` against `∂L/∂(embed output)` **at ordinary text positions in the same forward**
+— same tensor, same units, different positions:
+
+| loss defined on | slot / text ratio |
+|---|---|
+| **all positions** (the fair control) | **3.88×** |
+| slot positions only | 7.87× |
+
+**Not 40–1128×.** Most of the earlier figure was the mismatch between a weight gradient
+(outer product over ~86 positions, normalised by 4.2 M elements) and a per-position embedding
+gradient. A ~4× residual is modest. **There is no LR story here** — revert to treating `Q` like any
+other parameter and tune from measurement. The clipping caution stands but is far less urgent than
+1000× implied.
+
+Two confirmations fell out of the same run:
+
+- `∂L/∂Q == ∂L/∂(embed out)[slots]` → **True**. The hook is exactly an identity assignment; no
+  autograd subtlety.
+- Vision positions receive **exactly zero** gradient at the embed output, because `masked_scatter`
+  overwrites them downstream. Independent confirmation that hooking `embed_tokens` runs *before* the
+  vision merge and cannot perturb it.
+
+### C2 — `randn * 0.02` is already well scaled; vocab-init is a *semantic* argument
+
+| | per-element RMS |
+|---|---|
+| real token embeddings (mean row-norm 1.4420) | 3.19e-2 |
+| `randn * 0.02` | 2.00e-2 |
+
+Only **1.59×** apart. So init magnitude explains neither the gradient size nor any off-manifold
+concern. Vocab-initialisation is still worth doing — but for **where in embedding space the slots
+start**, not for their scale. Don't "fix" a scale problem that doesn't exist.
+
+### C3 — capacity floor: 16 k input params move the loss easily, and vocab-init wins
+
+Frozen backbone, train **only** `Q`, 16 samples × 120 steps, CE on a target string:
+
+| init | frozen-`Q` baseline | trained `Q` (first 10 → last 10) | loss trace |
+|---|---|---|---|
+| random `randn*0.02` | 4.9836 | 3.2946 → **0.0005** | 4.93 · 1.87 · 0.42 · 0.010 · 0.004 · … |
+| **vocab (real token embeddings)** | **3.7069** | 2.1163 → **0.0001** | 3.60 · 0.146 · 0.006 · 0.001 · … |
+
+Two results:
+
+1. **Capacity is not the blocker at this floor.** Gradient flow proved the channel is *connected*;
+   this shows it is *wide enough to steer the model*, driving the loss to ~0.
+2. **Vocab-init measurably beats random**, exactly as Lester et al. (2021) report below ~10 B: a
+   lower starting loss (3.71 vs 4.98 frozen) **and** roughly 3× faster convergence (0.146 by step 12
+   vs 1.868). This is the cheapest win available and it is now measured on this model, not assumed.
+
+⚠️ **Floor test, not ceiling evidence.** The target is the *same string for every sample*, so `Q` can
+succeed by learning a constant output — the easiest possible objective, requiring no input-dependent
+behaviour. It answers "can 16 k input params move a loss at all", not "can slots carry
+scene-dependent reasoning". The fast convergence therefore does **not** contradict the literature's
+"prompt tuning converges slowly" finding, which concerns real tasks.
+
+### The literature this sits in: prompt tuning / prefix tuning
+
+With a frozen backbone, `Q` **is** prompt tuning, which brings directly transferable guidance:
+
+- **Prompt tuning** (Lester et al. 2021) — soft prompts prepended to the input; converges slowly,
+  and real-vocabulary init substantially beats random below ~10 B. At 2.44 B we are squarely in that
+  regime, and C3 reproduces the init finding.
+- **Prefix-tuning** (Li & Liang 2021) — found *direct* optimisation of the prefix unstable and
+  needed the reparameterisation `P = MLP(P_small)`. **Keep this in your pocket** as the known fix if
+  Stage 0/1 turns out unstable, rather than rediscovering it.
+
+### Truncated BPTT — two specifics beyond "remember to detach"
+
+- **The gate `g` trains fine against a detached carry.** `g * detached_cache` still gives `g`
+  gradient from the current window, so detaching costs nothing on the gate.
+- **The first frame of each window is asymmetric**: its slots receive gradient only from their own
+  frame's loss, while later frames also receive it through the carry. Standard TBPTT — but at a
+  window of 4 that is **25 % of frames**, so consider overlapping windows, or report
+  per-position-in-window loss to confirm it is not skewing what the slots learn.
 
 ### Next step, with a correction to §8 step 2
 
