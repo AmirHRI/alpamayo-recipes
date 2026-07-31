@@ -272,7 +272,9 @@ def read_index(cache_root: str | Path) -> dict[str, Any]:
     root = Path(cache_root)
     merged: dict[str, int] = {}
     metadata: dict[str, Any] = {}
-    for path in sorted(root.glob("index.shard*.json")):
+    # index.rebuilt.json (from rebuild_index) is read last so it wins: it is derived
+    # from the files and is therefore the complete picture when shard indexes are not.
+    for path in sorted(root.glob("index.shard*.json")) + sorted(root.glob("index.rebuilt.json")):
         with path.open("r", encoding="utf-8") as f:
             payload = json.load(f)
         merged.update(payload.get("n_cot", {}))
@@ -281,6 +283,33 @@ def read_index(cache_root: str | Path) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------------ read
+def rebuild_index(cache_root: str | Path, tier: str = "full") -> Path:
+    """Regenerate ``index.rebuilt.json`` from the files themselves.
+
+    The per-shard indexes only describe the keys *that run* wrote, so re-sharding a
+    partially-complete cache (say 4 shards -> 6 after adding GPUs) leaves the earlier
+    runs' keys with files on disk but no index entry. Nothing functional depends on the
+    index — `N_C` is recoverable as ``k_pre.shape[-2]`` and the training dataset never
+    reads it — but QA and the `compress_teacher_kv` fallback are both nicer when it is
+    complete.
+
+    Reads only the safetensors *header* per file (no tensor pages), so a 38k-entry
+    cache rebuilds in seconds.
+    """
+    root = Path(cache_root)
+    entries: dict[str, int] = {}
+    for path in sorted((root / tier).glob("*/*.safetensors")):
+        with safe_open(str(path), framework="pt") as f:
+            slice_ = f.get_slice("k_pre")
+            entries[path.stem.replace("__", "::")] = int(slice_.get_shape()[-2])
+    metadata = dict(read_index(root).get("metadata", {}))
+    metadata["rebuilt_from"] = tier
+    out = root / "index.rebuilt.json"
+    with out.open("w", encoding="utf-8") as f:
+        json.dump({"metadata": metadata, "n_cot": entries}, f)
+    return out
+
+
 def load_entry(
     cache_root: str | Path,
     tier: str,

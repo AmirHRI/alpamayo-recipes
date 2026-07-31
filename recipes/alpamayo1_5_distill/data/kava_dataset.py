@@ -105,9 +105,11 @@ class KaVaPAIDataset(DistillPAIDataset):
         attach_tfs_hidden: also surface the ``<traj_future_start>`` hidden that the
             same cache run recorded, so the existing single-vector loss can be kept
             alongside ``L_KV`` (KAVA's ``lambda_1`` term).
-        allow_missing: skip samples with no cache entry instead of raising.  Off by
-            default — a silent hole in the cache would train part of an epoch with
-            no KV supervision and look like a mysteriously weak result.
+        allow_missing: give clips with no cache entry an all-masked target (CE only)
+            instead of raising.  Off by default — a silent hole in the cache would
+            train part of an epoch with no KV supervision and look like a mysteriously
+            weak result.  Turn it ON for the LCDrive build, where 4 of 38,340 clips
+            have no handoff token and therefore no cache entry.
     """
 
     def __init__(
@@ -126,8 +128,31 @@ class KaVaPAIDataset(DistillPAIDataset):
         self.num_slots = int(num_slots)
         self.attach_tfs_hidden = attach_tfs_hidden
         self.allow_missing = allow_missing
+        # Teacher KV geometry, refreshed from every successful load. Seeded with the
+        # Alpamayo-1.5-10B values so a miss on the very first sample still produces a
+        # correctly-shaped empty target.
+        self._teacher_layers, self._teacher_kv_heads, self._head_dim = 36, 8, 128
         if kv_cache_root is not None and kv_tier is None:
             raise ValueError("kv_cache_root given without kv_tier; pass the compressed tier name")
+
+    def _attach_empty_kv(self, sample: dict[str, Any]) -> dict[str, Any]:
+        """Attach an all-masked KV target, so an uncached clip trains on CE alone.
+
+        Returning ``None`` instead would be worse than useless: the shared collator
+        stacks tensors and has no notion of a dropped sample, so one uncached clip
+        would take down the step. A zero target behind an all-False ``valid`` mask is
+        already handled by ``kv_matching_loss`` (it contributes nothing to either the
+        numerator or the denominator), so the sample simply trains without ``L_KV``.
+
+        On the LCDrive build this affects **4 of 38,340 clips** (0.01%) — ones where
+        the teacher hit ``max_new_tokens`` without ever emitting
+        ``<|traj_future_start|>``, so there was no handoff point to cache.
+        """
+        shape = (self._teacher_layers, self._teacher_kv_heads, self.num_slots, self._head_dim)
+        sample["teacher_kv_k"] = torch.zeros(shape, dtype=torch.bfloat16)
+        sample["teacher_kv_v"] = torch.zeros(shape, dtype=torch.bfloat16)
+        sample["teacher_kv_valid"] = torch.zeros(self.num_slots, dtype=torch.bool)
+        return sample
 
     def _attach_teacher_kv(self, sample: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
         if sample is None or self.kv_cache_root is None:
@@ -138,9 +163,11 @@ class KaVaPAIDataset(DistillPAIDataset):
             entry = kv_cache_io.load_entry(self.kv_cache_root, self.kv_tier, key, names=names)
         except KeyError:
             if self.allow_missing:
-                return None
+                return self._attach_empty_kv(sample)
             raise
 
+        layers, heads, _, head_dim = entry["k_pre"].shape
+        self._teacher_layers, self._teacher_kv_heads, self._head_dim = layers, heads, head_dim
         k, v, valid = pad_kv_to_budget(entry["k_pre"], entry["v"], self.num_slots)
         sample["teacher_kv_k"] = k
         sample["teacher_kv_v"] = v

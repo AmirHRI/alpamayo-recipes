@@ -532,3 +532,66 @@ def test_tier_stats_reports_per_entry_size(tmp_path) -> None:
     stats = kv_cache_io.tier_stats(tmp_path, "t")
     assert stats["n_entries"] == 3 and stats["mb_per_entry"] > 0
     assert kv_cache_io.tier_stats(tmp_path, "absent")["n_entries"] == 0
+
+
+# ------------------------------------------------ missing cache entries
+def test_empty_kv_target_is_shaped_and_fully_masked() -> None:
+    """A clip with no cache entry must not take down the step it lands in."""
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = 6, L, H, D
+    out = ds._attach_empty_kv({})
+    assert out["teacher_kv_k"].shape == (L, H, 6, D)
+    assert out["teacher_kv_valid"].sum() == 0
+    assert float(out["teacher_kv_k"].abs().sum()) == 0.0
+
+
+def test_uncached_sample_contributes_nothing_to_the_batch_loss() -> None:
+    """Batching an uncached clip with a cached one must not change the loss."""
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = 5, L, H, D
+    empty = ds._attach_empty_kv({})
+    n_student = 3
+    mapping = build_layer_map(n_student, L)
+
+    real_k, real_v = torch.randn(L, H, 5, D), torch.randn(L, H, 5, D)
+    teacher_k = torch.stack([empty["teacher_kv_k"].float(), real_k])
+    teacher_v = torch.stack([empty["teacher_kv_v"].float(), real_v])
+    valid = torch.stack([empty["teacher_kv_valid"], torch.ones(5, dtype=torch.bool)])
+    student = {i: (torch.randn(2, H, 5, D), torch.randn(2, H, 5, D)) for i in range(n_student)}
+
+    both = kv_matching_loss(student, teacher_k, teacher_v, mapping, valid_mask=valid)
+    cached_only = kv_matching_loss(
+        {i: (k[1:], v[1:]) for i, (k, v) in student.items()},
+        teacher_k[1:], teacher_v[1:], mapping, valid_mask=valid[1:],
+    )
+    torch.testing.assert_close(both, cached_only)
+
+
+def test_all_uncached_batch_yields_a_safe_zero() -> None:
+    n_student = 2
+    mapping = build_layer_map(n_student, L)
+    student = {i: (torch.randn(2, H, 4, D), torch.randn(2, H, 4, D)) for i in range(n_student)}
+    loss = kv_matching_loss(
+        student, torch.zeros(2, L, H, 4, D), torch.zeros(2, L, H, 4, D), mapping,
+        valid_mask=torch.zeros(2, 4, dtype=torch.bool),
+    )
+    assert float(loss) == 0.0 and not loss.requires_grad
+
+
+def test_rebuild_index_recovers_every_key_from_the_files(tmp_path) -> None:
+    """Re-sharding a partial run orphans index entries; rebuild reads them off disk."""
+    for i in range(3):
+        kv_cache_io.save_full_entry(
+            tmp_path, f"a{i}::1", torch.randn(L, H, 7 + i, D), torch.randn(L, H, 7 + i, D)
+        )
+    kv_cache_io.write_index(tmp_path, {"a0::1": 7}, {"mode": "generate"}, shard=0)
+    assert len(kv_cache_io.read_index(tmp_path)["n_cot"]) == 1  # the orphaned state
+
+    kv_cache_io.rebuild_index(tmp_path)
+    merged = kv_cache_io.read_index(tmp_path)["n_cot"]
+    assert merged == {"a0::1": 7, "a1::1": 8, "a2::1": 9}
+    assert merged["a2::1"] == 9  # N_C recovered from the tensor shape, not the sidecar

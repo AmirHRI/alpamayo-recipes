@@ -865,8 +865,31 @@ curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-s
   `partial(KaVaCollator, …)` and HF Trainer calls it as `collate_fn(features)` — the
   batch lands in `model_config` and a fresh collator is built per batch. The KAVA
   config sets `_partial_: false` explicitly.
-- **Cache builder run on real LCDrive under SLURM** (`slurm_teacher_kv_lcdrive.sh`,
-  1 GPU): an 8-clip smoke test and then the 200-clip pilot, both green.
+- **✅ The full LCDrive-train cache is BUILT** (`slurm_teacher_kv_lcdrive.sh`,
+  2 GPUs x 3 co-located shards, `COMPLETED` in **3 h 12 m**):
+
+  | | |
+  |---|---|
+  | entries | **38,336 / 38,340** in both `full/` and `compressed_M16_rkv0.1/` |
+  | disk | **135 GB** (256 buckets) |
+  | `N_C` over all 38,336 | min 6 · p25 11 · **median 13** · p95 17 · max 101 · mean 12.70 |
+  | throughput | 2.5 samples/s aggregate (0.42/s per shard) |
+  | failures | 4 clips (0.01%) — see below |
+
+  Validated after the fact, not just from the logs: 0 orphan `.tmp`, shard indexes
+  pairwise-disjoint, every file's key present in the index, `red` sums to 1 per
+  (layer, head), and a spot-checked entry loads finite `[36, 8, N_C, 128]` bf16.
+
+  **4 clips have no entry**: the teacher hit `max_new_tokens` without ever emitting
+  `<|traj_future_start|>`, so there is no handoff point to cache. `KaVaPAIDataset`
+  now handles this with `allow_missing=true`, which attaches an all-masked target so
+  the clip trains on CE alone — returning `None` would have taken down the whole step,
+  since the shared collator stacks tensors and cannot drop a sample.
+
+  **`M=16` engages eviction on only 7.8% of clips** across the full set (`M=8`: 79.2%),
+  confirming the pilot. See the boxed note above.
+
+- Earlier: an 8-clip smoke test and a 200-clip pilot, both green.
 
   ```
   [kv-cache] 200 new (200/200 scanned)  1.04/s
@@ -887,7 +910,7 @@ curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-s
   The pilot's one substantive finding is the **13-token CoT** and what it does to the
   `M` guidance; see the boxed note above. It also corrected this README's latency
   saving from ~420 ms to ~143 ms.
-- **Not yet run:** the full 38,340-clip build, and therefore no training numbers.
+- **Not yet run:** training itself, and therefore no quality numbers.
 - **`importance_source="expert"` built and verified against the real 10B**
   (`teacher_ar1_5_10b_expert`, expert loaded, 22.7 GiB peak):
 
