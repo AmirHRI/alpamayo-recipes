@@ -23,7 +23,10 @@ tell you whether the KV objective did anything, and a dead ``L_KV`` is precisely
 failure this recipe has to detect.
 """
 
+import os
 from typing import Any
+
+import torch
 
 from alpamayo1_5_sft.trainer import ReasoningVLA_Trainer
 
@@ -37,6 +40,17 @@ AUX_LOSS_KEYS = ("ce_loss", "latent_loss", "kv_loss", "n_valid_slots")
 #: where they do.
 NO_DECAY_PARAMS = ("slot_embeddings",)
 
+#: How often to re-measure each loss term's share of the backbone gradient. 0 disables.
+#: Cheap at this interval (three partial backwards over one layer, on the graph the
+#: step already built), and it is the standing check that no term has gone inert.
+#: Settable via ``KAVA_GRAD_PROBE_STEPS`` — an env var rather than a config key so it
+#: needs no field on the shared ``TrainingArguments`` owned by the sft recipe.
+GRAD_PROBE_STEPS = int(os.environ.get("KAVA_GRAD_PROBE_STEPS", 200))
+
+#: The slice of the backbone the probe differentiates. One mid-stack layer is enough to
+#: rank the terms and keeps the probe to a few ms; layer 14 of the student's 28.
+PROBE_LAYER_PREFIX = "vlm.model.language_model.layers.14."
+
 
 class KaVaTrainer(ReasoningVLA_Trainer):
     """``ReasoningVLA_Trainer`` plus per-term loss logging.
@@ -49,16 +63,101 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         super().__init__(*args, **kwargs)
         self._aux_sums: dict[str, float] = {}
         self._aux_count: int = 0
+        self._last_probe_step: int = -1
+        self._probe_failed: bool = False
 
     def get_decay_parameter_names(self, model: Any) -> list[str]:
         decay = super().get_decay_parameter_names(model)
         return [name for name in decay if not any(part in name for part in NO_DECAY_PARAMS)]
 
     def compute_loss(self, model: Any, inputs: Any, return_outputs: bool = False, **kwargs: Any):
-        result = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        base = self._unwrapped(model)
+        probing = self._should_probe()
+        if probing:
+            base.keep_loss_terms = True
+        try:
+            result = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        finally:
+            if probing:
+                base.keep_loss_terms = False
         loss, outputs = result if isinstance(result, tuple) else (result, None)
         self._stash(outputs)
+        if probing:
+            self._probe_gradient_shares(base)
         return (loss, outputs) if return_outputs else loss
+
+    # -------------------------------------------------------- gradient probe
+    def _unwrapped(self, model: Any) -> Any:
+        return getattr(self, "accelerator", None) and self.accelerator.unwrap_model(model) or model
+
+    def _should_probe(self) -> bool:
+        if self._probe_failed or GRAD_PROBE_STEPS <= 0:
+            return False
+        step = int(getattr(self.state, "global_step", 0))
+        if step == self._last_probe_step:
+            return False  # once per optimizer step, not once per accumulation micro-batch
+        return step % GRAD_PROBE_STEPS == 0
+
+    def _probe_gradient_shares(self, base: Any) -> None:
+        """Log each loss term's share of the *backbone* gradient.
+
+        A term can be finite, decreasing, and still steer nothing — which is exactly
+        what happened to ``L_KV`` at its first ``lambda_2``: it normalises over every
+        (layer, head, slot, dim) element, so the shipped weight left it contributing
+        0.0% of the backbone gradient while looking perfectly healthy in the loss log.
+        A weight calibrated once by measurement is only safe if something keeps
+        checking it, so this re-measures on one batch every ``GRAD_PROBE_STEPS``.
+
+        Uses ``autograd.grad`` on the *existing* graph (before HF's backward), so the
+        cost is three partial backwards over one mid-stack layer rather than three
+        extra forwards. Nothing is written to ``.grad``, so training is unaffected.
+
+        The probe is best-effort: under ZeRO-3 the parameters are sharded and this
+        cannot work, so a failure disables it for the rest of the run rather than
+        taking the job down.
+        """
+        terms = getattr(base, "last_loss_terms", None)
+        if not terms:
+            return
+        probe = [
+            p
+            for name, p in base.named_parameters()
+            if name.startswith(PROBE_LAYER_PREFIX) and p.requires_grad
+        ]
+        if not probe:
+            self._probe_failed = True
+            return
+
+        weights = {
+            "ce": 1.0,
+            "latent": float(getattr(base, "latent_loss_weight", 0.0)),
+            "kv": float(getattr(base, "kv_loss_weight", 0.0)),
+        }
+        try:
+            norms = {}
+            for name, term in terms.items():
+                grads = torch.autograd.grad(
+                    term, probe, retain_graph=True, allow_unused=True, materialize_grads=True
+                )
+                norms[name] = weights.get(name, 1.0) * float(
+                    torch.linalg.vector_norm(torch.stack([g.norm() for g in grads]))
+                )
+        except Exception as ex:  # ZeRO-3 sharding, a freed graph, ...
+            print(f"[kava] gradient probe disabled: {ex}", flush=True)
+            self._probe_failed = True
+            return
+
+        self._last_probe_step = int(getattr(self.state, "global_step", 0))
+        reference = norms.get("ce", 0.0)
+        summary = "  ".join(
+            f"{k}={v:.3e}" + (f" ({v / reference:.0%} of ce)" if reference and k != "ce" else "")
+            for k, v in norms.items()
+        )
+        print(f"[kava] step {self._last_probe_step} weighted backbone grad: {summary}", flush=True)
+        for name, value in norms.items():
+            if name != "ce" and reference:
+                self._aux_sums[f"gradshare_{name}"] = value / reference
+                self._aux_count = max(self._aux_count, 1)
 
     def _stash(self, outputs: Any) -> None:
         if outputs is None:

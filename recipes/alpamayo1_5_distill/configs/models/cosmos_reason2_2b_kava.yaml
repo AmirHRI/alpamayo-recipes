@@ -9,7 +9,9 @@
 _target_: alpamayo1_5_distill.models.kava_model.KaVaReasoningVLA.from_pretrained_vlm
 vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
 alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-checkpoint_path: null
+# Warm start from the trained Stage-1 LCDrive VLM rather than the base 2B. Loaded
+# BEFORE init_kava runs, so the slots' vocab-init reads the fine-tuned embeddings.
+checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_stage1_cosmos2b_lcdrive/checkpoint-3597
 
 # lambda_1: the endpoint hidden match (KAVA's L_CODI analogue), inherited.
 teacher_hidden_dim: 4096
@@ -18,7 +20,10 @@ latent_cosine_weight: 0.1
 
 kava:
   # M — must equal the collator's num_slots AND the cached tier's M.
-  num_slots: 16
+  # 8, not 16: the teacher's LCDrive CoT is ~13 tokens (measured over all 38,336
+  # clips), so M=16 leaves R-KV eviction inactive on 92% of them. M=8 engages it on
+  # 79%, which is the point of the method.
+  num_slots: 8
   # Depth of the teacher whose cache was recorded; builds the 28 -> 36 layer map.
   teacher_layers: 36
   # T — passes that produce the latents. 1 = the slots ride the single prefill pass,
@@ -27,8 +32,14 @@ kava:
   # better per KAVA's Fig 7, but each extra iteration costs a pass, and with ~85 ms of
   # the 100 ms budget already in prefill there is little room. Sweep it.
   jacobi_iters: 1
-  # lambda_2 on L_KV.
-  kv_loss_weight: 1.0
+  # lambda_2 on L_KV. CALIBRATED BY MEASUREMENT, not taken from the paper: this loss
+  # averages over every (layer, head, slot, dim) element -- 458,752 of them at M=8 --
+  # whereas KAVA Eq.7 divides by 2M=16, a factor of L*H*D = 28,672. At the paper's
+  # lambda_2=1 the term contributed 0.0% of the backbone gradient. 50 puts it at 62.5%
+  # of CE's, matching the latent term's 64.5%, measured at M=8 / L=28 on a real batch.
+  # Re-measure if M or the layer map changes; KaVaTrainer logs gradshare_kv every
+  # GRAD_PROBE_STEPS so a mis-scaled weight shows up within a few hundred steps.
+  kv_loss_weight: 50.0
   # "l1" | "mse" | "smooth_l1" — the paper's best choice varies by dataset.
   kv_loss_type: smooth_l1
   # KAVA's "Layer-wise std" row: normalise each layer's residual by its teacher

@@ -105,6 +105,14 @@ class KaVaReasoningVLA(DistillReasoningVLA):
     kv_align: str = "projector"
     kv_layer_map: list[int] | None = None
 
+    #: When True, ``forward`` also stashes the loss terms **with their graph attached**
+    #: in :attr:`last_loss_terms`.  ``KaVaTrainer`` switches this on periodically so it
+    #: can take ``autograd.grad`` of each term separately and report how much of the
+    #: backbone gradient each objective actually contributes — the check that catches a
+    #: silently inert term.  Off by default: keeping the references alive would pin the
+    #: graph for longer than the training step needs.
+    keep_loss_terms: bool = False
+
     # ------------------------------------------------------------------ setup
     def init_kava(
         self,
@@ -567,6 +575,7 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         losses["others"] = self._compute_next_token_loss(outputs, labels, labels != IGNORE_INDEX)
         ce_loss = sum(losses.values())
         total_loss = ce_loss
+        attached: dict[str, torch.Tensor] = {"ce": ce_loss}
 
         # lambda_1: the endpoint hidden match (KAVA's L_CODI analogue).
         latent_loss = None
@@ -575,6 +584,7 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             h_student = latent_proj(self._gather_tfs_hidden(input_ids, outputs.hidden_states[-1]))
             latent_loss = self._latent_loss(h_student, teacher_tfs_hidden.to(h_student.device))
             total_loss = total_loss + self.latent_loss_weight * latent_loss
+            attached["latent"] = latent_loss
 
         # lambda_2: the compressed-KV match.
         kv_loss = None
@@ -585,12 +595,15 @@ class KaVaReasoningVLA(DistillReasoningVLA):
                 teacher_kv_k.to(input_ids.device), teacher_kv_v.to(input_ids.device), valid
             )
             total_loss = total_loss + self.kv_loss_weight * kv_loss
+            attached["kv"] = kv_loss
             n_valid = (
                 valid.float().sum(dim=1).mean()
                 if valid is not None
                 else torch.tensor(float(self.num_slots))
             )
             self._capture = {}  # drop references so the graph is freed with the step
+
+        self.last_loss_terms = attached if self.keep_loss_terms else None
 
         return KaVaVLAOutput(
             loss=total_loss,

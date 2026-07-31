@@ -14,7 +14,11 @@
 # Prerequisites:
 #   1. scripts/generate_teacher_kv.py  (config=cache_teacher_kv_lcdrive)
 #   2. point kv_cache_root / kv_tier below at its output
-#   3. set model.kava.num_slots == the tier's M == data.collate_fn.num_slots
+#   3. these FOUR must agree, and nothing enforces it — a mismatch surfaces as a
+#      shape error, not a clear message:
+#        model.kava.num_slots == data.collate_fn.num_slots
+#                             == data.train_dataset.num_slots
+#                             == the M of data.train_dataset.kv_tier
 #
 # Launch (from the alpamayo1_5_sft venv, PYTHONPATH includes recipes/). Use
 # train_kava, not train_hf: it swaps in KaVaTrainer, which logs the three loss terms
@@ -51,7 +55,7 @@ data:
     # in `model_config`. Instantiating it as an object is also what lets the
     # QwenProcessor be built once per worker instead of on every call.
     _partial_: false
-    num_slots: 16
+    num_slots: 8
     chat_template_version: r1_5
 
   train_dataset:
@@ -63,9 +67,14 @@ data:
     use_default_keyframe: true
     teacher_cache_path: null   # the tfs hidden rides in the KV cache instead
     kv_cache_root: ???         # set to generate_teacher_kv.py's cache_root
-    kv_tier: compressed_M16_rkv0.1
-    num_slots: 16
+    kv_tier: compressed_M8_rkv0.1
+    num_slots: 8
     attach_tfs_hidden: true
+    # 4 of 38,340 LCDrive clips have no cache entry (the teacher hit max_new_tokens
+    # without emitting <traj_future_start>, so there was no handoff to record). They
+    # get an all-masked target and train on CE alone; without this the run dies on
+    # them, since the shared collator cannot drop a sample.
+    allow_missing: true
     vla_preprocess_args:
       generation_mode: false
 
@@ -79,7 +88,7 @@ data:
     teacher_cache_path: null
     kv_cache_root: null       # eval needs no teacher target; slots still run
     kv_tier: null
-    num_slots: 16
+    num_slots: 8
     vla_preprocess_args:
       generation_mode: true
 
