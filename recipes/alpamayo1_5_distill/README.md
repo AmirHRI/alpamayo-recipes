@@ -381,7 +381,7 @@ Two things follow for distillation:
   `compressed_<tag>/`, `index.*.json`, `cot_text.*.jsonl`), mmap reads.
 - **`data/kava_dataset.py`** — `KaVaPAIDataset` and `KaVaCollator`
   (`splice_slot_placeholders`, `pad_kv_to_budget`).
-- **`scripts/{cache_common,generate_teacher_kv,compress_teacher_kv,validate_kv_distill}.py`**
+- **`scripts/{cache_common,generate_teacher_kv,compress_teacher_kv,validate_kv_distill,profile_kava_latency}.py`**
   — shared builder plumbing (also now used by `generate_teacher_features.py`), the
   KV cache builder, offline recompression, and the KV1–KV7 harness.
 - **`trainer.py` / `train_kava.py`** — `KaVaTrainer` logs the loss terms separately
@@ -547,6 +547,67 @@ python -m alpamayo1_5_distill.scripts.validate_kv_distill 8 float32
 | **KV5** gradient reaches slots, backbone and projector through `L_KV` | ‖slots.grad‖ 2.6e1, non-zero 8/8, per-slot cosine max **0.58** (≈1.0 would be a broadcast bug) |
 | **KV6** self-consistency floor: `L_KV` driven toward 0 on a solvable target | 2.767 → **0.393** (14.2%) in 200 steps |
 | **KV7** cache round-trip; offline recompression reproduces the inline result | identical indices, rel-L2 0.0 |
+
+### Latency measured on real LCDrive data — `scripts/profile_kava_latency.py`
+
+The deployable Stage-2 student (2.609 B = frozen 2B VLM + 28-layer/1024-hidden expert)
+on a real LCDrive **val** clip, batch 1, bf16, H100. Phases are timed separately and
+the arms composed from measured parts, so nothing inherits another arm's overhead:
+
+```
+CUDA_VISIBLE_DEVICES=3 python -m alpamayo1_5_distill.scripts.profile_kava_latency \
+    slots=0,8,16,32 n_timed=25
+```
+
+**The slots are free.** This is the load-bearing claim, and at a *realistic* prefill it
+holds with room to spare — `reasoning-setup-2b.md` §8 warned that measuring at 64
+vision tokens would badly understate it, so this runs at 2880:
+
+| K | seq | prefill min (ms) | overhead vs K=0 |
+|---|---|---|---|
+| 0 | 2993 | 113.83 | — |
+| 8 | 3003 | 113.86 | **+0.03** |
+| 16 | 3011 | 113.84 | **+0.01** |
+| 32 | 3027 | 114.38 | **+0.55** |
+
+≤0.55 ms in every configuration measured, i.e. indistinguishable from zero — as the
+causal mask predicts, since the slots only add ~1% to the sequence and attend to a
+prefix that was going to be computed anyway.
+
+**Per-phase costs** (min of 25 interleaved reps): ViT **59.0 ms** — *52% of prefill* —
+language prefill ~54.8 ms, text decode **10.5 ms/token**, expert Euler step
+**12.5 ms**. The decode and expert figures corroborate the ~11.5 ms/token and
+13.59 ms/step recorded earlier in this README from a different script.
+
+**Totals, and the frames lever.** Vision dominates, so `num_frames` is the knob that
+decides whether 10 Hz is reachable; the expert is weight-bound (12.1–12.7 ms/step
+regardless of cache length), so only `inference_step` moves it:
+
+| frames/cam | images | vision tok | prefill | Full CoT (40 tok) | KAVA K=16 T=1 @10 steps | **@2 steps** | T=3 @2 |
+|---|---|---|---|---|---|---|---|
+| 4 (today) | 16 | 2880 | 113.8 | 659 ms (1.5 Hz) | 238 ms (4.2 Hz) | 139 ms (7.2 Hz) | 168 ms |
+| **2** | 8 | 1440 | 62.0 | 675 ms (1.5 Hz) | 184 ms (5.4 Hz) | **86.6 ms (11.6 Hz)** | 114 ms |
+| 1 | 4 | 720 | 38.0 | 614 ms (1.6 Hz) | 165 ms (6.1 Hz) | 63.4 ms (15.8 Hz) | 91.6 ms |
+
+**The 100 ms budget is met** at `K=16, T=1, 8 camera images, inference_step=2`:
+**86.6 ms / 11.6 Hz**. Three things that table says plainly:
+
+- KAVA T=1 costs **the same as today's text-silent 2B** (138.8 vs 138.7 ms at 16
+  images) — latent reasoning is added for free, and whether it *helps* is now purely a
+  quality question, not a latency trade.
+- The 40-token CoT it replaces costs **~420 ms** of rollout. That is the whole reason
+  this recipe exists.
+- `T>1` is not free: each Jacobi iteration is ~15 ms — *more* than a decode token,
+  because it runs K tokens against the full cache and re-crops. `T=3` at 8 images lands
+  at 114 ms, just over budget. Sweep T for quality knowing T=1 is the only free point.
+
+⚠️ Read these as **relative**: H100, not Thor, and with untrained weights (latency is
+shape-bound, so untrained is fine, but the device is not the deploy target).
+`reasoning-setup-2b.md` §0 carries the Thor per-token figure. The first run of this
+profile also reported the slot overhead as *negative* (−5%) — pure GPU contention from a
+co-tenant job, which is why the script now times arms round-robin and reports `min`; a
+strictly-more-work prefill cannot be faster, and any such result should be thrown out
+rather than published.
 
 Two findings worth carrying forward:
 
