@@ -1,0 +1,44 @@
+# Stage-2 action-expert EVAL for Alpamayo-1.5 (2B Cosmos-Reason2) on the official
+# LCDrive val split. Mirrors sft_stage2_cosmos2b_lcdrive.yaml (expert model, plain
+# PAIDataset + default processor, UUID-filtered val) but loads the trained Stage-2
+# checkpoint and runs the ReasoningSampler + DistanceMetrics (minADE) rollout.
+#
+# The action expert generates trajectories via the diffusion path
+# (sample_trajectories_from_data -> sample_trajectories_from_data_with_vlm_rollout),
+# so this measures the FULL two-stage model (fine-tuned VLM + action expert),
+# unlike the Stage-1 eval which sampled discrete trajectory tokens from the VLM.
+#
+# NOTE: TrainableAlpamayoR1 is built by `from_pretrained_vlm`, which takes
+# `stage2_checkpoint_path` (loads ALL vlm.*/expert.*/action_* tensors) rather than
+# HF's `pretrained_model_name_or_path`. So we set the checkpoint on the model here
+# and leave `evaluate.eval_ckpt` null (its TrainableAlpamayoR1 branch would pass an
+# unsupported kwarg to from_pretrained_vlm).
+defaults:
+  - sft_stage2_cosmos2b_lcdrive
+  - _self_
+
+# Disable W&B for eval — metrics are printed to the log, and the inherited
+# `/wandb: default` leaves `wandb.team` as a mandatory ??? that we don't need here.
+wandb: null
+
+model:
+  # Load the finished Stage-2 checkpoint (VLM + expert + action/diffusion heads).
+  # stage1_vlm_checkpoint_path is redundant here (the Stage-2 ckpt already contains
+  # the frozen VLM), so null it out to avoid a wasted second VLM load.
+  stage1_vlm_checkpoint_path: null
+  stage2_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_stage2_cosmos2b_lcdrive/checkpoint-11502
+
+trainer:
+  report_to: none
+  # Eval has no gradients/optimizer; batch 4 used only ~30GB/80GB. Batch 10 (~60GB)
+  # uses the headroom and cuts wall-clock ~2.5x.
+  per_device_eval_batch_size: 10
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_eval_stage2_cosmos2b_lcdrive
+
+evaluate:
+  eval_ckpt: null
+  max_eval_steps: -1   # -1 = full LCDrive val split
+
+task_name: alpamayo_1_5_sft_stage2_eval_cosmos2b_lcdrive
