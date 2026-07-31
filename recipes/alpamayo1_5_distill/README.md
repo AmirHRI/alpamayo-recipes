@@ -511,16 +511,54 @@ diffusion) and `DistillReasoningVLA` (CoT generation) are **siblings** under
 `generate_cot_prefix` directly rather than duplicating it, since that method only
 touches the shared `ReasoningVLA` surface.
 
-| Tier | Contents | Size |
+| Tier | Contents | Measured size |
 |---|---|---|
-| `full/` | `k_pre`, `v` `[36, 8, N_C, 128]` bf16 + `imp`, `red` + `tfs_hidden` | ~5.9 MB at N_C=40, ≤18.9 MB at the 128 cap |
-| `compressed_M16_rkv0.1/` | `k_pre`, `v` `[36, 8, M, 128]` + `sel_idx` + `tfs_hidden` | ~2.4 MB |
-| `cot_text.shard*.jsonl` | the teacher's reasoning as text | ~200 B |
+| `full/` | `k_pre`, `v` `[36, 8, N_C, 128]` bf16 + `imp`, `red` + `tfs_hidden` | **1.79 MB**/sample |
+| `compressed_M16_rkv0.1/` | `k_pre`, `v` `[36, 8, M', 128]` + `sel_idx` + `tfs_hidden` | **1.72 MB**/sample |
+| `cot_text.shard*.jsonl` | the teacher's reasoning as text | ~180 B |
 
-Training reads only the compressed tier (~19 MB/step at bs=8). `full/` exists so every
-`(M, λ, method)` point is re-derivable by `compress_teacher_kv.py` with **no teacher
-and no GPU**. Projected totals for LCDrive-train: ~226 GB (`full/`, N_C=40) + ~90 GB
-(`M=16`). **Put `cache_root` on `/data`** — `/home` is quota-capped at 100 GB.
+Training reads only the compressed tier. `full/` exists so every `(M, λ, method)` point
+is re-derivable by `compress_teacher_kv.py` with **no teacher and no GPU**. Measured
+totals for LCDrive-train (38,340 clips): **67 GB** `full/` + **65 GB** `M=16` ≈ **132 GB**.
+**Put `cache_root` on `/data`** — `/home` is quota-capped at 100 GB.
+
+#### ⚠️ Measured CoT length changes the M guidance
+
+The 200-clip pilot (below) measured the teacher's actual CoT on LCDrive:
+
+```
+N_C: min 6  p25 11  median 13  p75 14  p95 17  max 46  mean 12.4
+```
+
+This recipe originally assumed ~40 tokens, extrapolated from `reasoning-setup-2b.md` §0
+which concerns a different setting. The real traces are **~13 tokens** — the teacher
+emits one crisp sentence ("Stop for the red traffic light since the signal is red"), not
+a paragraph. That has a direct consequence for `M`, since `M` is simultaneously the
+latent budget *and* the number of KV pairs eviction keeps:
+
+| M | eviction engages on | mean slots with a target |
+|---|---|---|
+| 4 | 100% of clips | 4.0 / 4 (100% of budget) |
+| **8** | **82%** | 7.9 / 8 (99%) |
+| 12 | 55% | 10.9 / 12 (91%) |
+| **16** (config default) | **6.5%** | 12.0 / 16 (75%) |
+| 32 | 1.0% | 12.4 / 32 (39%) |
+
+So at the shipped `M=16`, **R-KV eviction is inactive on 93.5% of clips** — the
+compressed tier is very nearly a 1:1 copy of the teacher's CoT cache (1.72 vs 1.79
+MB/sample), and a quarter of the slots have no target and are masked out of `L_KV`.
+
+That is not a bug, and per KAVA it may well be the *better* regime — its strongest
+results are on GSM8k-AUG, where the cache "retains all of its content after eviction".
+But it means two different things are worth running and they must not be conflated:
+
+* `M=16` — "match the teacher's whole CoT cache, one slot per token". Simplest
+  objective, most expected quality, **eviction untested**.
+* `M=8` — eviction genuinely engages on 82% of clips, so this is the arm that
+  exercises R-KV and the `lam` / `eviction` ablations. Derive it from `full/` with
+  `compress_teacher_kv.py m=8`; no teacher re-run.
+
+`M=32` is not useful here: 61% of the budget would never receive a target.
 
 ### Two things that fail silently, and how they are prevented
 
@@ -583,11 +621,14 @@ language prefill ~54.8 ms, text decode **10.5 ms/token**, expert Euler step
 decides whether 10 Hz is reachable; the expert is weight-bound (12.1–12.7 ms/step
 regardless of cache length), so only `inference_step` moves it:
 
-| frames/cam | images | vision tok | prefill | Full CoT (40 tok) | KAVA K=16 T=1 @10 steps | **@2 steps** | T=3 @2 |
+| frames/cam | images | vision tok | prefill | Full CoT (13 tok) | KAVA K=16 T=1 @10 steps | **@2 steps** | T=3 @2 |
 |---|---|---|---|---|---|---|---|
-| 4 (today) | 16 | 2880 | 113.8 | 659 ms (1.5 Hz) | 238 ms (4.2 Hz) | 139 ms (7.2 Hz) | 168 ms |
-| **2** | 8 | 1440 | 62.0 | 675 ms (1.5 Hz) | 184 ms (5.4 Hz) | **86.6 ms (11.6 Hz)** | 114 ms |
-| 1 | 4 | 720 | 38.0 | 614 ms (1.6 Hz) | 165 ms (6.1 Hz) | 63.4 ms (15.8 Hz) | 91.6 ms |
+| 4 (today) | 16 | 2880 | 113.8 | 381 ms (2.6 Hz) | 238 ms (4.2 Hz) | 139 ms (7.2 Hz) | 167 ms |
+| **2** | 8 | 1440 | 62.0 | 321 ms (3.1 Hz) | 182 ms (5.5 Hz) | **85.7 ms (11.7 Hz)** | 113 ms |
+| 1 | 4 | 720 | 38.0 | — | 165 ms (6.1 Hz) | 63.4 ms (15.8 Hz) | 91.6 ms |
+
+`Full CoT` uses the **measured** 13-token trace length (see the pilot above), not the
+40 tokens an earlier draft of this section assumed.
 
 **The 100 ms budget is met** at `K=16, T=1, 8 camera images, inference_step=2`:
 **86.6 ms / 11.6 Hz**. Three things that table says plainly:
@@ -595,8 +636,11 @@ regardless of cache length), so only `inference_step` moves it:
 - KAVA T=1 costs **the same as today's text-silent 2B** (138.8 vs 138.7 ms at 16
   images) — latent reasoning is added for free, and whether it *helps* is now purely a
   quality question, not a latency trade.
-- The 40-token CoT it replaces costs **~420 ms** of rollout. That is the whole reason
-  this recipe exists.
+- The CoT it replaces costs **~143 ms** of rollout (13 measured tokens x 11.0 ms).
+  Earlier drafts of this section said ~420 ms, from assuming a 40-token trace; the
+  pilot measured 13. Still the single largest saving available — it is 1.7x the entire
+  KAVA VLM cost at 8 images — but it is 3x smaller than first claimed, and the ViT
+  (59 ms, 52% of prefill) is now the bigger target.
 - `T>1` is not free: each Jacobi iteration is ~15 ms — *more* than a decode token,
   because it runs K tokens against the full cache and re-crops. `T=3` at 8 images lands
   at 114 ms, just over budget. Sweep T for quality knowing T=1 is the only free point.
@@ -821,10 +865,29 @@ curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-s
   `partial(KaVaCollator, …)` and HF Trainer calls it as `collate_fn(features)` — the
   batch lands in `model_config` and a fresh collator is built per batch. The KAVA
   config sets `_partial_: false` explicitly.
-- **Not yet run:** the KV cache build itself, and therefore no training numbers. The
-  cache builder's teacher path shares `generate_cot_prefix` with the already-validated
-  single-vector builder, but the two-segment capture has not been exercised against
-  the 10B — do the 200-sample pilot (step **K2**) first.
+- **Cache builder run on real LCDrive under SLURM** (`slurm_teacher_kv_lcdrive.sh`,
+  1 GPU): an 8-clip smoke test and then the 200-clip pilot, both green.
+
+  ```
+  [kv-cache] 200 new (200/200 scanned)  1.04/s
+  [kv-cache] full: 200 entries, 1.79 MB/entry -> 67.2 GB for 38340 clips
+  [kv-cache] compressed_M16_rkv0.1: 1.72 MB/entry -> 64.5 GB
+  [kv-cache] N_C over 200 samples: min=6 median=13 max=46 (mean=12.4)
+  ```
+
+  **1.04 samples/s** ⇒ the full 38,340-clip build is **~10.2 h on one GPU**, ~2.6 h over
+  4 shards — matching the ~1.1 samples/s this README predicted. Total disk **~132 GB**.
+  Artifacts verified by loading them back: `k_pre`/`v` `[36, 8, N_C, 128]` bf16 all
+  finite, `red` sums to 1 per (layer, head), `tfs_hidden` 4096-d, and
+  `compress_teacher_kv.py` re-deriving the stored `sel_idx` bit-identically (rel-L2 0.0).
+  The CoT text is real and scene-specific — *"Stop for the red traffic light since the
+  signal is red"*, *"Keep distance to the lead vehicle since it is directly ahead in our
+  lane"* — so the `components_order` gotcha is confirmed absent on this path.
+
+  The pilot's one substantive finding is the **13-token CoT** and what it does to the
+  `M` guidance; see the boxed note above. It also corrected this README's latency
+  saving from ~420 ms to ~143 ms.
+- **Not yet run:** the full 38,340-clip build, and therefore no training numbers.
 - **`importance_source="expert"` built and verified against the real 10B**
   (`teacher_ar1_5_10b_expert`, expert loaded, 22.7 GiB peak):
 
