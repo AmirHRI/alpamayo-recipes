@@ -30,6 +30,7 @@
 defaults:
   - sft_base
   - /models/cosmos_reason2_2b_kava@model
+  - /wandb: default
   - _self_
 
 hydra:
@@ -98,8 +99,14 @@ data:
   dataloader_prefetch_factor: 4
   dataloader_persistent_workers: true
 
+# The KAVA sweep (M, lambda_2, eviction method, direct-vs-projector) gets its own
+# project rather than mixing into the SFT one. Auth resolves from ~/.netrc.
+wandb:
+  team: zrb20
+  project: alpamayo1_5-kava-distill
+
 trainer:
-  report_to: none
+  report_to: wandb
   lr_multiplier:
     vlm.model.visual: 0.1
     # Randomly/vocab-initialised heads that must learn fast relative to the
@@ -111,16 +118,24 @@ trainer:
     jacobi_proj: 5.0
   ddp_find_unused_parameters: false
 
+  # ABSOLUTE path. sft_base sets `deepspeed: configs/deepspeed/zero2.json`, which only
+  # resolves when cwd is the *sft* recipe dir — the sft slurm scripts cd there, this
+  # recipe does not. Left relative, accelerate tries to json.loads() the path string
+  # and dies with "Expecting value: line 1 column 1".
+  deepspeed: /home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/configs/deepspeed/zero2.json
+
   # ⚠️ REQUIRED: gradient checkpointing silently forces use_cache=False and detaches
   # anything a forward hook captured on the first pass, so L_KV would compute a
   # finite, decreasing-looking number and supervise nothing. KaVaReasoningVLA raises
   # rather than let that happen. Stage-2 already runs with it off for its own reasons.
   gradient_checkpointing: false
 
-  # Smaller than the plain Stage-1 LCDrive run (bs=8) because checkpointing is off
-  # and the K/V capture retains per-layer slot activations. Raise until it OOMs.
-  per_device_train_batch_size: 2
-  gradient_accumulation_steps: 8
+  # bs=1 MEASURED, not guessed: bs=2 OOMs on one 80 GiB H100. Gradient checkpointing is
+  # off (required, see above) and ZeRO-2 shards nothing when there is only one rank, so
+  # a single GPU carries the full AdamW state for 2.67 B params on top of ~30 GiB of
+  # activations. Raise this only together with --gpus, where ZeRO-2 actually shards.
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
   learning_rate: 1e-5
   warmup_steps: 500
   num_train_epochs: 3
@@ -132,3 +147,7 @@ evaluate:
   eval_ckpt: null
 
 task_name: alpamayo_1_5_kava_stage1_cosmos2b_lcdrive
+# Encode the sweep point in the run name — this project will hold one run per
+# (M, alignment, lambda_2, eviction) combination and the default timestamp-only name
+# makes them indistinguishable in the wandb sidebar.
+run_name: kava_M${model.kava.num_slots}_${model.kava.kv_align}_lam2-${model.kava.kv_loss_weight}_${now:%m%d-%H%M}

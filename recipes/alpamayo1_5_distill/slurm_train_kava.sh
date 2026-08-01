@@ -7,7 +7,10 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=160G
+# 120G: host RAM is only for the frame-decoding dataloader workers (the model lives on
+# the GPU). Asking 160G left the job PENDING on (Resources) when co-tenants held 368G of
+# the node's 503 GiB — a memory limit, not a GPU one.
+#SBATCH --mem=120G
 #SBATCH --time=48:00:00
 #SBATCH --mail-type=END
 #SBATCH --mail-user=amirhosein_chahe@honda-ri.com
@@ -48,12 +51,17 @@ if [[ "$SMOKE" == "1" ]]; then
     EXTRA+=(++trainer.max_steps=20 ++trainer.logging_steps=1
             ++trainer.save_strategy=no ++trainer.eval_strategy=no
             ++trainer.warmup_steps=0 ++trainer.gradient_accumulation_steps=1
-            +data.train_dataset.chunk_ids="0-120" +data.val_dataset.chunk_ids="0-120")
+            ++data.train_dataset.chunk_ids="0-120" ++data.val_dataset.chunk_ids="0-120")
     export KAVA_GRAD_PROBE_STEPS=2
     echo "[slurm] SMOKE mode: 20 steps, gradient probe every 2"
 fi
 
-echo "[slurm] job=$SLURM_JOB_ID gpus=$CUDA_VISIBLE_DEVICES cache_root=$CACHE_ROOT"
+# The cgroup exposes roughly half of --cpus-per-task, so 12 workers (the config default,
+# sized for a multi-GPU run) thrash here. Derive it from the actual allocation.
+WORKERS="${WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-16} / 3 ))}"
+EXTRA+=(++trainer.dataloader_num_workers="$WORKERS")
+
+echo "[slurm] job=$SLURM_JOB_ID gpus=$CUDA_VISIBLE_DEVICES cache_root=$CACHE_ROOT workers=$WORKERS"
 
 srun "$VENV/torchrun" \
     --nproc_per_node "$GPUS" \

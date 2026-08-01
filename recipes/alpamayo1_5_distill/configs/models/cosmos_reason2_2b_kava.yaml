@@ -15,7 +15,12 @@ checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/
 
 # lambda_1: the endpoint hidden match (KAVA's L_CODI analogue), inherited.
 teacher_hidden_dim: 4096
-latent_loss_weight: 1.0
+# 0.01, not 1.0. RECALIBRATED against the WARM-STARTED student: a model that already
+# fits trajectories has CE ~3.1 (vs ~31 for the base 2B), so at lambda_1=1 the latent
+# term contributed 13107% of CE's backbone gradient and would have flattened the
+# trajectory head. 0.01 puts it at ~131% -- roughly parity. Measured at step 0 of the
+# first real run; KaVaTrainer logs gradshare_latent so drift is visible.
+latent_loss_weight: 0.01
 latent_cosine_weight: 0.1
 
 kava:
@@ -32,14 +37,18 @@ kava:
   # better per KAVA's Fig 7, but each extra iteration costs a pass, and with ~85 ms of
   # the 100 ms budget already in prefill there is little room. Sweep it.
   jacobi_iters: 1
-  # lambda_2 on L_KV. CALIBRATED BY MEASUREMENT, not taken from the paper: this loss
-  # averages over every (layer, head, slot, dim) element -- 458,752 of them at M=8 --
-  # whereas KAVA Eq.7 divides by 2M=16, a factor of L*H*D = 28,672. At the paper's
-  # lambda_2=1 the term contributed 0.0% of the backbone gradient. 50 puts it at 62.5%
-  # of CE's, matching the latent term's 64.5%, measured at M=8 / L=28 on a real batch.
-  # Re-measure if M or the layer map changes; KaVaTrainer logs gradshare_kv every
-  # GRAD_PROBE_STEPS so a mis-scaled weight shows up within a few hundred steps.
-  kv_loss_weight: 50.0
+  # lambda_2 on L_KV, CALIBRATED BY MEASUREMENT against the warm-started student.
+  #
+  # It cannot be taken from the paper: this loss averages over every
+  # (layer, head, slot, dim) element -- 458,752 at M=8 -- whereas KAVA Eq.7 divides by
+  # 2M=16, a factor of L*H*D = 28,672. It also cannot be calibrated against the BASE
+  # 2B: on the base model CE is ~31 and lambda_2=50 gave parity, but warm-starting
+  # drops CE to ~3.1 and the same weight then contributed 5898% of CE's gradient.
+  #
+  # Measured at step 0 of the warm-started run: unweighted ||grad|| was ce 1.305,
+  # latent 171, kv 1.539. lambda_2=1 puts L_KV at ~118% of CE. Re-measure if the warm
+  # start, M, or the layer map changes -- gradshare_kv in the logs is the tripwire.
+  kv_loss_weight: 1.0
   # "l1" | "mse" | "smooth_l1" — the paper's best choice varies by dataset.
   kv_loss_type: smooth_l1
   # KAVA's "Layer-wise std" row: normalise each layer's residual by its teacher
