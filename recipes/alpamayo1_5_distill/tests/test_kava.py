@@ -595,3 +595,80 @@ def test_rebuild_index_recovers_every_key_from_the_files(tmp_path) -> None:
     merged = kv_cache_io.read_index(tmp_path)["n_cot"]
     assert merged == {"a0::1": 7, "a1::1": 8, "a2::1": 9}
     assert merged["a2::1"] == 9  # N_C recovered from the tensor shape, not the sidecar
+
+
+# ------------------------------------------------- inference-time slot injection
+def _hook_stub(num_slots=2, hidden=4, zero=False):
+    """Duck-typed stand-in: _generation_slot_hook only needs these four attributes."""
+    import types
+
+    from alpamayo1_5_distill.models.kava_model import KaVaReasoningVLA
+
+    emb = torch.nn.Embedding(50, hidden)
+    torch.nn.init.zeros_(emb.weight)  # so injected rows are unmistakable
+    slots = torch.nn.Parameter(torch.arange(1.0, num_slots + 1).repeat(hidden, 1).T.contiguous())
+    stub = types.SimpleNamespace(
+        num_slots=num_slots,
+        slot_embeddings=slots,
+        zero_slots=zero,
+        vlm=types.SimpleNamespace(get_input_embeddings=lambda: emb),
+    )
+    return KaVaReasoningVLA._generation_slot_hook, stub, emb, slots
+
+
+def test_generation_hook_injects_on_prefill() -> None:
+    """Without this the model reads the literal '.' placeholder — silently wrong."""
+    hook, stub, emb, slots = _hook_stub()
+    slot_pos = torch.tensor([[3, 4]])
+    with hook(stub, slot_pos):
+        out = emb(torch.zeros(1, 7, dtype=torch.long))
+    torch.testing.assert_close(out[0, 3], slots[0])
+    torch.testing.assert_close(out[0, 4], slots[1])
+    assert float(out[0, [0, 1, 2, 5, 6]].abs().sum()) == 0.0  # nothing else touched
+
+
+def test_generation_hook_skips_decode_steps() -> None:
+    """generate() embeds ONE token per decode step; slot_pos would index out of bounds."""
+    hook, stub, emb, _ = _hook_stub()
+    with hook(stub, torch.tensor([[3, 4]])):
+        out = emb(torch.zeros(1, 1, dtype=torch.long))  # a decode step
+    assert out.shape == (1, 1, 4)
+    assert float(out.abs().sum()) == 0.0  # untouched, and crucially did not raise
+
+
+def test_generation_hook_realigns_for_num_return_sequences() -> None:
+    """generate() repeat_interleaves the batch; slot_pos must expand the same way.
+
+    Getting this wrong silently gives sample A's slots to sample B's rows — the
+    model still runs and still produces trajectories.
+    """
+    hook, stub, emb, slots = _hook_stub()
+    slot_pos = torch.tensor([[1, 2], [4, 5]])  # two samples, different columns
+    n_return = 3
+    with hook(stub, slot_pos):
+        out = emb(torch.zeros(2 * n_return, 8, dtype=torch.long))
+    for sample in (0, 1):
+        for rep in range(n_return):
+            row = out[sample * n_return + rep]
+            for j, col in enumerate(slot_pos[sample].tolist()):
+                torch.testing.assert_close(row[col], slots[j])
+        # and the OTHER sample's columns must be untouched in this sample's rows
+        other = slot_pos[1 - sample].tolist()
+        untouched = [c for c in other if c not in slot_pos[sample].tolist()]
+        for col in untouched:
+            assert float(out[sample * n_return][col].abs().sum()) == 0.0
+
+
+def test_generation_hook_zero_slots_ablation() -> None:
+    """§7a: zeroed slots must be injected as zeros, not skipped entirely."""
+    hook, stub, emb, _ = _hook_stub(zero=True)
+    with hook(stub, torch.tensor([[2, 3]])):
+        out = emb(torch.zeros(1, 5, dtype=torch.long))
+    assert float(out.abs().sum()) == 0.0
+
+
+def test_generation_hook_noop_without_slots() -> None:
+    hook, stub, emb, _ = _hook_stub(num_slots=0)
+    with hook(stub, None):
+        out = emb(torch.zeros(1, 5, dtype=torch.long))
+    assert float(out.abs().sum()) == 0.0

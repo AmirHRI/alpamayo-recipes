@@ -1,0 +1,92 @@
+# minADE evaluation of a trained KAVA Stage-1 student on the LCDrive VAL split.
+#
+# NOTE this is a STANDALONE primary config rather than `defaults: [sft_stage1_kava_...]`.
+# Hydra allows `hydra.searchpath` only in the primary config, and the training config
+# declares one — inheriting it raises "Overriding hydra.searchpath is only supported
+# from the primary config". `evaluate_hf` touches only `data.val_dataset` and
+# `data.collate_fn`, so the duplication is limited to those two blocks.
+#
+# ⚠️ `num_slots` must match the trained checkpoint in BOTH places below, and the
+# collator's must match the model's. A mismatch surfaces as a shape error, not a
+# message.
+#
+# THREE things differ from evaluating a plain Stage-1 checkpoint, each of which fails
+# SILENTLY if skipped:
+#
+#  1. `model.kava_checkpoint_path`, NOT `evaluate.eval_ckpt`. evaluate_hf routes
+#     eval_ckpt into `model.checkpoint_path`, which loads ONLY vlm.* — the trained slot
+#     embeddings would be replaced by fresh vocab-init and you would score a model that
+#     never existed. kava_checkpoint_path restores the full state dict and asserts the
+#     KAVA tensors were present.
+#  2. Generation must inject the slots. KaVaReasoningVLA overrides
+#     sample_trajectories_from_data to install the embedding hook; without it the model
+#     reads the literal placeholder token '.' where the reasoning should be.
+#  3. `kv_cache_root: null` — no teacher targets at eval, and L_KV is not computed. The
+#     slots still run; they are part of the model now.
+#
+# Usage: see slurm_eval_kava_lcdrive.sh. `model.zero_slots=true` runs the §7a
+# dead-slot ablation.
+defaults:
+  - sft_base
+  - /models/cosmos_reason2_2b_kava@model
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  # The finished KAVA run — this is what actually loads the weights.
+  kava_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_kava_cosmos2b_lcdrive/checkpoint-7191
+  # Do NOT warm-start as well: kava_checkpoint_path carries the VLM weights too, so
+  # loading checkpoint-3597 first would only be overwritten.
+  checkpoint_path: null
+  # Zero the slots at inference (§7a). If the metric does not move, they are decorative.
+  zero_slots: false
+  kava:
+    num_slots: 8
+    # Irrelevant at eval — the trained slots are restored from the checkpoint — but it
+    # must be null or hydra tries to interpolate a train_dataset that is not defined here.
+    slot_init_cot_text: null
+
+data:
+  collate_fn:
+    _target_: alpamayo1_5_distill.data.kava_dataset.KaVaCollator
+    _partial_: false          # overrides sft_base; see the training config for why
+    num_slots: 8              # MUST equal model.kava.num_slots
+    chat_template_version: r1_5
+
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.kava_dataset.KaVaPAIDataset
+    _recursive_: false
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    use_default_keyframe: true
+    teacher_cache_path: null
+    kv_cache_root: null       # no teacher targets needed at eval
+    kv_tier: null
+    num_slots: 8
+    vla_preprocess_args:
+      generation_mode: true
+
+trainer:
+  report_to: none
+  per_device_eval_batch_size: 2
+  # No optimizer exists at eval, so ZeRO buys nothing. It also has to be disabled
+  # explicitly: sft_base sets `deepspeed: configs/deepspeed/zero2.json` RELATIVE, which
+  # only resolves when cwd is the sft recipe dir, and accelerate then fails with
+  # "Expected a string path to an existing deepspeed config ... Received: configs/...".
+  deepspeed: null
+  gradient_checkpointing: false
+
+evaluate:
+  # Stays null on purpose: routing a KAVA checkpoint through evaluate_hf's eval_ckpt
+  # would send it to the vlm-only loader and silently drop the slots.
+  eval_ckpt: null
+  max_eval_steps: -1
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kava_eval
+task_name: alpamayo_1_5_kava_eval_cosmos2b_lcdrive
+run_name: kavaeval_M${model.kava.num_slots}_zero-${model.zero_slots}_${now:%m%d-%H%M}

@@ -52,6 +52,7 @@ what the Jacobi refinement path does.
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterator
 
 import torch
@@ -112,6 +113,12 @@ class KaVaReasoningVLA(DistillReasoningVLA):
     #: silently inert term.  Off by default: keeping the references alive would pin the
     #: graph for longer than the training step needs.
     keep_loss_terms: bool = False
+
+    #: §7a dead-slot ablation. When True the slots are zeroed at *inference* while
+    #: everything else is unchanged. If the metric does not move, the slots are
+    #: decorative and L_KV achieved nothing however well it converged — the single
+    #: most important check on whether this recipe worked.
+    zero_slots: bool = False
 
     # ------------------------------------------------------------------ setup
     def init_kava(
@@ -262,12 +269,22 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         latent_loss_weight: float = 1.0,
         latent_cosine_weight: float = 0.1,
         kava: dict[str, Any] | None = None,
+        kava_checkpoint_path: str | None = None,
         **kwargs: Any,
     ) -> "KaVaReasoningVLA":
         """Build the student, the parent's latent projector, then the KAVA state.
 
-        ``kava`` is the kwarg block forwarded to :meth:`init_kava`; omit it to get
-        exactly a :class:`DistillReasoningVLA` (the no-slot control arm).
+        Args:
+            checkpoint_path: a Stage-1 checkpoint to **warm start** from. Only its
+                ``vlm.*`` weights are read (that is what ``load_alpamayo1_vlm`` does).
+            kava_checkpoint_path: a checkpoint from a finished **KAVA** run, loaded
+                *after* ``init_kava`` and restoring the whole state dict — the slots,
+                the projector bank and ``latent_proj`` as well as the VLM.  Use this
+                for evaluation: routing a KAVA checkpoint through ``checkpoint_path``
+                would silently keep freshly vocab-initialised slots and evaluate a
+                model that was never trained.
+            kava: the kwarg block forwarded to :meth:`init_kava`; omit it to get
+                exactly a :class:`DistillReasoningVLA` (the no-slot control arm).
         """
         model = super().from_pretrained_vlm(
             vlm_name_or_path,
@@ -280,7 +297,54 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         )
         if kava is not None:
             model.init_kava(**kava)
+        if kava_checkpoint_path is not None:
+            model.load_kava_checkpoint(kava_checkpoint_path)
         return model
+
+    def load_kava_checkpoint(self, path: str) -> None:
+        """Restore a finished KAVA run: VLM **and** slots, projectors, latent_proj.
+
+        ``from_pretrained_vlm(checkpoint_path=...)`` deliberately loads only ``vlm.*``,
+        which is right for a warm start and wrong for evaluation — the trained slot
+        embeddings are the whole artifact, and losing them fails silently: the model
+        loads, runs, and reports a number for a configuration that never existed.
+        This asserts the KAVA tensors were actually found.
+        """
+        import glob
+
+        from safetensors.torch import load_file
+
+        shards = sorted(glob.glob(str(Path(path) / "model*.safetensors")))
+        if not shards:
+            raise FileNotFoundError(f"no model*.safetensors under {path}")
+        state: dict[str, torch.Tensor] = {}
+        for shard in shards:
+            state.update(load_file(shard))
+
+        kava_keys = [
+            k
+            for k in state
+            if k.startswith(("slot_embeddings", "kv_projector", "latent_proj", "jacobi_proj"))
+        ]
+        if not kava_keys:
+            raise ValueError(
+                f"{path} has no KAVA tensors (slot_embeddings / kv_projector / "
+                "latent_proj). That is a plain Stage-1 checkpoint — pass it as "
+                "`checkpoint_path` (warm start), not `kava_checkpoint_path`."
+            )
+        missing, unexpected = self.load_state_dict(state, strict=False)
+        missing_kava = [
+            m
+            for m in missing
+            if m.startswith(("slot_embeddings", "kv_projector", "latent_proj", "jacobi_proj"))
+        ]
+        if missing_kava:
+            raise ValueError(f"KAVA params absent from {path}: {missing_kava[:5]}")
+        print(
+            f"[kava] restored {len(state)} tensors from {path} "
+            f"({len(kava_keys)} KAVA, {len(unexpected)} unexpected, {len(missing)} missing)",
+            flush=True,
+        )
 
     # ------------------------------------------------------------- accessors
     def _text_model(self) -> nn.Module:
@@ -488,6 +552,67 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             kind=self.kv_loss_type,
             layerwise_std=self.kv_layerwise_std,
         )
+
+    # -------------------------------------------------------------- inference
+    @contextmanager
+    def _generation_slot_hook(self, slot_pos: torch.Tensor | None) -> Iterator[None]:
+        """Inject the learned slots for the duration of a ``generate`` call.
+
+        The training path injects via :meth:`_slot_hooks`, but generation never goes
+        through ``forward``, so without this the slots exist only as the placeholder
+        token ``'.'`` in ``input_ids`` and the model literally reads periods where the
+        reasoning should be. Nothing errors; the number at the end is just wrong.
+
+        Two things differ from the training hook:
+
+        * **Prefill only.** ``generate`` calls ``embed_tokens`` once per decode step on
+          a single new token, where ``slot_pos`` would index out of bounds. The guard
+          is on sequence length, so injection happens on the prefill pass alone —
+          which is sufficient, since the slots' K/V land in the cache there and every
+          later step attends to that cache.
+        * **Expanded batch.** ``num_return_sequences > 1`` makes ``generate``
+          ``repeat_interleave`` the batch, so ``slot_pos`` must be expanded the same
+          way or the rows misalign.
+        """
+        if slot_pos is None or slot_pos.numel() == 0 or self.num_slots <= 0:
+            yield
+            return
+
+        slots = self.slot_embeddings
+        if getattr(self, "zero_slots", False):
+            # §7a dead-slot ablation: if quality is unchanged with the slots zeroed,
+            # they are decorative and L_KV achieved nothing, whatever the loss said.
+            slots = torch.zeros_like(slots)
+        batch = slot_pos.shape[0]
+        max_col = int(slot_pos.max())
+
+        def inject(_module: nn.Module, _args: Any, out: torch.Tensor) -> torch.Tensor:
+            if out.shape[1] <= max_col:
+                return out  # a decode step, not the prefill
+            positions, n_out = slot_pos, out.shape[0]
+            if n_out != batch:
+                if n_out % batch:
+                    return out  # unexpected expansion; leave it rather than corrupt it
+                positions = slot_pos.repeat_interleave(n_out // batch, dim=0)
+            rows = torch.arange(n_out, device=out.device).unsqueeze(1)
+            out = out.clone()
+            out[rows, positions.to(out.device)] = slots.to(out.dtype)
+            return out
+
+        handle = self.vlm.get_input_embeddings().register_forward_hook(inject)
+        try:
+            yield
+        finally:
+            handle.remove()
+
+    def sample_trajectories_from_data(self, data: dict[str, Any], *args: Any, **kwargs: Any):
+        """Parent's sampler, with the latent slots actually injected.
+
+        ``slot_pos`` rides on the batch from ``KaVaCollator``; the parent knows nothing
+        about it, so this wraps the call rather than reimplementing the sampler.
+        """
+        with self._generation_slot_hook(data.get("slot_pos")):
+            return super().sample_trajectories_from_data(data, *args, **kwargs)
 
     # ---------------------------------------------------------------- forward
     def forward(
