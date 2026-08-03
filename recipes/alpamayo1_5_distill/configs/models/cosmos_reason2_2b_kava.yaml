@@ -15,12 +15,12 @@ checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/
 
 # lambda_1: the endpoint hidden match (KAVA's L_CODI analogue), inherited.
 teacher_hidden_dim: 4096
-# 0.01, not 1.0. RECALIBRATED against the WARM-STARTED student: a model that already
-# fits trajectories has CE ~3.1 (vs ~31 for the base 2B), so at lambda_1=1 the latent
-# term contributed 13107% of CE's backbone gradient and would have flattened the
-# trajectory head. 0.01 puts it at ~131% -- roughly parity. Measured at step 0 of the
-# first real run; KaVaTrainer logs gradshare_latent so drift is visible.
-latent_loss_weight: 0.01
+# 0.0. The endpoint term converged almost immediately (59.7 -> 0.15) and spent the run
+# at ~3% of CE's gradient, so it was contributing nothing while remaining a confound --
+# it drags a 2048-d hidden toward a 4096-d teacher through a randomly-initialised
+# projector. KAVA sets lambda_1 = 0 on its hardest dataset for the same reason.
+# Set 0.01 to restore it (that value was calibrated to ~131% of CE at step 0).
+latent_loss_weight: 0.0
 latent_cosine_weight: 0.1
 
 kava:
@@ -49,8 +49,18 @@ kava:
   # latent 171, kv 1.539. lambda_2=1 puts L_KV at ~118% of CE. Re-measure if the warm
   # start, M, or the layer map changes -- gradshare_kv in the logs is the tripwire.
   kv_loss_weight: 1.0
-  # "l1" | "mse" | "smooth_l1" — the paper's best choice varies by dataset.
-  kv_loss_type: smooth_l1
+  # l1, NOT smooth_l1. MEASURED: smooth_l1 is self-extinguishing here. Its gradient is
+  # proportional to the residual, so as the student converges toward the teacher the
+  # objective quietly stops steering. On real cached targets with layerwise_std on:
+  #
+  #   residual (x std)   2.70     0.62     0.30     0.10
+  #   smooth_l1 ||grad|| 4.8e-5   3.0e-5   1.6e-5   5.3e-6     <- decays 9x
+  #   l1        ||grad|| 5.3e-5   5.3e-5   5.3e-5   5.3e-5     <- constant
+  #
+  # The first run traversed 2.7 -> ~0.3 std (kv_loss 2.16 -> 0.193) and its backbone
+  # gradient share collapsed 89% -> 10% within ~300 of 7,191 steps, so ~96% of training
+  # was effectively plain CE. l1 holds the gradient constant instead.
+  kv_loss_type: l1
   # KAVA's "Layer-wise std" row: normalise each layer's residual by its teacher
   # target's std. Qwen3-VL K/V magnitudes differ by orders of magnitude across depth
   # ("massive activations"), so leaving this off lets the largest layers dominate.

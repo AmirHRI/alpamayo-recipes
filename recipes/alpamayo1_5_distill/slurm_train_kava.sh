@@ -19,6 +19,7 @@
 # checkpoint, K=8 latent slots supervised by the teacher's M=8 compressed KV cache.
 #
 #   SMOKE=1 sbatch slurm_train_kava.sh     # 20 steps, probe every 2 — verify, then run
+#   CONTROL=1 sbatch slurm_train_kava.sh   # same schedule, BOTH aux losses off
 #   sbatch slurm_train_kava.sh             # the real run
 #   GPUS=2 sbatch --gpus=2 slurm_train_kava.sh
 #
@@ -54,6 +55,22 @@ if [[ "$SMOKE" == "1" ]]; then
             ++data.train_dataset.chunk_ids="0-120" ++data.val_dataset.chunk_ids="0-120")
     export KAVA_GRAD_PROBE_STEPS=2
     echo "[slurm] SMOKE mode: 20 steps, gradient probe every 2"
+fi
+
+# CONTROL arm: identical warm start, data, schedule and slots, distillation OFF. Its
+# only job is to attribute the first run's +0.158 min_ade regression, which accrued over
+# 7,191 steps of which only ~300 carried real KAVA gradient — so over-training is a live
+# explanation that has nothing to do with the method.
+#   control regresses ~as much  -> the damage is over-training; KAVA is neutral here
+#   control regresses less      -> the distillation terms genuinely hurt
+#   control does not regress    -> something specific to this configuration
+# Done as CLI overrides rather than a second config: hydra forbids inheriting a config
+# that declares hydra.searchpath, and a copied config would drift from this one.
+if [[ "${CONTROL:-0}" == "1" ]]; then
+    EXTRA+=(model.latent_loss_weight=0.0 model.kava.kv_loss_weight=0.0
+            paths.output_dir="$OUT_DIR/output_stage1_kava_control_lcdrive"
+            "run_name=kavactl_noaux_$(date +%m%d-%H%M)")
+    echo "[slurm] CONTROL arm: lambda_1 = lambda_2 = 0 (gradshare_kv should log 0.0)"
 fi
 
 # The cgroup exposes roughly half of --cpus-per-task, so 12 workers (the config default,
