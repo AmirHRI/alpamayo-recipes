@@ -63,6 +63,12 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         super().__init__(*args, **kwargs)
         self._aux_sums: dict[str, float] = {}
         self._aux_count: int = 0
+        # Gradient shares are RATIOS measured once per probe, not per-micro-batch
+        # values. They must not go through _aux_sums, which log() divides by
+        # _aux_count -- with logging_steps=5 x grad_accum=16 that is 80 compute_loss
+        # calls, so the logged curve came out 80x too small while the printed probe
+        # line was right. Kept in their own dict and logged verbatim.
+        self._grad_shares: dict[str, float] = {}
         self._last_probe_step: int = -1
         self._probe_failed: bool = False
 
@@ -156,8 +162,8 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         print(f"[kava] step {self._last_probe_step} weighted backbone grad: {summary}", flush=True)
         for name, value in norms.items():
             if name != "ce" and reference:
-                self._aux_sums[f"gradshare_{name}"] = value / reference
-                self._aux_count = max(self._aux_count, 1)
+                self._grad_shares[f"gradshare_{name}"] = value / reference
+        self._grad_shares["gradshare_ce_absnorm"] = reference
 
     def _stash(self, outputs: Any) -> None:
         if outputs is None:
@@ -178,4 +184,7 @@ class KaVaTrainer(ReasoningVLA_Trainer):
                 logs[key] = round(total / self._aux_count, 6)
             self._aux_sums = {}
             self._aux_count = 0
+        if self._grad_shares:  # ratios: logged as-is, never averaged
+            logs.update({k: round(v, 6) for k, v in self._grad_shares.items()})
+            self._grad_shares = {}
         super().log(logs, *args, **kwargs)

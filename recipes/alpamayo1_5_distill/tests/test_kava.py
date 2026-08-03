@@ -693,3 +693,25 @@ def test_zero_slots_is_an_explicit_parameter_not_swallowed_by_kwargs() -> None:
         "and the dead-slot ablation would silently be a no-op"
     )
     assert sig.parameters["zero_slots"].default is False
+
+
+def test_gradient_shares_are_logged_verbatim_not_averaged() -> None:
+    """gradshare_* is a ratio, not a per-micro-batch quantity.
+
+    Routing it through `_aux_sums` made log() divide it by `_aux_count` — with
+    logging_steps=5 x grad_accum=16 that is 80 compute_loss calls, so the wandb curve
+    read 0.0026 where the probe had measured 0.21. The printed line and the logged
+    metric disagreed by 80x for a whole 22-hour run.
+    """
+    import types
+
+    from alpamayo1_5_distill.trainer import KaVaTrainer
+
+    tr = KaVaTrainer.__new__(KaVaTrainer)
+    tr._aux_sums, tr._aux_count = {"ce_loss": 8.0}, 4      # 4 micro-batches -> mean 2.0
+    tr._grad_shares = {"gradshare_kv": 0.21}
+    captured: dict = {}
+    tr.__class__.__mro__[1].log = lambda self, logs, *a, **k: captured.update(logs)
+    KaVaTrainer.log(tr, {})
+    assert captured["ce_loss"] == 2.0            # summed value IS averaged
+    assert captured["gradshare_kv"] == 0.21      # ratio is NOT
