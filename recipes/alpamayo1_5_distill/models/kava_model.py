@@ -270,6 +270,7 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         latent_cosine_weight: float = 0.1,
         kava: dict[str, Any] | None = None,
         kava_checkpoint_path: str | None = None,
+        zero_slots: bool = False,
         **kwargs: Any,
     ) -> "KaVaReasoningVLA":
         """Build the student, the parent's latent projector, then the KAVA state.
@@ -285,6 +286,11 @@ class KaVaReasoningVLA(DistillReasoningVLA):
                 model that was never trained.
             kava: the kwarg block forwarded to :meth:`init_kava`; omit it to get
                 exactly a :class:`DistillReasoningVLA` (the no-slot control arm).
+            zero_slots: the §7a dead-slot ablation.  **Must be an explicit parameter**:
+                left to ``**kwargs`` it is swallowed by the parent's
+                ``config_kwargs.update(kwargs)`` and becomes a *config field* rather
+                than a model attribute, so the ablation silently does nothing and both
+                arms score identically. That is how the first ablation run was wasted.
         """
         model = super().from_pretrained_vlm(
             vlm_name_or_path,
@@ -299,6 +305,13 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             model.init_kava(**kava)
         if kava_checkpoint_path is not None:
             model.load_kava_checkpoint(kava_checkpoint_path)
+        model.zero_slots = bool(zero_slots)
+        if model.zero_slots:
+            print(
+                "[kava] zero_slots=True — DEAD-SLOT ABLATION: the slots are injected as "
+                "zeros at inference. Any metric from this run is the no-reasoning arm.",
+                flush=True,
+            )
         return model
 
     def load_kava_checkpoint(self, path: str) -> None:

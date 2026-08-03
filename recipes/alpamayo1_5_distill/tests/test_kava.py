@@ -672,3 +672,24 @@ def test_generation_hook_noop_without_slots() -> None:
     with hook(stub, None):
         out = emb(torch.zeros(1, 5, dtype=torch.long))
     assert float(out.abs().sum()) == 0.0
+
+
+def test_zero_slots_is_an_explicit_parameter_not_swallowed_by_kwargs() -> None:
+    """`zero_slots` must be a named arg of from_pretrained_vlm, not left to **kwargs.
+
+    The parent's from_pretrained_vlm ends in `config_kwargs.update(kwargs)`, so any
+    unrecognised kwarg silently becomes a CONFIG FIELD instead of a model attribute.
+    `_generation_slot_hook` reads the attribute, so an ablation passed that way does
+    nothing and both arms score identically — which is exactly what happened on the
+    first ablation run (500/500 clips bit-identical, 76 min per arm wasted).
+    """
+    import inspect
+
+    from alpamayo1_5_distill.models.kava_model import KaVaReasoningVLA
+
+    sig = inspect.signature(KaVaReasoningVLA.from_pretrained_vlm)
+    assert "zero_slots" in sig.parameters, (
+        "zero_slots fell out of the signature; it would be swallowed into the config "
+        "and the dead-slot ablation would silently be a no-op"
+    )
+    assert sig.parameters["zero_slots"].default is False
