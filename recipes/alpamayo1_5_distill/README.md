@@ -776,6 +776,54 @@ for s in 0 1 2 3 4 5 6 7; do
 done; wait
 ```
 
+**K3-alt. Or restore the prebuilt cache from HuggingFace** — on a second machine,
+this is much faster than rebuilding, and far faster than copying over a slow site link
+(measured: 2.85 MB/s between our two sites, vs 19.2 MB/s pulling from HF).
+
+The M=8 tier, the sidecars and the Stage-1 warm-start checkpoint are mirrored to a
+**private** dataset repo, tarred into 12 zstd shards because 38,336 small files is
+hostile to the Hub (43 GB → 34 GB; bf16 K/V compresses ~21%):
+
+> 🔒 `ac4462/alpamayo-kava-cache` — **private, Honda-internal.** Teacher KV activations
+> derived from the PAI driving data plus generated CoT text. Do not make it public or
+> re-share it.
+
+```bash
+DEST=/path/on/target
+hf download ac4462/alpamayo-kava-cache --repo-type dataset --local-dir $DEST/dl
+
+mkdir -p $DEST/teacher_kv_lcdrive/compressed_M8_rkv0.1 $DEST/checkpoint-3597
+for f in $DEST/dl/kv_M8_shard*.tar.zst; do
+  zstd -dc "$f" | tar -C $DEST/teacher_kv_lcdrive/compressed_M8_rkv0.1 -xf -
+done
+zstd -dc $DEST/dl/kv_M8_sidecars.tar.zst  | tar -C $DEST/teacher_kv_lcdrive -xf -
+zstd -dc $DEST/dl/stage1_ckpt3597.tar.zst | tar -C $DEST/checkpoint-3597 -xf -
+
+# MUST be 38336 — a short cache fails at TRAINING time as a KeyError, not at unpack
+find $DEST/teacher_kv_lcdrive/compressed_M8_rkv0.1 -name '*.safetensors' | wc -l
+```
+
+| in the repo | |
+|---|---|
+| `kv_M8_shard{00..11}.tar.zst` | the `compressed_M8_rkv0.1` tier, 38,336 entries |
+| `kv_M8_sidecars.tar.zst` | `index.rebuilt.json` + `cot_text.shard0.jsonl` — **required**, `cot_text` drives the slot vocab-init |
+| `stage1_ckpt3597.tar.zst` | the Stage-1 warm start (`model.safetensors` + `config.json` only; the 28 GB of DeepSpeed state is not needed) |
+
+**Not** in the repo, because they are public — pull them directly rather than copying:
+`nvidia/Cosmos-Reason2-2B` (student backbone) and the `Alpamayo-1.5-10B` config (only
+its tokenizer/trajectory settings are read). The `full/` tier (69 GB) is also omitted;
+it is only needed to derive *other* `(M, λ, method)` tiers, which is better done on the
+machine that already has it.
+
+Then point the training config at it — remember these must all agree:
+
+```bash
+data.train_dataset.kv_cache_root=$DEST/teacher_kv_lcdrive
+data.train_dataset.kv_tier=compressed_M8_rkv0.1
+data.train_dataset.num_slots=8  data.collate_fn.num_slots=8  model.kava.num_slots=8
+model.checkpoint_path=$DEST/checkpoint-3597
+```
+
 **K4. Train.** Use `train_kava`, not `train_hf` — it swaps in `KaVaTrainer`, and
 without the per-term logging "total went down" cannot tell you whether `L_KV` did
 anything:
