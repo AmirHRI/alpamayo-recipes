@@ -10,6 +10,15 @@ recipe's student/teacher model classes, trainer, and shared config groups, and
 adds only the distillation-specific model subclass, dataset wrappers, offline
 teacher-feature cache script, and configs.
 
+> **Published artifacts** (both 🔒 **private, Honda-internal** — do not make public):
+> | | |
+> |---|---|
+> | 🤗 `ac4462/alpamayo-kava-2b-m8-lcdrive` | the trained M=8 student, 4.70 GB — see **K5-alt** |
+> | 🤗 `ac4462/alpamayo-kava-cache` | the teacher KV cache, 34 GB — see **K3-alt** |
+>
+> Together these let a second machine evaluate or continue from this work without the
+> 10B teacher, the 22 GPU-hour cache build, or the 22-hour training run.
+
 ---
 
 ## Background: how Alpamayo works
@@ -850,6 +859,49 @@ for e in cosine attn crop; do $VENV/python -m alpamayo1_5_distill.scripts.compre
 Also sweep `model.kava.{jacobi_iters,kv_loss_type,kv_loss_weight,kv_align,kv_layerwise_std}`.
 `jacobi_iters` is the one with a latency cost: `T=1` rides the single prefill pass for
 free, each further iteration adds a pass against ~85 ms of prefill in a 100 ms budget.
+
+**K5-alt. Or skip training and pull the trained model.** The finished M=8 run is
+mirrored, so evaluation or a Stage-2 handoff needs neither the cache nor 22 GPU-hours:
+
+> 🔒 `ac4462/alpamayo-kava-2b-m8-lcdrive` — **private, Honda-internal.** 4.70 GB.
+> Cosmos-Reason2-2B distilled from Alpamayo-1.5-10B on Honda's LCDrive data.
+
+```bash
+hf download ac4462/alpamayo-kava-2b-m8-lcdrive --local-dir $DEST/kava-2b-m8
+```
+
+Plain safetensors, not tarred — 6 files, so `hf download` and `from_pretrained` work
+directly. The 33 GB `global_step7191/` DeepSpeed optimizer state is deliberately **not**
+mirrored: inference never reads it, and it is 87% of the checkpoint directory.
+
+⚠️ **Point it at `kava_checkpoint_path`, never `checkpoint_path`.** The checkpoint holds
+59 KAVA tensors (`slot_embeddings [8, 2048]`, 56 projectors, `latent_proj`) beside 626
+VLM tensors. `checkpoint_path` loads **only `vlm.*`** — the trained slots would be
+silently replaced by fresh vocab-init and you would score a model that never existed.
+`kava_checkpoint_path` restores the full state dict and asserts the KAVA tensors were
+found:
+
+```yaml
+model:
+  kava_checkpoint_path: $DEST/kava-2b-m8   # ✅  logs "restored 685 tensors (59 KAVA ...)"
+  checkpoint_path: null                    # ❌  vlm.* only
+  kava: {num_slots: 8, ...}                #     must match the trained M
+```
+
+What it was trained with — warm start from Stage-1 `checkpoint-3597`, 3 epochs over
+38,336 LCDrive clips, `CE + 0.01·L_latent + 1.0·L_KV`, M=8 with the identity-init
+projector, T=1, 21 h 46 m on one H100:
+
+```
+              start    end
+ce_loss        2.89 -> 2.06     (improved — trajectory quality not sacrificed)
+latent_loss   59.7  -> 0.150
+kv_loss        2.16 -> 0.193
+gradshare_kv    89% ->  21% of CE   (falls as it is learned, rises as CE's own shrinks)
+```
+
+`L_KV` never went inert — which is the failure the first `lambda_2` would have produced
+(0.0% of the backbone gradient) while the loss curve looked perfectly healthy.
 
 **K6. The dead-slot gate.** After training, zero the slots at inference. If quality
 does not drop, the slots are decorative and `L_KV` achieved nothing, whatever the loss
