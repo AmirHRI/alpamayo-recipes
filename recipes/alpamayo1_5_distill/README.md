@@ -897,15 +897,30 @@ projector, T=1, 21 h 46 m on one H100:
 ce_loss        2.89 -> 2.06     (improved — trajectory quality not sacrificed)
 latent_loss   59.7  -> 0.150
 kv_loss        2.16 -> 0.193
-gradshare_kv    89% ->  21% of CE   (falls as it is learned, rises as CE's own shrinks)
 ```
 
-`L_KV` never went inert — which is the failure the first `lambda_2` would have produced
-(0.0% of the backbone gradient) while the loss curve looked perfectly healthy.
+⚠️ **Do not summarise `gradshare_kv` as "89% → 21%".** Two endpoints hide a collapse;
+the full series is what matters:
 
-**K6. The dead-slot gate.** After training, zero the slots at inference. If quality
-does not drop, the slots are decorative and `L_KV` achieved nothing, whatever the loss
-curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-splice.
+```
+step        0    latent 111%   kv 89%
+steps 300-600    latent   7%   kv 10%
+steps  >6000     latent   3%   kv 17%
+```
+
+Both terms collapse within ~300 of 7,191 steps and spend the bulk of training at 5–11%.
+The late rise in `kv%` is CE's own gradient shrinking (2.17 → 0.63), not `L_KV`
+strengthening. So this run was effectively ~300 steps of KAVA followed by ~6,900 steps
+of plain CE continuation — which is why the 1-epoch configs below replaced it, and why
+over-training was a live explanation for its regression that had nothing to do with the
+distillation terms. An earlier version of this README claimed "`L_KV` never went inert"
+from the endpoint alone; that was cherry-picking and is retracted.
+
+**K6. The dead-slot gate — RUN, and it is the most informative result here.** Zero the
+slots at inference: if quality does not drop, the slots are decorative and `L_KV`
+achieved nothing, whatever the loss curve said (`reasoning-setup-2b.md` §7a). See
+[Trained and evaluated](#trained-and-evaluated-lcdrive-val-n500-paired) — at `T=1` the
+slots are decorative, and at `T=2` they are not.
 
 ## Status — verified end-to-end (real H100, real PAI data)
 
@@ -1010,7 +1025,6 @@ curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-s
   The pilot's one substantive finding is the **13-token CoT** and what it does to the
   `M` guidance; see the boxed note above. It also corrected this README's latency
   saving from ~420 ms to ~143 ms.
-- **Not yet run:** training itself, and therefore no quality numbers.
 - **`importance_source="expert"` built and verified against the real 10B**
   (`teacher_ar1_5_10b_expert`, expert loaded, 22.7 GiB peak):
 
@@ -1032,6 +1046,65 @@ curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-s
   `dtype: auto`). Second, at `M >= N_C` eviction is a no-op and *every* scoring method
   agrees perfectly — so a short-CoT sample cannot demonstrate that the score works.
   Compare methods at `M < N_C`.
+
+### Trained and evaluated (LCDrive val, n=500, paired)
+
+Four arms trained, all warm-started from Stage-1 `checkpoint-3597`, `M=8`,
+`kv_align: projector`, `kv_loss_type: l1`, `latent_loss_weight: 0.0` (so `CE + L_KV`
+only — the logged `latent_loss` is raw and unweighted). Evaluated against the Stage-1
+baseline's own per-clip file on a **bit-identical 500-clip set** (verified: union ==
+intersection == 500, every id present in the 23,331-clip baseline dump).
+
+| arm | eff. batch | `min_ade` | `ade` | slots load-bearing? |
+|---|---|---|---|---|
+| Stage-1 baseline, no KD | 48 | **4.094** | **4.949** | — |
+| CE-only control, `T=1` | 16 | 4.297 | 5.127 | — |
+| KAVA `T=1` | 16 | 4.021 | 5.764 | **no** (−0.024 ± 0.053, n.s.) |
+| KAVA `T=2` | 48 | 4.165 | 9.570 | **yes** (−3.78 ± 0.59, 6.4σ) |
+
+Three findings, and the second corrects a reading of the first table column:
+
+1. **`T=1` slots are decorative.** Zeroing them changes nothing at any horizon
+   (−0.0008 to +0.0037, all |z| < 0.5). `T=1` is PCCoT with one iteration ≡ pause
+   tokens, so the slots add width but never re-read their own output. `L_KV` still
+   *helped* — it recovered the CE-only control's +0.203 regression — but as a
+   regulariser on the weights, not through the slots. That is not the mechanism KAVA
+   claims.
+2. **`T=2` makes the slots load-bearing, and this survives scrutiny.** Zeroing costs
+   −0.221 at 0.5 s and −1.850 at 3 s (5.0–6.4σ), and it holds on the 247 clips where
+   neither arm is degenerate (−0.021 to −0.327, 3.2–4.0σ) — so it is not a tail
+   artifact. **But quality did not improve.** Full-horizon `min_ade` is +0.071 ± 0.046
+   (1.5σ) vs baseline, which reads as parity and is *underpowered*; the
+   horizon-resolved columns are unambiguous and all significant: +0.010 (3.3σ) at
+   0.5 s, +0.034 (3.9σ) at 1 s, +0.157 (5.4σ) at 3 s. Prefer the per-horizon numbers —
+   the full-horizon column is dominated by long-horizon variance.
+3. **`T=2` destabilised the trajectory *distribution*.** `ade` mean 4.95 → 9.57, with
+   48/500 clips above 20 versus 8 for the baseline — and 37 of those 48 are clips the
+   baseline handles fine (< 10). On the worst, `ade` ≈ 102 while `min_ade` ≈ 0.9: a
+   near-perfect mode still exists but a typical draw is 100× off. This is real, not a
+   metric artifact — [`metric_api.py:225`](../../src/alpamayo/metrics/metric_api.py#L225)
+   sets `logprob = torch.zeros_like(...)` ("dummy logprob for now"), so `argmax` always
+   returns 0 and **`ade` is sample 0's error, not the best or the mean over modes**.
+   `min_ade` is best-of-K. Deployment gets one trajectory, so `ade` is arguably the
+   number that matters more.
+
+**`L_KV` has a floor at ~0.60.** It falls 3.13 → 0.62 by epoch 0.30 and then moves
+0.02 over the remaining 70% of the epoch. Doubling Jacobi depth does not move it either
+(`T=2`: 0.589 vs `T=1`: 0.574). So the limit is not compute or steps — it is alignment
+or capacity. The two untested hypotheses are the 59 M-param per-layer projector
+absorbing the loss instead of forcing the backbone to match (`kv_align: direct` tests
+this with zero params) and an intrinsic 2B-vs-10B basis gap.
+
+⚠️ **Per-clip metric dumps are per-rank, not gathered.** A multi-GPU eval prints a
+correct aggregate to the log but writes only rank 0's shard to the JSON. A 2-rank,
+1000-clip eval left a 500-row file strided `0, 2, 4, …, 998`, which silently pairs
+against nothing. Run each eval arm as an independent single-rank job.
+
+**In flight:** a CE-only control at `T=2` and effective batch 48, differing from the
+KAVA `T=2` arm in exactly one variable (λ₂ 1.0 → 0.0). It decides whether the `T=2`
+slot dependence and the `ade` tail come from `L_KV` or merely from Jacobi refinement
+making the slots input-dependent. Until it lands, neither is attributed.
+
 
 ## Scope & follow-ups
 
