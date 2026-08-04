@@ -804,3 +804,26 @@ def test_generation_hook_T1_still_uses_raw_slots() -> None:
     with hook(stub, torch.tensor([[2, 3]])):
         out = emb(torch.zeros(1, 5, dtype=torch.long))
     torch.testing.assert_close(out[0, 2], slots[0])
+
+
+def test_refined_slots_expand_with_num_return_sequences() -> None:
+    """[B,K,H] refined slots must repeat_interleave like slot_pos does.
+
+    The raw path passes [K,H], which broadcasts over any batch — so the missing
+    expansion only surfaced with refined slots, as a shape error at eval:
+    "value tensor of shape [4,8,2048] cannot be broadcast to ... [24,8,2048]".
+    """
+    hook, stub, emb, _ = _hook_stub(num_slots=2)
+    stub.jacobi_iters = 2
+    n_return = 3
+    slot_pos = torch.tensor([[1, 2], [4, 5]])          # 2 samples, distinct columns
+    refined = torch.stack([torch.full((2, 4), 7.0), torch.full((2, 4), 8.0)])  # [2,K,H]
+    with hook(stub, slot_pos, refined_slots=refined):
+        out = emb(torch.zeros(2 * n_return, 8, dtype=torch.long))
+    for sample in (0, 1):
+        for rep in range(n_return):
+            row = out[sample * n_return + rep]
+            for j, col in enumerate(slot_pos[sample].tolist()):
+                torch.testing.assert_close(row[col], refined[sample, j]), (
+                    f"sample {sample} rep {rep} got another sample's refined slots"
+                )

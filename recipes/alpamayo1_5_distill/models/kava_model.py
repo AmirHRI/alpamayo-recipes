@@ -616,14 +616,22 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         def inject(_module: nn.Module, _args: Any, out: torch.Tensor) -> torch.Tensor:
             if out.shape[1] <= max_col:
                 return out  # a decode step, not the prefill
-            positions, n_out = slot_pos, out.shape[0]
+            positions, n_out, values = slot_pos, out.shape[0], slots
             if n_out != batch:
                 if n_out % batch:
                     return out  # unexpected expansion; leave it rather than corrupt it
-                positions = slot_pos.repeat_interleave(n_out // batch, dim=0)
+                repeat = n_out // batch
+                positions = slot_pos.repeat_interleave(repeat, dim=0)
+                # Per-sample slots must be expanded the SAME way. The raw path passes
+                # [K, H], which broadcasts over any batch and hid this; refined slots are
+                # [B, K, H] and previously died with "value tensor of shape [4, 8, 2048]
+                # cannot be broadcast to indexing result of shape [24, 8, 2048]" -- 24 =
+                # 4 x num_traj_samples 6.
+                if values.dim() == 3:
+                    values = values.repeat_interleave(repeat, dim=0)
             rows = torch.arange(n_out, device=out.device).unsqueeze(1)
             out = out.clone()
-            out[rows, positions.to(out.device)] = slots.to(out.dtype)
+            out[rows, positions.to(out.device)] = values.to(out.dtype)
             return out
 
         handle = self.vlm.get_input_embeddings().register_forward_hook(inject)
