@@ -109,6 +109,12 @@ WORKERS="${WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-16} / (3 * GPUS) ))}"
 [[ "$WORKERS" -lt 2 ]] && WORKERS=2
 EXTRA+=(++trainer.dataloader_num_workers="$WORKERS")
 
+# Free-form hydra overrides, word-split. For one-off knobs that do not deserve a named
+# variable -- e.g. EXTRA_ARGS='++trainer.ddp_timeout=5400' after a NCCL collective
+# timeout. Deliberately unquoted expansion so multiple overrides can be passed.
+# shellcheck disable=SC2206,SC2086
+[[ -n "${EXTRA_ARGS:-}" ]] && EXTRA+=($EXTRA_ARGS)
+
 echo "[slurm] job=$SLURM_JOB_ID gpus=$CUDA_VISIBLE_DEVICES cache_root=$CACHE_ROOT workers=$WORKERS"
 
 srun "$VENV/torchrun" \
