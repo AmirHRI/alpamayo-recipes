@@ -110,6 +110,11 @@ class KaVaPAIDataset(DistillPAIDataset):
             train part of an epoch with no KV supervision and look like a mysteriously
             weak result.  Turn it ON for the LCDrive build, where 4 of 38,340 clips
             have no handoff token and therefore no cache entry.
+
+            NOTE the substitute ``teacher_tfs_hidden`` is ZEROS, which is only harmless
+            because ``latent_loss_weight`` is 0. With lambda_1 > 0 those few clips would
+            be pulled toward a zero hidden; the latent term would need its own valid
+            mask first.
     """
 
     def __init__(
@@ -132,6 +137,7 @@ class KaVaPAIDataset(DistillPAIDataset):
         # Alpamayo-1.5-10B values so a miss on the very first sample still produces a
         # correctly-shaped empty target.
         self._teacher_layers, self._teacher_kv_heads, self._head_dim = 36, 8, 128
+        self._teacher_hidden = 4096  # Alpamayo-1.5-10B VLM width; corrected on first hit
         if kv_cache_root is not None and kv_tier is None:
             raise ValueError("kv_cache_root given without kv_tier; pass the compressed tier name")
 
@@ -152,6 +158,12 @@ class KaVaPAIDataset(DistillPAIDataset):
         sample["teacher_kv_k"] = torch.zeros(shape, dtype=torch.bfloat16)
         sample["teacher_kv_v"] = torch.zeros(shape, dtype=torch.bfloat16)
         sample["teacher_kv_valid"] = torch.zeros(self.num_slots, dtype=torch.bool)
+        if self.attach_tfs_hidden:
+            # MUST match the cached path's key set exactly. `basic_collation_fn` stacks
+            # by key across the batch, so a row missing one key raises KeyError as soon
+            # as it shares a batch with a row that has it -- invisible at bs=1 (one row
+            # per batch, nothing to mismatch) and fatal at bs>=2.
+            sample["teacher_tfs_hidden"] = torch.zeros(self._teacher_hidden, dtype=torch.float32)
         return sample
 
     def _attach_teacher_kv(self, sample: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
@@ -172,8 +184,15 @@ class KaVaPAIDataset(DistillPAIDataset):
         sample["teacher_kv_k"] = k
         sample["teacher_kv_v"] = v
         sample["teacher_kv_valid"] = valid
-        if self.attach_tfs_hidden and "tfs_hidden" in entry:
-            sample["teacher_tfs_hidden"] = entry["tfs_hidden"]
+        if self.attach_tfs_hidden:
+            # Unconditional for the same reason: an entry written without tfs_hidden
+            # would otherwise produce a row with a different key set from its batch-mates.
+            hidden = entry.get("tfs_hidden")
+            if hidden is None:
+                hidden = torch.zeros(self._teacher_hidden, dtype=torch.float32)
+            else:
+                self._teacher_hidden = int(hidden.shape[-1])
+            sample["teacher_tfs_hidden"] = hidden
         return sample
 
     def __getitem__(self, idx: int) -> dict[str, Any] | None:

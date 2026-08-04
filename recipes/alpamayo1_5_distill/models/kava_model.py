@@ -568,7 +568,9 @@ class KaVaReasoningVLA(DistillReasoningVLA):
 
     # -------------------------------------------------------------- inference
     @contextmanager
-    def _generation_slot_hook(self, slot_pos: torch.Tensor | None) -> Iterator[None]:
+    def _generation_slot_hook(
+        self, slot_pos: torch.Tensor | None, refined_slots: torch.Tensor | None = None
+    ) -> Iterator[None]:
         """Inject the learned slots for the duration of a ``generate`` call.
 
         The training path injects via :meth:`_slot_hooks`, but generation never goes
@@ -591,7 +593,19 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             yield
             return
 
-        slots = self.slot_embeddings
+        if refined_slots is not None:
+            slots = refined_slots
+        elif self.jacobi_iters > 1:
+            # Guard, not a fallback. Injecting raw embeddings for a T>1 checkpoint is
+            # what produced min_ade 17.56 vs a 4.09 baseline, silently.
+            raise RuntimeError(
+                f"jacobi_iters={self.jacobi_iters} but no refined slots were supplied to "
+                "the generation hook. Inference must run the same PCCoT refinement as "
+                "training; injecting the raw slot_embeddings feeds the model latents it "
+                "never saw. Call via sample_trajectories_from_data, or pass refined_slots."
+            )
+        else:
+            slots = self.slot_embeddings
         if getattr(self, "zero_slots", False):
             # §7a dead-slot ablation: if quality is unchanged with the slots zeroed,
             # they are decorative and L_KV achieved nothing, whatever the loss said.
@@ -618,13 +632,47 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         finally:
             handle.remove()
 
+    def _refined_slots_for_inference(
+        self, data: dict[str, Any], slot_pos: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Reproduce training's PCCoT refinement at inference. -> ``[B, K, H]`` or None.
+
+        Training injects ``_run_jacobi(...)`` when ``T > 1``; generation used to inject
+        the raw ``slot_embeddings``, i.e. the *starting point* of the iteration rather
+        than its result. Those differ by rel-L2 ~1.56 (measured), so a T=2 checkpoint
+        was being fed latents it had never seen: min_ade came out 17.56 against a 4.09
+        baseline, and *zeroing* the slots scored better (7.94) because zeros are merely
+        uninformative rather than actively wrong.
+
+        Returns None at ``T == 1``, where the raw embeddings are exactly what training
+        injects and no refinement is defined.
+        """
+        if self.jacobi_iters <= 1:
+            return None
+        tokenized = dict(data["tokenized_data"])
+        input_ids = tokenized.pop("input_ids")
+        input_ids = self.fuse_traj_tokens(
+            input_ids,
+            {
+                "ego_history_xyz": data.get("ego_history_xyz"),
+                "ego_history_rot": data.get("ego_history_rot"),
+            },
+        )
+        return self._run_jacobi(input_ids, tokenized, slot_pos, self.slot_embeddings)
+
     def sample_trajectories_from_data(self, data: dict[str, Any], *args: Any, **kwargs: Any):
         """Parent's sampler, with the latent slots actually injected.
 
         ``slot_pos`` rides on the batch from ``KaVaCollator``; the parent knows nothing
-        about it, so this wraps the call rather than reimplementing the sampler.
+        about it, so this wraps the call rather than reimplementing the sampler. When
+        ``T > 1`` the slots are refined first, exactly as ``forward`` does — otherwise
+        inference and training disagree about what a "slot" is.
         """
-        with self._generation_slot_hook(data.get("slot_pos")):
+        slot_pos = data.get("slot_pos")
+        refined = None
+        if slot_pos is not None and slot_pos.numel() and self.num_slots > 0:
+            refined = self._refined_slots_for_inference(data, slot_pos.to(self.device))
+        with self._generation_slot_hook(slot_pos, refined_slots=refined):
             return super().sample_trajectories_from_data(data, *args, **kwargs)
 
     # ---------------------------------------------------------------- forward

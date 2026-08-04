@@ -541,6 +541,7 @@ def test_empty_kv_target_is_shaped_and_fully_masked() -> None:
 
     ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
     ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = 6, L, H, D
+    ds.attach_tfs_hidden, ds._teacher_hidden = True, 4096
     out = ds._attach_empty_kv({})
     assert out["teacher_kv_k"].shape == (L, H, 6, D)
     assert out["teacher_kv_valid"].sum() == 0
@@ -553,6 +554,7 @@ def test_uncached_sample_contributes_nothing_to_the_batch_loss() -> None:
 
     ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
     ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = 5, L, H, D
+    ds.attach_tfs_hidden, ds._teacher_hidden = True, 4096
     empty = ds._attach_empty_kv({})
     n_student = 3
     mapping = build_layer_map(n_student, L)
@@ -611,6 +613,7 @@ def _hook_stub(num_slots=2, hidden=4, zero=False):
         num_slots=num_slots,
         slot_embeddings=slots,
         zero_slots=zero,
+        jacobi_iters=1,
         vlm=types.SimpleNamespace(get_input_embeddings=lambda: emb),
     )
     return KaVaReasoningVLA._generation_slot_hook, stub, emb, slots
@@ -715,3 +718,89 @@ def test_gradient_shares_are_logged_verbatim_not_averaged() -> None:
     KaVaTrainer.log(tr, {})
     assert captured["ce_loss"] == 2.0            # summed value IS averaged
     assert captured["gradshare_kv"] == 0.21      # ratio is NOT
+
+
+def test_cached_and_uncached_samples_expose_the_same_keys() -> None:
+    """A mixed batch must not raise — this crashed a 3-GPU run at bs=2.
+
+    `basic_collation_fn` stacks by key across the batch, so a row whose key set differs
+    from its batch-mates raises KeyError. At bs=1 every batch holds one row and nothing
+    can mismatch, so the bug was invisible through four single-GPU runs and surfaced
+    only when the batch grew.
+    """
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds.attach_tfs_hidden = 8, True
+    ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = L, H, D
+    ds._teacher_hidden = 4096
+
+    uncached = ds._attach_empty_kv({"clip_id": "a"})
+    cached = {
+        "clip_id": "b",
+        "teacher_kv_k": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "teacher_kv_v": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "teacher_kv_valid": torch.ones(8, dtype=torch.bool),
+        "teacher_tfs_hidden": torch.zeros(4096),
+    }
+    assert set(uncached) == set(cached), (
+        f"key sets differ -> KeyError at bs>=2. "
+        f"only-uncached={set(uncached)-set(cached)} only-cached={set(cached)-set(uncached)}"
+    )
+    # and the shared collation path must actually stack them
+    for k in cached:
+        if isinstance(cached[k], torch.Tensor):
+            torch.stack([uncached[k], cached[k]])
+
+
+def test_empty_kv_attaches_tfs_hidden_only_when_requested() -> None:
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads = 8, L, H
+    ds._head_dim, ds._teacher_hidden = D, 4096
+    ds.attach_tfs_hidden = False
+    assert "teacher_tfs_hidden" not in ds._attach_empty_kv({})
+    ds.attach_tfs_hidden = True
+    out = ds._attach_empty_kv({})
+    assert out["teacher_tfs_hidden"].shape == (4096,)
+
+
+def test_generation_hook_refuses_raw_slots_at_T_above_1() -> None:
+    """A T>1 checkpoint must never be fed the un-refined slot_embeddings.
+
+    Training injects `_run_jacobi(...)`; generation used to inject the raw parameter,
+    which is the iteration's STARTING point. Measured rel-L2 between them is ~1.56, and
+    the mismatch scored min_ade 17.56 against a 4.09 baseline — with the zeroed ablation
+    *better* at 7.94, because zeros are uninformative rather than actively wrong. This
+    now raises instead.
+    """
+    hook, stub, emb, slots = _hook_stub()
+    stub.jacobi_iters = 2
+    try:
+        with hook(stub, torch.tensor([[3, 4]])):
+            pass
+    except RuntimeError as ex:
+        assert "refined" in str(ex).lower()
+        return
+    raise AssertionError("expected RuntimeError when T>1 and no refined slots supplied")
+
+
+def test_generation_hook_uses_refined_slots_when_given() -> None:
+    hook, stub, emb, slots = _hook_stub()
+    stub.jacobi_iters = 2
+    refined = torch.full((1, 2, 4), 9.0)  # [B, K, H], clearly distinct from `slots`
+    with hook(stub, torch.tensor([[1, 2]]), refined_slots=refined):
+        out = emb(torch.zeros(1, 5, dtype=torch.long))
+    torch.testing.assert_close(out[0, 1], refined[0, 0])
+    torch.testing.assert_close(out[0, 2], refined[0, 1])
+    assert not torch.allclose(out[0, 1], slots[0]), "injected the raw parameter, not the refined one"
+
+
+def test_generation_hook_T1_still_uses_raw_slots() -> None:
+    """At T=1 the raw embeddings ARE what training injects — no refinement defined."""
+    hook, stub, emb, slots = _hook_stub()
+    stub.jacobi_iters = 1
+    with hook(stub, torch.tensor([[2, 3]])):
+        out = emb(torch.zeros(1, 5, dtype=torch.long))
+    torch.testing.assert_close(out[0, 2], slots[0])
