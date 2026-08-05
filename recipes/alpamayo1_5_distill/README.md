@@ -1100,10 +1100,52 @@ correct aggregate to the log but writes only rank 0's shard to the JSON. A 2-ran
 1000-clip eval left a 500-row file strided `0, 2, 4, …, 998`, which silently pairs
 against nothing. Run each eval arm as an independent single-rank job.
 
-**In flight:** a CE-only control at `T=2` and effective batch 48, differing from the
-KAVA `T=2` arm in exactly one variable (λ₂ 1.0 → 0.0). It decides whether the `T=2`
-slot dependence and the `ade` tail come from `L_KV` or merely from Jacobi refinement
-making the slots input-dependent. Until it lands, neither is attributed.
+### The λ₂ control settles the attribution
+
+A CE-only arm at `T=2` and effective batch 48, differing from the KAVA `T=2` arm in
+**exactly one variable** (λ₂ 1.0 → 0.0) — same warm start, data, schedule, Jacobi depth
+and slots. This is the only single-variable comparison in the study, and it resolves all
+three open questions.
+
+| arm | `min_ade` | `ade` mean / median | `corner` | clips `ade`>20 |
+|---|---|---|---|---|
+| baseline, no KD | 4.094 | 4.949 / 3.470 | 4.103 | 8 |
+| control, λ₂=0 | 4.319 | 4.838 / 3.297 | 4.321 | 3 |
+| control, slots zeroed | 4.254 | 4.663 / 3.191 | 4.269 | 0 |
+| KAVA, λ₂=1 | 4.165 | 9.570 / 4.144 | 4.079 | **48** |
+| KAVA, slots zeroed | 7.940 | 27.119 / 19.284 | 7.810 | 245 |
+
+1. **`L_KV` alone does the KV matching.** On identical data and schedule the control's
+   `kv_loss` *rises* 3.165 → 3.387 while KAVA's falls 3.129 → 0.591. CE does not
+   incidentally align the caches — it drifts the other way. The 5.3× match is the
+   objective's work.
+2. **`L_KV` alone makes the slots load-bearing.** Zeroing them costs KAVA −3.776 ± 0.589
+   `min_ade` (6.4σ); in the control it *helps* by +0.065 ± 0.027. Jacobi refinement by
+   itself leaves the slots decorative, so the `T=1`-vs-`T=2` difference reported above is
+   **not** Jacobi depth per se — it is `L_KV` having something to attach to once the
+   slots are re-read.
+3. **`L_KV` improves quality against the matched control**, −0.154 ± 0.039 `min_ade`
+   (4.0σ) and −0.242 ± 0.044 `corner_distance` (5.5σ), recovering ~⅔ of the control's
+   own +0.225 continuation cost. The gain sits **beyond 5 s**: by horizon KAVA is
+   slightly worse at 0.5/1/3 s (+0.006/+0.020/+0.064) and better at 5 s (−0.037, n.s.),
+   yet better over the full horizon — consistent with a reasoning cache informing
+   long-term intent rather than near-term kinematics.
+4. **`L_KV` also caused the `ade` tail.** 48/500 clips above `ade` 20 versus **3** for
+   the control and 8 for the baseline — the control is *cleaner* than the baseline, so
+   the blowup is not continuation damage. It is a tail, not a shift: median `ade` differs
+   by only +0.074.
+
+**So `L_KV` works and hurts at the same time.** It is solely responsible for the cache
+match, for making the latent slots functional, and for a real long-horizon gain over a
+matched control — while inducing catastrophic failure on ~10% of clips. The open problem
+is no longer "does KAVA transfer here" but "keep the gain, kill the tail." Net against
+the no-KD baseline it remains slightly behind (+0.071, n.s.) only because the
+continuation cost exceeds the recovery.
+
+⚠️ **Compare against the control, not the baseline.** The baseline never saw these 799
+extra steps, so any arm trained on top of Stage-1 pays a +0.225 `min_ade` continuation
+cost before `L_KV` does anything. Reading KAVA against the baseline attributes that cost
+to the method.
 
 
 ## Scope & follow-ups
