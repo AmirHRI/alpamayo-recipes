@@ -192,20 +192,36 @@ class KaVaReasoningVLA(DistillReasoningVLA):
     def _build_jacobi_proj(self, hidden: int) -> nn.Module:
         """The PCCoT projection: slot output hidden -> next-iteration input embedding.
 
-        Normalise first.  Qwen3-VL hidden states reach magnitudes ~1350 ("massive
-        activations") while token embeddings sit at ~3.19e-2 RMS, so feeding hidden
-        states straight back in — Coconut-style, i.e. an identity init — starts the
-        refinement four orders of magnitude off-manifold.  The RMSNorm removes the
-        scale entirely and the linear is initialised so its output RMS matches the
-        model's *measured* embedding RMS, rather than a guessed constant.
+        Architecture is the reference implementation's
+        (``github.com/whyNLP/PCCoT``, ``PCCoTLlamaForCausalLM.__init__``)::
+
+            Linear -> GELU -> Linear -> LayerNorm
+
+        Nonlinear, and normalised at the **output** rather than the input.  An earlier
+        version here was ``RMSNorm -> Linear``: normalising first fixes the scale but
+        leaves only a linear map, so the projection cannot reshape the hidden state on
+        its way to becoming an embedding.
+
+        ⚠️ One deliberate deviation, and it is measured rather than assumed.  PCCoT
+        leaves the LayerNorm gain at its default 1.0, which puts the output at RMS ~1.
+        Qwen3-VL token embeddings sit at ~3.19e-2 RMS, so their default would start the
+        latents ~31x off the embedding manifold — the same failure the old RMSNorm-first
+        design existed to avoid, and on Llama (their model) the gap is far smaller.  The
+        gain is therefore initialised to the *measured* embedding RMS, which keeps their
+        architecture and their norm placement while removing the scale mismatch.  It is
+        learnable, so training can move it.
         """
         emb_weight = self.vlm.get_input_embeddings().weight
         target_rms = float(emb_weight.detach().float().pow(2).mean().sqrt())
         proj = nn.Sequential(
-            nn.RMSNorm(hidden, eps=1e-6),
-            nn.Linear(hidden, hidden, bias=False),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
         )
-        nn.init.normal_(proj[1].weight, std=target_rms / (hidden**0.5))
+        # LayerNorm output is gamma * unit-variance + beta, so RMS ~= |gamma|.
+        nn.init.constant_(proj[3].weight, target_rms)
+        nn.init.zeros_(proj[3].bias)
         return proj
 
     def _init_slot_values(self, slot_init: str, cot_text: str | None, std: float) -> None:
@@ -467,12 +483,42 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         "generate the whole student sequence with Jacobi iterations and *then*
         distil".
 
-        Two documented deviations:
+        Aligned with the reference implementation (``github.com/whyNLP/PCCoT``,
+        ``PCCoTLlamaForCausalLM.forward``) on three points that used to differ:
 
-        * the prefix cache is built under ``no_grad``, so during refinement the
-          gradient reaches the slots but not the backbone through the prefix.  The
-          backbone still gets full gradient from the final forward.  This keeps the
-          cost at one extra prefill instead of ``T`` differentiable ones.
+        1. **The feedback is SHIFTED.**  Refinement among the slots is causal —
+           measured, exactly lower-triangular, see
+           ``scripts/validate_jacobi_causality.py`` — so the output at slot ``i`` is
+           the model's prediction *for* slot ``i+1``.  PCCoT routes it there and holds
+           slot 0's input fixed::
+
+               in_0    <- unchanged forever
+               in_i+1  <- proj(out_i)          # and out_{K-1} is discarded
+
+           Feeding ``out_i`` back into ``in_i`` instead (what this did before) hands
+           every slot the embedding meant for its successor, and converges to a
+           self-consistency fixed point rather than the autoregressive-consistent one
+           that Jacobi iteration exists to reach.
+        2. **The initial latents come from the prefix**, not from a free parameter.
+           One forward over ``[0, start + K)`` — whose slot columns still hold the
+           ``'.'`` placeholders — supplies hidden states at ``[start-1, start+K-1)``,
+           i.e. the same AR shift.  ``slot_embeddings`` is kept as an additive learned
+           offset (see below).
+        3. **The prefix is differentiable.**  It used to be built under ``no_grad``,
+           which left the backbone unable to learn a prefix cache that makes refinement
+           work.  (It always did get gradient *through the refinement passes
+           themselves* — those were never detached.)  Costs ``T`` differentiable
+           prefills instead of one; see the memory note in ``slurm_train_kava.sh``.
+
+        Two deviations that remain, both deliberate:
+
+        * ``slot_embeddings`` is added to the derived initial latents rather than
+          replaced by them.  PCCoT has no such parameter, but dropping it here would
+          leave it with **no gradient at all** at ``T>1`` — the exact
+          unused-parameter asymmetry that deadlocked two-rank training in the
+          ``L_KV`` mask path (see ``kv_matching_loss``).  It also gives each slot an
+          identity of its own, which matters more once the input to slot ``i`` is
+          derived from slot ``i-1``'s output.
         * refinement needs one crop point for the whole batch, so slot columns must
           be uniform across the batch.  They are, for every LCDrive config: batches
           are right-aligned by left padding and the span after
@@ -506,15 +552,32 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         slot_positions = position_ids[:, :, start : start + n_slots]
         cache_position = torch.arange(start, start + n_slots, device=input_ids.device)
 
-        with torch.no_grad():
-            prefix_kwargs = {k: v for k, v in tokenized_data.items() if k != "attention_mask"}
-            prefix = self.vlm(
-                input_ids=input_ids[:, :start],
-                attention_mask=None if attention_mask is None else attention_mask[:, :start],
-                use_cache=True,
-                **prefix_kwargs,
+        if start < 1:
+            raise ValueError(
+                f"slots start at column {start}; PCCoT's initial latents are seeded from "
+                "position start-1, so at least one real token must precede them"
             )
+
+        # Differentiable, and run over the prefix PLUS the K placeholder columns, so the
+        # same pass yields both the cache to refine against and PCCoT's initial latents.
+        #
+        # `self.vlm.model`, not `self.vlm`: the base model returns `last_hidden_state`
+        # directly and skips the LM head. Now that this pass carries gradient, running the
+        # head would retain logits over a 155,697 vocab for the whole prefix — ~1.9 GB at
+        # 3k tokens in fp32 — for a tensor nothing here reads.
+        prefix_kwargs = {k: v for k, v in tokenized_data.items() if k != "attention_mask"}
+        upto = start + n_slots
+        prefix = self.vlm.model(
+            input_ids=input_ids[:, :upto],
+            attention_mask=None if attention_mask is None else attention_mask[:, :upto],
+            use_cache=True,
+            **prefix_kwargs,
+        )
         cache = prefix.past_key_values
+        # AR shift: the hidden at position p is the prediction for p+1, so slot i is
+        # seeded from position start+i-1.
+        init_hidden = prefix.last_hidden_state[:, start - 1 : upto - 1]
+        cache.crop(start)  # refinement must attend to the prefix only, never the slots
 
         if attention_mask is None:
             refine_mask = None
@@ -522,7 +585,8 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             ones = attention_mask.new_ones((attention_mask.shape[0], n_slots))
             refine_mask = torch.cat([attention_mask[:, :start], ones], dim=1)
 
-        current = slots.unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+        # PCCoT's init, plus slot_embeddings as a learned per-slot offset (see docstring).
+        current = self.jacobi_proj(init_hidden) + slots.unsqueeze(0)
         text_model = self._text_model()
         for _ in range(self.jacobi_iters - 1):
             out = text_model(
@@ -534,7 +598,12 @@ class KaVaReasoningVLA(DistillReasoningVLA):
                 cache_position=cache_position,
             )
             cache.crop(start)  # roll the cache back so the next iteration re-reads the prefix
-            current = self.jacobi_proj(out.last_hidden_state)
+            # SHIFTED feedback: slot 0's input is never updated, slot i+1 takes slot i's
+            # output, and out_{K-1} is dropped (it predicts the first post-slot token, not
+            # a latent). Matches PCCoT; see the docstring for why the unshifted form is
+            # wrong under a causal mask.
+            projected = self.jacobi_proj(out.last_hidden_state)
+            current = torch.cat([current[:, :1], projected[:, :-1]], dim=1)
         return current
 
     # ------------------------------------------------------------------- loss

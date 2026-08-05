@@ -807,6 +807,118 @@ def test_empty_kv_attaches_tfs_hidden_only_when_requested() -> None:
     assert out["teacher_tfs_hidden"].shape == (4096,)
 
 
+def _jacobi_stub(num_slots=4, hidden=3, prefix=6, iters=2):
+    """Duck-typed stand-in for _run_jacobi.
+
+    The fake text stack returns a hidden state whose row ``i`` is the constant
+    ``(i + 1) * 100``, so the identity of the slot that produced each output survives
+    the shift and can be asserted on exactly.
+    """
+    import types
+
+    from alpamayo1_5_distill.models.kava_model import KaVaReasoningVLA
+
+    seq = prefix + num_slots
+
+    class Cache:
+        def __init__(self):
+            self.cropped_to = []
+
+        def crop(self, n):
+            self.cropped_to.append(n)
+
+    cache = Cache()
+
+    def base_model(input_ids=None, attention_mask=None, use_cache=None, **kw):
+        # last_hidden_state row p = (p + 1) * 1000, so the AR shift (slot i seeded from
+        # position start+i-1) is visible in the returned values.
+        n = input_ids.shape[1]
+        h = (torch.arange(1.0, n + 1) * 1000).view(1, n, 1).expand(1, n, hidden)
+        return types.SimpleNamespace(last_hidden_state=h.clone(), past_key_values=cache)
+
+    base_model.get_rope_index = lambda ids, thw, x, mask: (
+        torch.arange(ids.shape[1]).view(1, 1, -1).expand(3, 1, ids.shape[1]).clone(),
+        None,
+    )
+
+    def text_model(inputs_embeds=None, **kw):
+        k = inputs_embeds.shape[1]
+        h = (torch.arange(1.0, k + 1) * 100).view(1, k, 1).expand(1, k, hidden)
+        return types.SimpleNamespace(last_hidden_state=h.clone())
+
+    stub = types.SimpleNamespace(
+        num_slots=num_slots,
+        jacobi_iters=iters,
+        jacobi_proj=lambda x: x,  # identity, so the shift is not masked by a transform
+        vlm=types.SimpleNamespace(model=base_model),
+        _text_model=lambda: text_model,
+    )
+    slot_pos = torch.arange(prefix, prefix + num_slots).view(1, -1)
+    ids = torch.randint(5, 40, (1, seq))
+    return KaVaReasoningVLA._run_jacobi, stub, ids, slot_pos, cache
+
+
+def test_jacobi_initialises_latents_from_the_prefix_with_the_ar_shift() -> None:
+    """PCCoT seeds slot i from position start+i-1, not from a free parameter.
+
+    Regression guard: this used to start from `slot_embeddings` alone, so the initial
+    latents carried no information about the input at all.
+    """
+    run, stub, ids, slot_pos, cache = _jacobi_stub(num_slots=4, prefix=6, iters=1)
+    zeros = torch.zeros(4, 3)
+    out = run(stub, ids, {"attention_mask": torch.ones(1, 10, dtype=torch.long)}, slot_pos, zeros)
+    # iters=1 => no refinement loop, so this is purely the initialisation.
+    # start=6, so slot i is seeded from base_model position 6+i-1 => value (6+i)*1000.
+    assert torch.allclose(out[0, :, 0], torch.tensor([6000.0, 7000.0, 8000.0, 9000.0])), out
+    assert cache.cropped_to == [6], "the cache must be cropped to the slot start"
+
+
+def test_jacobi_feedback_is_shifted_and_slot_zero_is_frozen() -> None:
+    """PCCoT: in_0 stays fixed, in_{i+1} <- out_i, and out_{K-1} is discarded.
+
+    The unshifted form (in_i <- out_i) hands every slot the embedding meant for its
+    successor: under a causal mask the output at position i is the prediction FOR i+1.
+    Measured lower-triangularity is in scripts/validate_jacobi_causality.py.
+    """
+    run, stub, ids, slot_pos, _ = _jacobi_stub(num_slots=4, prefix=6, iters=2)
+    zeros = torch.zeros(4, 3)
+    out = run(stub, ids, {"attention_mask": torch.ones(1, 10, dtype=torch.long)}, slot_pos, zeros)
+    col = out[0, :, 0]
+    # slot 0 keeps its INITIAL value (position start-1 = 5 => 6000), never an output
+    assert col[0].item() == 6000.0, f"slot 0 was overwritten: {col}"
+    # slots 1..3 take outputs 0..2, which the fake stack reports as 100, 200, 300
+    assert torch.allclose(col[1:], torch.tensor([100.0, 200.0, 300.0])), col
+    # and out_3 (=400) must appear nowhere: it predicts the first post-slot token
+    assert 400.0 not in set(col.tolist())
+
+
+def test_jacobi_proj_is_nonlinear_and_starts_at_embedding_scale() -> None:
+    """PCCoT's Linear->GELU->Linear->LayerNorm, with the gain set to measured RMS.
+
+    Their default leaves LayerNorm gain at 1.0, i.e. output RMS ~1, while Qwen3-VL
+    embeddings sit at ~3.19e-2 — a ~31x off-manifold start. A purely linear projection
+    (the earlier RMSNorm->Linear form) cannot reshape the hidden state on the way to
+    becoming an embedding.
+    """
+    import types
+
+    from alpamayo1_5_distill.models.kava_model import KaVaReasoningVLA
+
+    hidden, target_rms = 64, 0.03
+    emb = torch.nn.Embedding(100, hidden)
+    torch.nn.init.normal_(emb.weight, std=target_rms)
+    stub = types.SimpleNamespace(vlm=types.SimpleNamespace(get_input_embeddings=lambda: emb))
+    proj = KaVaReasoningVLA._build_jacobi_proj(stub, hidden)
+
+    kinds = [type(m).__name__ for m in proj]
+    assert kinds == ["Linear", "GELU", "Linear", "LayerNorm"], kinds
+    measured = float(emb.weight.detach().pow(2).mean().sqrt())
+    assert abs(float(proj[3].weight[0]) - measured) < 1e-6, "LayerNorm gain != measured RMS"
+    # A hidden state at Qwen3-VL's real magnitude must come out near embedding scale.
+    out = proj(torch.randn(2, 8, hidden) * 1350.0)
+    assert 0.2 < float(out.pow(2).mean().sqrt()) / measured < 5.0, float(out.pow(2).mean().sqrt())
+
+
 def test_generation_hook_refuses_raw_slots_at_T_above_1() -> None:
     """A T>1 checkpoint must never be fed the un-refined slot_embeddings.
 
