@@ -247,6 +247,69 @@ def test_fully_masked_kv_loss_stays_attached_to_the_graph() -> None:
     assert all(p.grad is not None for k, v in student.values() for p in (k, v))
 
 
+def test_mlp_align_is_identity_at_init_and_nonlinear() -> None:
+    """`mlp` must start at exactly the `direct` objective, or it is not an ablation.
+
+    The residual branch's second layer is zero-initialised, so `x + W2(GELU(W1 x))` is
+    the identity at init — same trick as `eye_` for the linear projector, and what makes
+    direct / projector / mlp comparable at step 0.
+    """
+    b, h, m, d, n = 2, H, 5, D, 4
+    kv = torch.randn(b, h, m, d)
+    bank = KVProjectorBank(n, kv_width=h * d, align="mlp")
+    out = bank(kv, 0, "k")
+    assert out.shape == kv.shape
+    assert torch.allclose(out, kv, atol=1e-6), "mlp align is not identity at init"
+
+    # ... and once the residual branch is non-zero it is genuinely nonlinear, i.e. not
+    # reproducible by any single matrix: f(2x) != 2 f(x).
+    for p in bank.k_proj[0].fc2.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    f_x, f_2x = bank(kv, 0, "k"), bank(2 * kv, 0, "k")
+    assert not torch.allclose(f_2x, 2 * f_x, atol=1e-3), "mlp collapsed to a linear map"
+
+
+def test_mlp_align_gives_every_parameter_a_grad_on_the_first_step() -> None:
+    """Zero-init W2 makes W1's gradient exactly zero at step 1 — but it must EXIST.
+
+    This is the distinction that deadlocked two-rank training once already (see
+    kv_matching_loss's denom==0 branch): a parameter whose .grad is a zero tensor is
+    reduced normally, one whose .grad is None is not, and under ZeRO-2 that asymmetry
+    desyncs the collective sequence. A zero-init residual is exactly the shape that
+    could trip it, so pin it.
+    """
+    b, m, n = 1, 4, 3
+    teacher_k = torch.randn(b, L, H, m, D)
+    teacher_v = torch.randn(b, L, H, m, D)
+    mapping = build_layer_map(n, L)
+    student = {
+        i: (torch.randn(b, H, m, D, requires_grad=True), torch.randn(b, H, m, D, requires_grad=True))
+        for i in range(n)
+    }
+    bank = KVProjectorBank(n, kv_width=H * D, align="mlp")
+    kv_matching_loss(student, teacher_k, teacher_v, mapping, projector=bank, kind="l1").backward()
+
+    missing = [name for name, p in bank.named_parameters() if p.grad is None]
+    assert not missing, f".grad is None (not zero) for: {missing[:6]}"
+    # fc1 specifically: gradient present, and zero at step 1 because W2 is still zero.
+    fc1 = bank.k_proj[0].fc1.weight
+    assert fc1.grad is not None and float(fc1.grad.abs().sum()) == 0.0
+
+
+def test_kv_align_rejects_unknown_and_direct_stays_free() -> None:
+    """`direct` must allocate nothing — it is the no-shortcut arm of the ablation."""
+    assert sum(p.numel() for p in KVProjectorBank(4, kv_width=H * D, align="direct").parameters()) == 0
+    linear = sum(p.numel() for p in KVProjectorBank(4, kv_width=H * D, align="projector").parameters())
+    mlp = sum(p.numel() for p in KVProjectorBank(4, kv_width=H * D, align="mlp").parameters())
+    assert mlp > linear > 0, (linear, mlp)
+    try:
+        KVProjectorBank(4, kv_width=H * D, align="quadratic")
+    except ValueError as ex:
+        assert "kv_align" in str(ex)
+        return
+    raise AssertionError("expected ValueError for an unknown kv_align")
+
+
 def test_kv_loss_scale_is_independent_of_m_and_depth() -> None:
     """One kv_loss_weight has to transfer across the M / layer-map sweep."""
     torch.manual_seed(0)

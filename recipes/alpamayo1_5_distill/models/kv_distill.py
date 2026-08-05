@@ -52,6 +52,8 @@ import torch.nn.functional as F
 
 EvictionMethod = Literal["rkv", "cosine", "attn", "crop"]
 KVLossType = Literal["l1", "mse", "smooth_l1"]
+#: Cross-model K/V alignment, in increasing capacity — see :class:`KVProjectorBank`.
+KVAlignType = Literal["direct", "projector", "mlp"]
 
 
 # --------------------------------------------------------------------- scoring
@@ -240,33 +242,89 @@ def build_layer_map(
 
 
 # -------------------------------------------------------------------- projector
+class _KVAlignMLP(nn.Module):
+    """``x + W2(GELU(W1 x))`` — a nonlinear change of basis that starts at identity.
+
+    A single ``Linear`` can only apply one global linear map per layer.  Teacher and
+    student were trained separately, so there is no reason their ``W_k``/``W_v`` bases
+    are related by a *linear* transform at all — and eviction has already mixed tokens
+    from different positions, so the map that is actually needed may be input-dependent.
+
+    Residual with a **zero-initialised** second layer, so the block is exactly the
+    identity at init.  That is what keeps ``direct`` / ``projector`` / ``mlp`` a clean
+    ablation ladder: all three start at the same objective value and differ only in how
+    far they can move away from it.
+    """
+
+    def __init__(self, width: int, hidden: int | None = None) -> None:
+        super().__init__()
+        hidden = int(hidden or width)
+        self.fc1 = nn.Linear(width, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, width)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.fc2(self.act(self.fc1(x)))
+
+
 class KVProjectorBank(nn.Module):
     """Per-layer ``1024 -> 1024`` maps carrying the student's K/V into teacher space.
 
     KAVA is self-distillation, so its K/V live in one basis.  Here teacher and
     student are separately trained checkpoints: per-layer geometry agrees exactly
     (``8 kv-heads x 128 = 1024`` on both sides) but the learned ``W_k``/``W_v``
-    bases need not.  ``align="projector"`` learns that change of basis;
-    ``align="direct"`` asserts there is nothing to learn and costs no parameters.
+    bases need not.  Three settings, in increasing capacity:
 
-    The projectors are **identity-initialised**, so training starts at exactly the
-    ``direct`` objective and can only move away from it if that helps — which makes
-    the two settings a clean ablation pair rather than two unrelated runs.  They
-    are discarded at inference; nothing outside the loss reads them.
+    ============  ======  ==================================================
+    ``align``     params  map
+    ============  ======  ==================================================
+    ``direct``     0      identity; asserts there is nothing to learn
+    ``projector``  58.7M  one ``Linear`` per layer per K/V (linear basis change)
+    ``mlp``       117.5M  ``x + W2(GELU(W1 x))`` per layer per K/V (nonlinear)
+    ============  ======  ==================================================
+
+    All three are **identity at init** — ``projector`` via ``eye_``, ``mlp`` via a
+    zero-initialised residual branch — so training starts at exactly the ``direct``
+    objective and can only move away if that helps.  That makes them an ablation
+    ladder rather than three unrelated runs.  All are discarded at inference; nothing
+    outside the loss reads them.
+
+    ⚠️ **More capacity here is not automatically better, and may be actively worse.**
+    The action expert consumes the student's *unprojected* cache — these maps exist
+    only inside ``L_KV``.  So a projector with enough capacity can satisfy the loss by
+    absorbing the mismatch itself, leaving the tensor the expert actually reads no
+    closer to the teacher, and the loss curve cannot distinguish the two outcomes.
+    Measured on the 10B->2B LCDrive runs: with ``projector``, ``kv_loss`` floors at
+    ~0.60 by epoch 0.30 and does not move for the remaining 70% of training, nor when
+    Jacobi depth doubles — consistent with the shortcut.  ``mlp`` raises the ceiling
+    on what can be *expressed*; it also raises the ceiling on what can be absorbed.
+    Run it against ``direct`` (the opposite extreme, zero params, no shortcut possible)
+    rather than against ``projector`` alone.
     """
 
     def __init__(
         self,
         n_student_layers: int,
         kv_width: int = 1024,
-        align: Literal["direct", "projector"] = "projector",
+        align: KVAlignType = "projector",
+        mlp_hidden: int | None = None,
     ) -> None:
         super().__init__()
-        if align not in ("direct", "projector"):
+        if align not in ("direct", "projector", "mlp"):
             raise ValueError(f"unknown kv_align {align!r}")
         self.align = align
         self.kv_width = int(kv_width)
         if align == "direct":
+            return
+        if align == "mlp":
+            self.k_proj = nn.ModuleList(
+                [_KVAlignMLP(kv_width, mlp_hidden) for _ in range(n_student_layers)]
+            )
+            self.v_proj = nn.ModuleList(
+                [_KVAlignMLP(kv_width, mlp_hidden) for _ in range(n_student_layers)]
+            )
             return
         self.k_proj = nn.ModuleList(
             [nn.Linear(kv_width, kv_width, bias=False) for _ in range(n_student_layers)]
@@ -289,7 +347,8 @@ class KVProjectorBank(nn.Module):
         proj = (self.k_proj if which == "k" else self.v_proj)[layer]
         b, h, m, d = kv.shape
         flat = kv.permute(0, 2, 1, 3).reshape(b, m, h * d)
-        out = proj(flat.to(proj.weight.dtype))
+        # next(parameters()), not proj.weight: `mlp` is a module with no single weight.
+        out = proj(flat.to(next(proj.parameters()).dtype))
         return out.view(b, m, h, d).permute(0, 2, 1, 3)
 
 
