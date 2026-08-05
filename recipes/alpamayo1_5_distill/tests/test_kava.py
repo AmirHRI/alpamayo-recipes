@@ -206,6 +206,47 @@ def test_kv_loss_ignores_masked_slots() -> None:
     assert kv_matching_loss(student, teacher_k, teacher_v, mapping).item() > 0.0
 
 
+def test_fully_masked_kv_loss_stays_attached_to_the_graph() -> None:
+    """A fully-masked micro-batch must still deliver gradient to every KV parameter.
+
+    Regression test for a two-rank NCCL deadlock. When `allow_missing=true` hands over a
+    clip with no cached teacher CoT, every slot is masked and the loss is 0.0. Returning
+    a *detached* zero there is value-correct and therefore invisible to an assertion on
+    `.item()` — but it silently drops `kv_projector` out of the backward pass, so under
+    ZeRO-2 the two ranks reduce different parameter sets, their collective sequences
+    shift by one, and the next size-mismatched pair hangs until the 600 s watchdog fires.
+
+    Only reachable at per_device_train_batch_size=1: at bs>=2 the cache-less clip shares
+    the micro-batch with a valid one and the mask is never entirely empty.
+    """
+    b, m, n_student = 1, 6, 4
+    teacher_k = torch.zeros(b, L, H, m, D)
+    teacher_v = torch.zeros(b, L, H, m, D)
+    mapping = build_layer_map(n_student, L)
+    student = {
+        i: (
+            torch.randn(b, H, m, D, requires_grad=True),
+            torch.randn(b, H, m, D, requires_grad=True),
+        )
+        for i in range(n_student)
+    }
+    bank = KVProjectorBank(n_student, H * D)
+    valid = torch.zeros(b, m, dtype=torch.bool)  # nothing valid at all
+
+    loss = kv_matching_loss(
+        student, teacher_k, teacher_v, mapping, valid_mask=valid, projector=bank
+    )
+    assert loss.item() == 0.0, "the value must still be zero"
+    assert loss.requires_grad, "a detached zero here deadlocks 2-rank training"
+
+    loss.backward()
+    # Every projector parameter must have a .grad — all zeros, but PRESENT, so that
+    # DeepSpeed reduces the same parameter set on every rank.
+    missing = [n for n, p in bank.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no gradient reached: {missing[:4]}"
+    assert all(p.grad is not None for k, v in student.values() for p in (k, v))
+
+
 def test_kv_loss_scale_is_independent_of_m_and_depth() -> None:
     """One kv_loss_weight has to transfer across the M / layer-map sweep."""
     torch.manual_seed(0)

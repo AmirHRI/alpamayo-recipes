@@ -338,7 +338,9 @@ def kv_matching_loss(
             activations"), so without it the largest layers dominate the gradient.
 
     Returns:
-        Scalar loss; a gradient-free zero if nothing valid is left.
+        Scalar loss.  If every slot is masked the value is 0.0 but the tensor stays
+        **attached to the graph** — see the ``denom == 0`` branch, where a detached zero
+        deadlocks multi-rank training at ``per_device_train_batch_size=1``.
     """
     weight = None
     if valid_mask is not None:
@@ -378,7 +380,27 @@ def kv_matching_loss(
             total = total + k_err.sum() + v_err.sum()
             denom += 2.0 * k_err.numel()
 
-    if not torch.is_tensor(total) or denom == 0:
+    if not torch.is_tensor(total):
+        # No student layers were captured at all, so there is no graph to stay attached
+        # to. Symmetric across ranks (it depends on the model, not the batch), so the
+        # detached zero below is safe here in a way it is NOT in the denom==0 case.
         ref = next(iter(student_kv.values()))[0] if student_kv else teacher_k
         return torch.zeros((), device=ref.device, dtype=torch.float32)
+    if denom == 0:
+        # Every slot in this micro-batch is masked — a clip with no cached teacher CoT,
+        # which `allow_missing=true` deliberately admits (4 of 38,340 LCDrive clips).
+        #
+        # ⚠️ MUST return the graph-connected `total`, not a fresh zero. `total` is already
+        # exactly 0.0 here (w is a 0/1 mask that sums to 0), so the VALUE is identical —
+        # what differs is that `total` still carries the graph. Returning a detached zero
+        # gives `kv_projector` and the KV path no gradient ON THIS RANK ONLY; under ZeRO-2
+        # the ranks then reduce different parameter sets, their NCCL sequences shift by
+        # one, and the next size-mismatched pair deadlocks. Observed twice, deterministic
+        # at the same step, as rank0 ALLREDUCE(numel=54548736) against rank1
+        # ALLREDUCE(numel=1), each timing out after 600 s.
+        #
+        # Only reachable at per_device_train_batch_size=1: at bs>=2 a cache-less clip is
+        # batched with a valid one, so the mask is never entirely empty. That is why every
+        # earlier multi-GPU run (all bs=2) was fine and the first bs=1 2-rank run hung.
+        return total
     return total / denom
