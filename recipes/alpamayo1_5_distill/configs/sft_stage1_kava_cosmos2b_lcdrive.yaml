@@ -71,6 +71,9 @@ data:
     kv_tier: compressed_M8_rkv0.1
     num_slots: 8
     attach_tfs_hidden: true
+    # Must be true whenever model.latent_all_layers is. Needs a cache built with
+    # tfs_hidden_all; an older cache raises rather than falling back silently.
+    attach_tfs_hidden_all: false
     # 4 of 38,340 LCDrive clips have no cache entry (the teacher hit max_new_tokens
     # without emitting <traj_future_start>, so there was no handoff to record). They
     # get an all-masked target and train on CE alone; without this the run dies on

@@ -104,6 +104,9 @@ class KaVaReasoningVLA(DistillReasoningVLA):
     kv_loss_type: str = "smooth_l1"
     kv_layerwise_std: bool = False
     kv_align: str = "projector"
+    latent_all_layers: bool = False
+    latent_layer_map: list[int] | None = None
+    latent_div_std: bool = True
     kv_layer_map: list[int] | None = None
 
     #: When True, ``forward`` also stashes the loss terms **with their graph attached**
@@ -130,6 +133,9 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         kv_loss_type: str = "smooth_l1",
         kv_layerwise_std: bool = False,
         kv_align: str = "projector",
+        latent_all_layers: bool = False,
+        latent_layer_map: list[int] | None = None,
+        latent_div_std: bool = True,
         kv_layer_map: list[int] | None = None,
         slot_init: str = "vocab",
         slot_init_cot_text: str | None = None,
@@ -169,6 +175,11 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         self.kv_loss_type = str(kv_loss_type)
         self.kv_layerwise_std = bool(kv_layerwise_std)
         self.kv_align = str(kv_align)
+        self.latent_all_layers = bool(latent_all_layers)
+        self.latent_layer_map = (
+            None if latent_layer_map is None else [int(x) for x in latent_layer_map]
+        )
+        self.latent_div_std = bool(latent_div_std)
 
         n_student = self._n_student_layers()
         self.kv_layer_map = build_layer_map(n_student, int(teacher_layers), kv_layer_map)
@@ -607,6 +618,66 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         return current
 
     # ------------------------------------------------------------------- loss
+    def _latent_loss_all_layers(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: tuple[torch.Tensor, ...],
+        teacher_all: torch.Tensor,
+    ) -> torch.Tensor:
+        """CoDI's objective: match the handoff column at EVERY layer, then average.
+
+        The reference (``github.com/zhenyi4/codi``, ``src/model.py``) does::
+
+            for out, ref_out in zip(outputs.hidden_states, ref_outputs.hidden_states):
+                out_sel = out.gather(1, model_answer_position...)
+                ref_sel = ref_out.gather(1, ref_answer_position...)
+                distill_loss += loss_fct(out_sel, ref_sel.detach()) / ref_sel.std()
+            distill_loss /= len(outputs.hidden_states)
+
+        Ours matched **one** layer, ``hidden_states[-1]``.  That target converged
+        59.7 -> 0.15 and sat at ~3% of CE's gradient, which is what a too-easy
+        objective looks like: a single 4096-d vector is nearly solvable by the
+        8.4 M-parameter projector alone, without the backbone moving.  All layers is a
+        strictly harder, better-conditioned target.
+
+        Two things differ from CoDI by necessity, both because they self-distil and we
+        do not:
+
+        * **A width projector is required** (student 2048 -> teacher 4096) where they
+          need none.  It is the *same shared* ``latent_proj`` at every layer rather than
+          one per layer: per-layer would be 29 x 8.4 M = 243 M throwaway parameters, and
+          CoDI has no per-layer parameters at all.  Per-layer scale differences are
+          handled by the std normalisation instead, which is cheaper and is what CoDI
+          itself uses.
+        * **Depth differs** (29 student tensors vs 37 teacher), so the same uniform
+          stride as ``L_KV`` maps them, endpoints preserved -- embedding->embedding and
+          final->final.
+
+        ``div_std`` matters more here than it does for them: Qwen3-VL hidden magnitudes
+        span orders of magnitude across depth ("massive activations"), so without it the
+        largest layers own the average.
+        """
+        layer_map = self._codi_layer_map(len(hidden_states), int(teacher_all.shape[1]))
+        teacher_all = teacher_all.to(hidden_states[-1].device).float()
+        total = hidden_states[-1].new_zeros((), dtype=torch.float32)
+        for s_idx, t_idx in enumerate(layer_map):
+            h_s = self.latent_proj(self._gather_tfs_hidden(input_ids, hidden_states[s_idx]))
+            h_t = teacher_all[:, t_idx].detach()
+            term = self._latent_loss(h_s, h_t)
+            if self.latent_div_std:
+                term = term / h_t.std().clamp_min(1e-6)
+            total = total + term
+        return total / len(layer_map)
+
+    def _codi_layer_map(self, n_student: int, n_teacher: int) -> list[int]:
+        """Cached student->teacher map over hidden-state tensors (L+1 of them)."""
+        cached = getattr(self, "_codi_map_cache", None)
+        if cached is not None and cached[0] == (n_student, n_teacher):
+            return cached[1]
+        mapping = build_layer_map(n_student, n_teacher, self.latent_layer_map)
+        self._codi_map_cache = ((n_student, n_teacher), mapping)
+        return mapping
+
     def _kv_loss(
         self,
         teacher_kv_k: torch.Tensor,
@@ -762,6 +833,10 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         ego_future_rot: torch.Tensor | None = None,
         labels_mask: torch.Tensor | None = None,
         teacher_tfs_hidden: torch.Tensor | None = None,
+        # Explicit, never **kwargs: a config field swallowed into kwargs is how the
+        # zero_slots ablation silently became a no-op for a whole run (500/500 clips
+        # bit-identical). A missing all-layer target must reach the raise below.
+        teacher_tfs_hidden_all: torch.Tensor | None = None,
         slot_pos: torch.Tensor | None = None,
         teacher_kv_k: torch.Tensor | None = None,
         teacher_kv_v: torch.Tensor | None = None,
@@ -840,10 +915,22 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         total_loss = ce_loss
         attached: dict[str, torch.Tensor] = {"ce": ce_loss}
 
-        # lambda_1: the endpoint hidden match (KAVA's L_CODI analogue).
+        # lambda_1: the CoDI hidden match, at one layer or all of them.
         latent_loss = None
         latent_proj = getattr(self, "latent_proj", None)
-        if teacher_tfs_hidden is not None and latent_proj is not None:
+        if self.latent_all_layers and latent_proj is not None:
+            if teacher_tfs_hidden_all is None:
+                raise ValueError(
+                    "latent_all_layers=true but the batch has no `teacher_tfs_hidden_all`. "
+                    "Set data.train_dataset.attach_tfs_hidden_all=true and use a cache "
+                    "built with the all-layer target."
+                )
+            latent_loss = self._latent_loss_all_layers(
+                input_ids, outputs.hidden_states, teacher_tfs_hidden_all
+            )
+            total_loss = total_loss + self.latent_loss_weight * latent_loss
+            attached["latent"] = latent_loss
+        elif teacher_tfs_hidden is not None and latent_proj is not None:
             h_student = latent_proj(self._gather_tfs_hidden(input_ids, outputs.hidden_states[-1]))
             latent_loss = self._latent_loss(h_student, teacher_tfs_hidden.to(h_student.device))
             total_loss = total_loss + self.latent_loss_weight * latent_loss

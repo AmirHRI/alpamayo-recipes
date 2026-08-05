@@ -21,6 +21,27 @@ teacher_hidden_dim: 4096
 # projector. KAVA sets lambda_1 = 0 on its hardest dataset for the same reason.
 # Set 0.01 to restore it (that value was calibrated to ~131% of CE at step 0).
 latent_loss_weight: 0.0
+# CoDI (github.com/zhenyi4/codi) distils the handoff column at EVERY layer and averages:
+#   for out, ref in zip(outputs.hidden_states, ref_outputs.hidden_states):
+#       loss += fct(out_sel, ref_sel.detach()) / ref_sel.std()
+#   loss /= len(outputs.hidden_states)
+# We matched ONE layer. That is almost certainly why the term looked useless: a single
+# 4096-d vector is nearly solvable by the 8.4M-parameter projector alone, so it hit 0.15
+# without the backbone moving. All 29 student tensors vs 37 teacher ones (index 0 = the
+# embedding output, which CoDI includes) is a much harder, better-conditioned target.
+#
+# ⚠️ Requires a cache rebuilt with `tfs_hidden_all` — scripts/generate_teacher_kv.py now
+# records it (+23.2 GB/tier, 0.61 MB/clip). With an older cache the dataset raises
+# rather than silently falling back to the single vector. Also set
+# data.train_dataset.attach_tfs_hidden_all=true.
+#
+# ⚠️ lambda_1 = 0.01 was calibrated for the SINGLE-vector term and will not transfer:
+# this averages 29 terms and divides each by the teacher's per-layer std. Recalibrate
+# against CE's gradient before trusting a run.
+latent_all_layers: false
+latent_layer_map: null    # null = uniform stride, endpoints preserved (embed->embed, final->final)
+latent_div_std: true      # CoDI's distill_loss_div_std; matters more here than for them,
+                          # since Qwen3-VL hidden magnitudes span orders of magnitude by depth
 latent_cosine_weight: 0.1
 
 kava:

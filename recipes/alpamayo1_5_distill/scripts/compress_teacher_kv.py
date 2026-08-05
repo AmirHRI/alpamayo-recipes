@@ -87,7 +87,9 @@ def main() -> None:
     # 'cosine' and 'crop' never read the importance score, so skip those pages
     # entirely — it is ~150 KiB per sample of pure I/O otherwise.
     needs_imp = eviction in ("rkv", "attn") and lam > 0.0
-    names = ("k_pre", "v", "red", "tfs_hidden") + (("imp",) if needs_imp else ())
+    names = ("k_pre", "v", "red", "tfs_hidden", "tfs_hidden_all") + (
+        ("imp",) if needs_imp else ()
+    )
 
     started = time.time()
     n_cot_index: dict[str, int] = {}
@@ -115,6 +117,7 @@ def main() -> None:
             sel_idx=sel_idx,
             n_valid=k_sel.shape[-2],
             tfs_hidden=entry.get("tfs_hidden"),
+            tfs_hidden_all=entry.get("tfs_hidden_all"),
             metadata=provenance,
         )
         n_cot_index[key] = n_cot

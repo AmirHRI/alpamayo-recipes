@@ -247,6 +247,61 @@ def test_fully_masked_kv_loss_stays_attached_to_the_graph() -> None:
     assert all(p.grad is not None for k, v in student.values() for p in (k, v))
 
 
+def test_all_layer_target_keeps_cached_and_uncached_key_sets_identical() -> None:
+    """`teacher_tfs_hidden_all` must obey the same parity contract as every other key.
+
+    basic_collation_fn stacks by key, so one row missing a key that its batch-mates have
+    raises KeyError at bs>=2 while being invisible at bs=1 — the exact way the
+    `teacher_tfs_hidden` addition broke a run before.
+    """
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads = 8, L, H
+    ds._head_dim, ds._teacher_hidden, ds._teacher_hidden_layers = D, 4096, 37
+    ds.attach_tfs_hidden, ds.attach_tfs_hidden_all = True, True
+
+    empty = ds._attach_empty_kv({})
+    assert empty["teacher_tfs_hidden_all"].shape == (37, 4096)
+    assert empty["teacher_tfs_hidden"].shape == (4096,)
+
+    # ... and off by default, so an existing cache/config is untouched.
+    ds.attach_tfs_hidden_all = False
+    assert "teacher_tfs_hidden_all" not in ds._attach_empty_kv({})
+
+
+def test_all_layer_target_missing_from_an_old_cache_raises() -> None:
+    """A cache predating the all-layer target must fail loudly, not fall back.
+
+    Silently substituting the single-vector target (or zeros) would train a different
+    objective than the config says, and the loss curve would look entirely normal.
+    """
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds.kv_tier, ds.kv_cache_root = 8, "compressed_M8_rkv0.1", "/nonexistent"
+    ds.attach_tfs_hidden, ds.attach_tfs_hidden_all, ds.allow_missing = True, True, False
+    ds._teacher_hidden, ds._teacher_hidden_layers = 4096, 37
+
+    entry = {  # an old-format entry: k_pre/v/tfs_hidden present, tfs_hidden_all absent
+        "k_pre": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "v": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "tfs_hidden": torch.zeros(4096),
+    }
+    import alpamayo1_5_distill.data.kava_dataset as mod
+
+    real = mod.kv_cache_io.load_entry
+    mod.kv_cache_io.load_entry = lambda *a, **k: entry
+    try:
+        ds._attach_teacher_kv({}, "someclip::123")
+    except KeyError as ex:
+        assert "tfs_hidden_all" in str(ex) and "rebuild" in str(ex)
+        return
+    finally:
+        mod.kv_cache_io.load_entry = real
+    raise AssertionError("expected a KeyError naming tfs_hidden_all")
+
+
 def test_mlp_align_is_identity_at_init_and_nonlinear() -> None:
     """`mlp` must start at exactly the `direct` objective, or it is not an ablation.
 
