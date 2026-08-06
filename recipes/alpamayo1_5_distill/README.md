@@ -1100,6 +1100,61 @@ correct aggregate to the log but writes only rank 0's shard to the JSON. A 2-ran
 1000-clip eval left a 500-row file strided `0, 2, 4, …, 998`, which silently pairs
 against nothing. Run each eval arm as an independent single-rank job.
 
+### 🛑 The teacher's CoT makes its own driving ~11% worse (n=1000, held out)
+
+`scripts/eval_cot_vs_nocot.py`. The cleanest instrument in this recipe, and the one that
+should be read first: **no surgery**. The same 10B is run twice over
+`lcdrive_val_mysubset_1k_clip_uuids.txt`, changing only the processor.
+
+| arm | `components_order` |
+|---|---|
+| `cot` | `[image, traj_history, prompt, cot]` — reasons, then acts |
+| `nocot` | `[image, traj_history, prompt, traj_future]` — no `cot` component exists |
+
+Stock rollout on both sides: stochastic sampling, 6 trajectories, 10 Euler steps.
+Diffusion noise pinned *at the sampler* so the arms share it (see the trap below). Two
+independent 500-clip shards agree.
+
+| metric | with CoT | without CoT | Δ | σ | no-CoT better on |
+|---|---|---|---|---|---|
+| **min_ade** | 1.1159 | **0.9882** | −0.1277 | **−6.80** | 59% |
+| **ade** | 2.2063 | **2.0218** | −0.1845 | **−6.38** | 58% |
+| **corner_distance** | 1.1040 | **0.9726** | −0.1313 | **−7.21** | 59% |
+| min_ade @0.5 s | 0.0135 | 0.0132 | −0.0003 | −1.47 | n.s. |
+| min_ade @1 s | 0.0433 | 0.0422 | −0.0011 | −1.49 | n.s. |
+| min_ade @3 s | 0.2978 | 0.2868 | −0.0109 | −2.38 | sig |
+| min_ade @5 s | 0.7058 | **0.6379** | −0.0679 | **−6.00** | sig |
+
+**Removing the chain-of-thought improves the teacher's own driving by ~11% relative.**
+All 1000 clips differ between arms, so the contrast is real.
+
+The horizon profile is the informative part: **nothing at 0.5–1 s, growing to −6σ at
+5 s.** The CoT does not perturb immediate control; it degrades *long-horizon*
+prediction — consistent with a lossy intermediate whose errors propagate into high-level
+intent, where reading the scene directly does not.
+
+This **supersedes the cache-surgery section below**. Same direction (removal helps), but
+at 6–7σ on held-out data through the real inference path, without per-head gathers,
+sequence edits or rope compensation, and without perturbing only 0.36% of the cache —
+four to seven times below the expert's measured detection threshold.
+
+⚠️ Open question, stated rather than buried: the `nocot` arm uses the `default`
+processor, which could be out-of-distribution for a model trained to always reason.
+Against that reading — an OOD mode should be *worse*, not 11% better; `default` is a
+standard SFT processor; and it is the mode the 2B student runs in. Settling it needs the
+checkpoint's training provenance, not another measurement.
+
+⚠️ **Seeding before the rollout does NOT pair the arms.** The rollout calls
+`vlm.generate` first, which consumes RNG sampling tokens, and `cot` emits ~13 tokens
+where `nocot` emits 1–2 — so the arms reach `diffusion.sample` with different generator
+states and different noise. `diffusion.sample` is wrapped to re-seed at the call itself;
+two identical runs are then bit-identical.
+
+**Implication.** KAVA distils this CoT into the student, and this CoT measurably degrades
+the teacher's own driving. Combined with `L_KV`'s benefit being attributable to
+regularisation rather than transfer through the slots, the case for the KV-cache target
+in this architecture is weak.
+
 ### ⚠️ The ceiling: the teacher's expert barely uses the CoT in its cache
 
 `scripts/eval_evicted_expert.py` runs the **teacher's own** action expert on the
