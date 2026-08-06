@@ -114,6 +114,13 @@ def _selection(mode: str, sel_idx: torch.Tensor, n_cot: int, m: int, seed: int) 
     if mode == "crop":
         base = torch.arange(m)
         return base[None, None, :].expand(n_layers, n_heads, m).contiguous()
+    if mode == "none":
+        # Drop the CoT ENTIRELY. The expert reads the whole prefix cache (~3142 entries,
+        # 91.7% of it vision) of which the CoT is ~13 -- 0.41%. If deleting all of it
+        # does not move min_ade, the teacher's own reasoning contributes almost nothing
+        # to the teacher's own trajectory, which bounds the whole recipe in a way that
+        # evicting 13 -> 8 (0.16% of the expert's input) cannot.
+        return sel_idx[:, :, :0]
     if mode == "random":
         g = torch.Generator().manual_seed(seed)
         out = torch.stack(
@@ -199,7 +206,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=50)
-    ap.add_argument("--arms", default="full,rkv,crop,random")
+    ap.add_argument("--arms", default="full,rkv,crop,random,none")
     ap.add_argument("--cache-root", default=CACHE_ROOT)
     ap.add_argument("--tier", default=TIER)
     ap.add_argument("--config-name", default="cache_teacher_kv_lcdrive")
@@ -211,6 +218,10 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--num-traj-samples", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    # Independent noise draws per clip, each shared across all arms. The
+    # per-arm noise is the dominant variance at best-of-1, so reps buy far more
+    # than extra clips do.
+    ap.add_argument("--reps", type=int, default=3)
     args = ap.parse_args()
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
 
@@ -269,41 +280,59 @@ def main() -> None:
 
         # No pre-pass: the wrapper reads the span from the sequence the rollout itself
         # generates, so the two cannot drift. `full` runs first and records n_cot.
-        row: dict[str, Any] = {"clip_id": key}
+        #
+        # ⚠️ Every arm is re-seeded to the SAME value before its rollout, and each clip
+        # is repeated over `--reps` independent seeds. This is load-bearing, not tidiness.
+        # diffusion.sample() draws random initial noise; without seeding, each arm gets
+        # its own draw and at best-of-1 that noise swamps the signal. Measured: two runs
+        # of the IDENTICAL `full` arm over the same 150 clips differed by
+        # -0.2475 +- 0.1308 -- 1.89 sigma on an effect that is exactly zero by
+        # construction, and the same magnitude as every difference this script exists to
+        # detect. Pairing the clips is not enough; the noise draw has to be paired too.
+        acc: dict[str, list[float]] = {a: [] for a in arms}
         sel = sel_idx.long()
         m = int(sel.shape[-1])
+        n_cot_seen: int | None = None
         ok = True
-        for arm in arms:
-            state: dict[str, Any] = {}
+        for rep in range(args.reps):
+            seed_base = (args.seed * 1_000_003 + done * 97 + rep) & 0x7FFFFFFF
+            for arm in arms:
+                state: dict[str, Any] = {}
 
-            def make_keep(n_cot: int, _arm: str = arm, _sel: torch.Tensor = sel) -> Any:
-                if m > n_cot or int(_sel.max()) >= n_cot:
-                    return None
-                return _selection(_arm, _sel, n_cot, m, args.seed + done)
+                def make_keep(n_cot: int, _arm: str = arm, _sel: torch.Tensor = sel) -> Any:
+                    if _arm != "none" and (m > n_cot or int(_sel.max()) >= n_cot):
+                        return None
+                    return _selection(_arm, _sel, n_cot, m, seed_base)
 
-            state["make_keep"] = make_keep
-            arm_batch = {**batch, "tokenized_data": dict(tok0)}
-            real_gen = model.vlm.generate
-            model.vlm.generate = _patched_generate(model, arm, state)
-            try:
-                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    pred_xyz, _ = model.sample_trajectories_from_data_with_vlm_rollout(
-                        arm_batch, num_traj_samples=1, num_traj_sets=1
-                    )
-            except _SkipClip as ex:
-                skipped["cot_mismatch"] += 1
-                print(f"[evict-eval] skip {key[:12]} ({arm}): {ex}", flush=True)
-                ok = False
+                state["make_keep"] = make_keep
+                arm_batch = {**batch, "tokenized_data": dict(tok0)}
+                torch.manual_seed(seed_base)
+                torch.cuda.manual_seed_all(seed_base)
+                real_gen = model.vlm.generate
+                model.vlm.generate = _patched_generate(model, arm, state)
+                try:
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                        pred_xyz, _ = model.sample_trajectories_from_data_with_vlm_rollout(
+                            arm_batch, num_traj_samples=1, num_traj_sets=1
+                        )
+                except _SkipClip as ex:
+                    skipped["cot_mismatch"] += 1
+                    print(f"[evict-eval] skip {key[:12]} ({arm}): {ex}", flush=True)
+                    ok = False
+                    break
+                finally:
+                    model.vlm.generate = real_gen
+                mt = distance_metrics.compute_minade(
+                    pred_xyz.float(), gt_xyz, disable_summary=True, timestep_horizons=[]
+                )
+                acc[arm].append(float(mt["min_ade"].mean()))
+                n_cot_seen = state.get("n_cot", n_cot_seen)
+            if not ok:
                 break
-            finally:
-                model.vlm.generate = real_gen
-            mt = distance_metrics.compute_minade(
-                pred_xyz.float(), gt_xyz, disable_summary=True, timestep_horizons=[]
-            )
-            row[arm] = float(mt["min_ade"].mean())
-            row.setdefault("n_cot", state.get("n_cot"))
         if not ok:
             continue
+        row: dict[str, Any] = {"clip_id": key, "n_cot": n_cot_seen}
+        row.update({a: st.mean(v) for a, v in acc.items()})
         rows.append(row)
         done += 1
         if done % 5 == 0 or done == 1:
