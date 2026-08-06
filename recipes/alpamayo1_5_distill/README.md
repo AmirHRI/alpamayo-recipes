@@ -1174,6 +1174,25 @@ distinguishable from an arbitrary equal-size slice of the prefix.** Any apparent
 from deleting the reasoning is a generic effect of shortening the cache, not a property
 of the reasoning.
 
+**The sensitivity floor — what makes the null meaningful.** A null is worthless without
+evidence the instrument can detect anything, so `preN` sweeps the number of removed
+entries. n=100 OOD clips × 2 seeds:
+
+| entries removed | Δ `min_ade` vs `full` | σ | |
+|---|---|---|---|
+| **~14 — the CoT** | −0.108 ± 0.068 | −1.58 | n.s. |
+| ~14 — prefix (`pre`) | −0.095 ± 0.057 | −1.67 | n.s. |
+| 25 | −0.131 ± 0.100 | −1.32 | n.s. |
+| 50 | +0.254 ± 0.196 | +1.30 | n.s. |
+| 100 | +0.756 ± 0.244 | **+3.10** | **SIG** |
+| 200 | +0.938 ± 0.247 | **+3.80** | **SIG** |
+
+**The expert's detection threshold is ~50–100 cache entries out of ~3019. The CoT is 14 —
+four to seven times below it.** So the result is not "no effect was found"; it is "this
+measurement resolves removals at the 100-entry scale, and the CoT is far too small to
+reach that scale." That bounds how much any CoT-cache objective can possibly buy here,
+independent of how faithfully a student reproduces the target.
+
 ⚠️ An earlier version of this section reported `random`/`crop`/`none` beating `full` at
 2.3–3.1σ on these clips and read it as "removing the CoT *helps*". That was measured
 against `full` only, before `pre` existed, and is retracted: an unrelated removal

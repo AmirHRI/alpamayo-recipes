@@ -135,7 +135,7 @@ def _selection(
         # this differs from `full`, the gather path is biased and every removal arm's
         # ~-0.05 offset is an artifact of the machinery rather than a property of the CoT.
         return torch.arange(n_cot)[None, None, :].expand(n_layers, n_heads, n_cot).contiguous()
-    if mode in ("none", "pre"):
+    if mode == "none" or mode.startswith("pre"):
         # `pre` is the shortening control: the wrapper has already pointed the span
         # at the tokens immediately BEFORE the CoT, so returning an empty selection
         # removes the same COUNT of entries as `none` does, from prompt/vision
@@ -195,14 +195,15 @@ def _patched_generate(model: Any, arm: str, state: dict[str, Any]) -> Any:
 
         lo, hi = find_cot_span(out.sequences, cot_start, cot_end, tfs_id)
         state["lo"], state["hi"], state["n_cot"] = lo, hi, hi - lo
-        if arm == "pre":
+        if arm.startswith("pre"):
             # CONTROL for cache SHORTENING, as opposed to CoT removal. Evict the same
             # number of entries from the span immediately BEFORE the CoT -- prompt/vision
             # content -- leaving the CoT fully intact. `identity` shows the gather is
             # neutral but never shortens; this shortens by the same amount without
             # touching the reasoning. If `pre` also improves min_ade, the gain is about
             # cache length, not about the CoT.
-            span = hi - lo
+            # `preN` removes N entries; bare `pre` matches the CoT length exactly.
+            span = int(arm[3:]) if len(arm) > 3 else (hi - lo)
             if lo - span < 1:
                 raise _SkipClip(f"no room for a {span}-token pre-CoT span at lo={lo}")
             lo, hi = lo - span, lo
@@ -356,7 +357,7 @@ def main() -> None:
                 state: dict[str, Any] = {}
 
                 def make_keep(n_cot: int, _arm: str = arm, _sel: Any = sel) -> Any:
-                    if _arm not in ("none", "identity", "pre"):
+                    if _arm not in ("none", "identity") and not _arm.startswith("pre"):
                         if m > n_cot:
                             return None
                         if _sel is not None and int(_sel.max()) >= n_cot:
