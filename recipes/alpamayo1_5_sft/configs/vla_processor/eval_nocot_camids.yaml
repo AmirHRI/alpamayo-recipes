@@ -1,0 +1,13 @@
+# no-CoT arm for the 10B CoT ablation, in Alpamayo-1.5's OWN trained prompt format.
+#
+# Identical to `default` except include_camera_ids / include_frame_nums are ON, so it
+# pairs exactly with eval_cot_camids.yaml. The ONLY difference between the two configs
+# is the `cot` component: here the prompt ends at <|traj_future_start|> and the model
+# goes straight to the trajectory.
+_target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+chat_template_version: r1_5
+components_order: ["image", "traj_history", "prompt", "traj_future"]
+components_prompt: ["traj_future"]
+label_components: ["traj_future"]
+include_camera_ids: true
+include_frame_nums: true
