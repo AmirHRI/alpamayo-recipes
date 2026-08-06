@@ -114,6 +114,14 @@ def _selection(mode: str, sel_idx: torch.Tensor, n_cot: int, m: int, seed: int) 
     if mode == "crop":
         base = torch.arange(m)
         return base[None, None, :].expand(n_layers, n_heads, m).contiguous()
+    if mode == "identity":
+        # CONTROL for the surgery itself: run the per-head gather over the CoT span but
+        # keep every entry, so nothing is removed and the sequence is not shortened. If
+        # this differs from `full`, the gather path is biased and every removal arm's
+        # ~-0.05 offset is an artifact of the machinery rather than a property of the CoT.
+        return torch.arange(n_cot)[None, None, :].expand(
+            sel_idx.shape[0], sel_idx.shape[1], n_cot
+        ).contiguous()
     if mode == "none":
         # Drop the CoT ENTIRELY. The expert reads the whole prefix cache (~3142 entries,
         # 91.7% of it vision) of which the CoT is ~13 -- 0.41%. If deleting all of it
@@ -300,7 +308,7 @@ def main() -> None:
                 state: dict[str, Any] = {}
 
                 def make_keep(n_cot: int, _arm: str = arm, _sel: torch.Tensor = sel) -> Any:
-                    if _arm != "none" and (m > n_cot or int(_sel.max()) >= n_cot):
+                    if _arm not in ("none", "identity") and (m > n_cot or int(_sel.max()) >= n_cot):
                         return None
                     return _selection(_arm, _sel, n_cot, m, seed_base)
 

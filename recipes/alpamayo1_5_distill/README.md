@@ -1100,6 +1100,68 @@ correct aggregate to the log but writes only rank 0's shard to the JSON. A 2-ran
 1000-clip eval left a 500-row file strided `0, 2, 4, …, 998`, which silently pairs
 against nothing. Run each eval arm as an independent single-rank job.
 
+### ⚠️ The ceiling: the teacher's expert barely uses the CoT in its cache
+
+`scripts/eval_evicted_expert.py` runs the **teacher's own** action expert on the
+**teacher's own** cache, evicted with the exact `sel_idx` we distil against. No student
+is involved, so this measures the compression alone — and it upper-bounds the recipe,
+since reproducing that object *is* the student's objective.
+
+First, the geometry that motivates it. The expert reads the whole prefix cache
+(`kv_cache.crop(tfs_idx + 1)`), roughly **3142 entries**:
+
+| | entries | share |
+|---|---|---|
+| vision tokens | ~2880 | **91.7%** |
+| prompt + special | ~249 | 7.9% |
+| **CoT** | **13** (median over 38,336 clips) | **0.41%** |
+
+So evicting 13 → 8 perturbs **0.16%** of the expert's input. n=120 clips × 3 seeds,
+diffusion noise paired across arms:
+
+| | Δ `min_ade` vs `full` | σ |
+|---|---|---|
+| `identity` (gather everything, remove nothing) | **+0.0000 ± 0.0000** | — |
+| `rkv` (drop 5 of 13, R-KV λ=0.1) | −0.048 ± 0.026 | −1.85 |
+| `crop` (drop 5, keep the first 8) | −0.051 ± 0.027 | −1.89 |
+| `random` (drop 5 at random) | −0.052 ± 0.030 | −1.71 |
+| `none` (**drop all 13**) | −0.075 ± 0.052 | −1.45 |
+
+Two conclusions, both null in the direction that matters:
+
+1. **Which tokens survive is irrelevant.** `rkv` − `random` is +0.0038 ± 0.0062 with a
+   median of **exactly 0.0000** — on most clips the trajectory is bit-identical however
+   the 8 survivors are chosen. Same for `rkv` − `crop` and `crop` − `random`.
+2. **Whether any survive is nearly irrelevant.** `none` − `rkv` is −0.027 ± 0.035
+   (z = −0.77): deleting the entire chain-of-thought is indistinguishable from keeping
+   the 8 entries R-KV picked.
+
+`identity` is the control that makes this trustworthy — it exercises the per-head gather
+and the rope compensation but removes nothing, and comes out bit-identical to `full`, so
+the shared ~−0.05 offset is a property of removing CoT content rather than of the
+surgery. Numbers reproduce to four decimals across independent runs.
+
+**What this does and does not say.** It says the teacher's expert is insensitive to CoT
+content *in aggregate min_ade on 120 LCDrive train clips*. It does **not** say reasoning
+is useless: the CoT may matter on rare or hard scenarios this sample under-represents
+(the ~1,740 OOD-reasoning clips are the obvious place to look), and aggregate ADE is a
+coarse instrument for semantic correctness. It also does not contradict the T=2 slot
+ablation — a student *trained* to route through slots becoming dependent on them is a
+different phenomenon from the teacher's expert not needing the CoT.
+
+But it does bound the premise. "Compile the teacher's reasoning into the cache the expert
+reads" has limited headroom here, because the expert does not appear to use the reasoning
+that is already in that cache. Any future KAVA work should establish a scenario set where
+the CoT demonstrably moves the teacher's own trajectory *before* optimising how faithfully
+a student reproduces it.
+
+⚠️ **The diffusion sampler is unseeded by default, and it will fool you.** Two runs of
+the identical `full` arm once differed by −0.2475 ± 0.1308 (1.89σ on a true-zero effect),
+which is larger than every effect above. That artifact produced a confident,
+wrong "R-KV is worse than random" result before it was caught. The script now seeds
+`torch.manual_seed`/`cuda.manual_seed_all` identically per arm and repeats over `--reps`
+seeds; keep a duplicate arm in any variant of this experiment as a live noise floor.
+
 ### The λ₂ control settles the attribution
 
 A CE-only arm at `T=2` and effective batch 48, differing from the KAVA `T=2` arm in
