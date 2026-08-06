@@ -66,6 +66,10 @@ from typing import Any
 
 import torch
 
+class _SkipClip(RuntimeError):
+    """This clip cannot be scored coherently; skip it rather than record a number."""
+
+
 CACHE_ROOT = "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive"
 TIER = "compressed_M8_rkv0.1"
 
@@ -125,35 +129,63 @@ def _selection(mode: str, sel_idx: torch.Tensor, n_cot: int, m: int, seed: int) 
 
 
 def _patched_generate(model: Any, arm: str, state: dict[str, Any]) -> Any:
-    """Wrap ``vlm.generate`` so the rollout receives an already-evicted cache."""
+    """Wrap ``vlm.generate``: force greedy, then hand back an evicted cache.
+
+    ⚠️ The rollout's own generation is STOCHASTIC (``temperature=0.6, top_p=0.98``) and
+    asks for ``num_return_sequences = num_traj_samples``, so by default it produces six
+    DIFFERENT CoTs of different lengths. The cached ``sel_idx`` was computed against the
+    greedy CoT, so under sampling it indexes a span that does not exist -- which shows up
+    as an out-of-bounds gather, reported asynchronously at whatever CUDA call comes next.
+    Forcing greedy makes the rollout's CoT identical to the cached one, which is the only
+    condition under which this comparison means anything.
+
+    The span is then read from the sequence that was actually generated, not from a
+    separate pass, so the two can never drift apart silently.
+    """
+    from alpamayo1_5_distill.models.teacher_kv import find_cot_span
+
     real = model.vlm.generate
-    tfs_id = model.tokenizer.convert_tokens_to_ids("<|traj_future_start|>")
+    tok = model.tokenizer
+    cot_start = tok.convert_tokens_to_ids("<|cot_start|>")
+    cot_end = tok.convert_tokens_to_ids("<|cot_end|>")
+    tfs_id = tok.convert_tokens_to_ids("<|traj_future_start|>")
 
     def wrapper(*a: Any, **kw: Any) -> Any:
+        gc = kw.get("generation_config")
+        if gc is not None:
+            gc.do_sample = False
+            gc.temperature = None
+            gc.top_p = None
+            gc.top_k = None
+            gc.num_return_sequences = 1
         out = real(*a, **kw)
         out.rope_deltas = model.vlm.model.rope_deltas
+
+        lo, hi = find_cot_span(out.sequences, cot_start, cot_end, tfs_id)
+        state["lo"], state["hi"], state["n_cot"] = lo, hi, hi - lo
         if arm == "full":
-            state["n_cot"] = None
             return out
 
-        seq = out.sequences
-        keep_rel, lo, hi = state["keep"], state["lo"], state["hi"]
+        keep_rel = state["make_keep"](hi - lo)
+        if keep_rel is None:
+            raise _SkipClip(f"selection does not fit N_C={hi - lo}")
         dropped = _evict_cache_per_head(out.past_key_values, lo, hi, keep_rel)
         state["dropped"] = dropped
         if dropped == 0:
             return out
 
-        # sequences: drop `dropped` columns from the CoT span. WHICH ones is irrelevant
-        # (a token-id row cannot express a per-head choice); only the count matters, and
-        # it is what shifts the <traj_future_start> array index the mask is built from.
-        out.sequences = torch.cat([seq[:, : lo], seq[:, lo + dropped :]], dim=1)
-        # Compensate the position shift: action-token positions are rope_deltas + offset,
-        # and offset just shrank by `dropped`. The surviving cache keys keep their original
-        # baked-in rotations, so without this every relative offset moves by `dropped`.
+        seq = out.sequences
+        # Drop `dropped` columns from the CoT span so the downstream
+        # <traj_future_start> search returns the NEW array index (the attention mask
+        # uses it as an index). WHICH columns is irrelevant -- only the count -- since a
+        # token-id row cannot represent a per-head choice.
+        out.sequences = torch.cat([seq[:, :lo], seq[:, lo + dropped :]], dim=1)
+        # Action-token positions are rope_deltas + offset, and offset just shrank by
+        # `dropped`, while surviving cache keys keep their baked-in rotations. Without
+        # this every relative offset would silently move by `dropped`.
         out.rope_deltas = out.rope_deltas + dropped
-        n_tfs = int((out.sequences == tfs_id).sum())
-        if n_tfs == 0:
-            raise RuntimeError("eviction removed the <traj_future_start> column")
+        if int((out.sequences == tfs_id).sum()) == 0:
+            raise _SkipClip("eviction removed the <traj_future_start> column")
         return out
 
     return wrapper
@@ -192,11 +224,6 @@ def main() -> None:
     print(f"[evict-eval] teacher up, dataset={len(dataset)}", flush=True)
 
     from alpamayo.metrics import distance_metrics
-    from alpamayo1_5_distill.models.teacher_kv import find_cot_span
-
-    cot_start = model.tokenizer.convert_tokens_to_ids("<|cot_start|>")
-    cot_end = model.tokenizer.convert_tokens_to_ids("<|cot_end|>")
-    tfs_id = model.tokenizer.convert_tokens_to_ids("<|traj_future_start|>")
 
     # Same loader the cache builder uses: workers decode frames on CPU while the GPU
     # runs, and processor.collate_fn produces the `tokenized_data` the model expects.
@@ -240,45 +267,43 @@ def main() -> None:
                 f"batch keys={sorted(batch)}"
             )
 
-        # Locate the CoT span by regenerating the prefix greedily. The cache was built
-        # the same way, so the spans should agree; where they do not, sel_idx points at
-        # different tokens and the arm would be silently meaningless, so skip.
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            trunc, _ = model.generate_cot_prefix(
-                dict(tok0),
-                ego_history_xyz=batch.get("ego_history_xyz"),
-                ego_history_rot=batch.get("ego_history_rot"),
-            )
-        lo, hi = find_cot_span(trunc, cot_start, cot_end, tfs_id)
-        n_cot, m = hi - lo, int(sel_idx.shape[-1])
-        if m > n_cot:
-            # The cached selection has more entries than this run's CoT -- the teacher
-            # regenerated something shorter, so the indices do not apply.
-            skipped["m_gt_ncot"] += 1
-            continue
-        if int(sel_idx.max()) >= n_cot:
-            skipped["cot_mismatch"] += 1
-            continue
-
-        row: dict[str, Any] = {"clip_id": key, "n_cot": n_cot, "m": m}
+        # No pre-pass: the wrapper reads the span from the sequence the rollout itself
+        # generates, so the two cannot drift. `full` runs first and records n_cot.
+        row: dict[str, Any] = {"clip_id": key}
+        sel = sel_idx.long()
+        m = int(sel.shape[-1])
+        ok = True
         for arm in arms:
-            state: dict[str, Any] = {"lo": lo, "hi": hi}
-            if arm != "full":
-                state["keep"] = _selection(arm, sel_idx.long(), n_cot, m, args.seed + done)
+            state: dict[str, Any] = {}
+
+            def make_keep(n_cot: int, _arm: str = arm, _sel: torch.Tensor = sel) -> Any:
+                if m > n_cot or int(_sel.max()) >= n_cot:
+                    return None
+                return _selection(_arm, _sel, n_cot, m, args.seed + done)
+
+            state["make_keep"] = make_keep
             arm_batch = {**batch, "tokenized_data": dict(tok0)}
             real_gen = model.vlm.generate
             model.vlm.generate = _patched_generate(model, arm, state)
             try:
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                     pred_xyz, _ = model.sample_trajectories_from_data_with_vlm_rollout(
-                        arm_batch, num_traj_samples=args.num_traj_samples, num_traj_sets=1
+                        arm_batch, num_traj_samples=1, num_traj_sets=1
                     )
+            except _SkipClip as ex:
+                skipped["cot_mismatch"] += 1
+                print(f"[evict-eval] skip {key[:12]} ({arm}): {ex}", flush=True)
+                ok = False
+                break
             finally:
                 model.vlm.generate = real_gen
             mt = distance_metrics.compute_minade(
                 pred_xyz.float(), gt_xyz, disable_summary=True, timestep_horizons=[]
             )
             row[arm] = float(mt["min_ade"].mean())
+            row.setdefault("n_cot", state.get("n_cot"))
+        if not ok:
+            continue
         rows.append(row)
         done += 1
         if done % 5 == 0 or done == 1:
