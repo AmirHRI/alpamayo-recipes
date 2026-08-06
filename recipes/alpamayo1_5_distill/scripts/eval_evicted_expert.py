@@ -106,10 +106,25 @@ def _evict_cache_per_head(
     return (hi - lo) - m
 
 
-def _selection(mode: str, sel_idx: torch.Tensor, n_cot: int, m: int, seed: int) -> torch.Tensor:
-    """``[L, H, M]`` indices relative to the CoT start, for one arm."""
-    n_layers, n_heads, _ = sel_idx.shape
+def _selection(
+    mode: str,
+    sel_idx: torch.Tensor | None,
+    n_cot: int,
+    m: int,
+    seed: int,
+    geom: tuple[int, int],
+) -> torch.Tensor:
+    """``[L, H, M]`` indices relative to the CoT start, for one arm.
+
+    ``sel_idx`` is needed ONLY by the ``rkv`` arm -- it is the cached R-KV choice.
+    Every other arm is derivable from ``n_cot`` and the (layers, kv-heads) geometry,
+    which is what lets this run on clips with no cache entry at all: the decisive
+    ``full`` vs ``none`` comparison never touches the cache.
+    """
+    n_layers, n_heads = geom
     if mode == "rkv":
+        if sel_idx is None:
+            raise ValueError("the rkv arm needs a cached sel_idx for this clip")
         return sel_idx
     if mode == "crop":
         base = torch.arange(m)
@@ -119,16 +134,18 @@ def _selection(mode: str, sel_idx: torch.Tensor, n_cot: int, m: int, seed: int) 
         # keep every entry, so nothing is removed and the sequence is not shortened. If
         # this differs from `full`, the gather path is biased and every removal arm's
         # ~-0.05 offset is an artifact of the machinery rather than a property of the CoT.
-        return torch.arange(n_cot)[None, None, :].expand(
-            sel_idx.shape[0], sel_idx.shape[1], n_cot
-        ).contiguous()
-    if mode == "none":
+        return torch.arange(n_cot)[None, None, :].expand(n_layers, n_heads, n_cot).contiguous()
+    if mode in ("none", "pre"):
+        # `pre` is the shortening control: the wrapper has already pointed the span
+        # at the tokens immediately BEFORE the CoT, so returning an empty selection
+        # removes the same COUNT of entries as `none` does, from prompt/vision
+        # content instead of from the reasoning.
         # Drop the CoT ENTIRELY. The expert reads the whole prefix cache (~3142 entries,
         # 91.7% of it vision) of which the CoT is ~13 -- 0.41%. If deleting all of it
         # does not move min_ade, the teacher's own reasoning contributes almost nothing
         # to the teacher's own trajectory, which bounds the whole recipe in a way that
         # evicting 13 -> 8 (0.16% of the expert's input) cannot.
-        return sel_idx[:, :, :0]
+        return torch.zeros(n_layers, n_heads, 0, dtype=torch.long)
     if mode == "random":
         g = torch.Generator().manual_seed(seed)
         out = torch.stack(
@@ -178,6 +195,17 @@ def _patched_generate(model: Any, arm: str, state: dict[str, Any]) -> Any:
 
         lo, hi = find_cot_span(out.sequences, cot_start, cot_end, tfs_id)
         state["lo"], state["hi"], state["n_cot"] = lo, hi, hi - lo
+        if arm == "pre":
+            # CONTROL for cache SHORTENING, as opposed to CoT removal. Evict the same
+            # number of entries from the span immediately BEFORE the CoT -- prompt/vision
+            # content -- leaving the CoT fully intact. `identity` shows the gather is
+            # neutral but never shortens; this shortens by the same amount without
+            # touching the reasoning. If `pre` also improves min_ade, the gain is about
+            # cache length, not about the CoT.
+            span = hi - lo
+            if lo - span < 1:
+                raise _SkipClip(f"no room for a {span}-token pre-CoT span at lo={lo}")
+            lo, hi = lo - span, lo
         if arm == "full":
             return out
 
@@ -230,6 +258,10 @@ def main() -> None:
     # per-arm noise is the dominant variance at best-of-1, so reps buy far more
     # than extra clips do.
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--m", type=int, default=8, help="budget for arms that need no cache")
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--num-shards", type=int, default=1)
+    ap.add_argument("--uuid-filter", default=None, help="override the dataset clip filter")
     args = ap.parse_args()
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
 
@@ -237,6 +269,8 @@ def main() -> None:
     cfg = cache_common.compose_config(args.config_name, {"teacher": args.teacher})
     print(f"[evict-eval] arms={arms} limit={args.limit} tier={args.tier}", flush=True)
     model = cache_common.build_teacher(cfg, device)
+    if args.uuid_filter:
+        cfg.data.cache_dataset.clip_uuid_filter = args.uuid_filter
     dataset = hyu.instantiate(
         cfg.data.cache_dataset, _convert_="partial", model_config=model.config
     )
@@ -247,12 +281,26 @@ def main() -> None:
     # Same loader the cache builder uses: workers decode frames on CPU while the GPU
     # runs, and processor.collate_fn produces the `tokenized_data` the model expects.
     processor = cache_common.build_processor(model)
-    candidates = [
-        i
-        for i in range(len(dataset))
-        if kv_cache_io.has_entry(args.cache_root, args.tier, dataset._sample_key(i))
-    ]
-    print(f"[evict-eval] {len(candidates)} clips have a cached tier entry", flush=True)
+    geom = (
+        len(model.vlm.model.language_model.layers),
+        int(getattr(model.vlm.config, "text_config", model.vlm.config).num_key_value_heads),
+    )
+    needs_cache = "rkv" in arms
+    candidates = list(range(len(dataset)))
+    if needs_cache:
+        # Only the rkv arm needs the cached R-KV choice. Every other arm is derivable
+        # from n_cot alone, which is what lets this run on clips with no cache entry --
+        # e.g. the OOD-reasoning set, which was never cached.
+        candidates = [
+            i for i in candidates
+            if kv_cache_io.has_entry(args.cache_root, args.tier, dataset._sample_key(i))
+        ]
+    candidates = candidates[args.shard :: args.num_shards]
+    print(
+        f"[evict-eval] {len(candidates)} candidate clips "
+        f"(shard {args.shard}/{args.num_shards}, cache required={needs_cache})",
+        flush=True,
+    )
     loader = cache_common.sample_loader(dataset, candidates, processor, num_workers=6)
 
     rows: list[dict[str, Any]] = []
@@ -264,13 +312,13 @@ def main() -> None:
         if batch is None:
             continue
         key = dataset._sample_key(idx)
+        sel_idx = None
         try:
             entry = kv_cache_io.load_entry(args.cache_root, args.tier, key, names=("sel_idx",))
+            sel_idx = entry.get("sel_idx")
         except KeyError:
-            skipped["no_sel_idx"] += 1
-            continue
-        sel_idx = entry.get("sel_idx")
-        if sel_idx is None:
+            pass
+        if sel_idx is None and needs_cache:
             skipped["no_sel_idx"] += 1
             continue
 
@@ -298,8 +346,8 @@ def main() -> None:
         # construction, and the same magnitude as every difference this script exists to
         # detect. Pairing the clips is not enough; the noise draw has to be paired too.
         acc: dict[str, list[float]] = {a: [] for a in arms}
-        sel = sel_idx.long()
-        m = int(sel.shape[-1])
+        sel = None if sel_idx is None else sel_idx.long()
+        m = int(sel.shape[-1]) if sel is not None else args.m
         n_cot_seen: int | None = None
         ok = True
         for rep in range(args.reps):
@@ -307,10 +355,13 @@ def main() -> None:
             for arm in arms:
                 state: dict[str, Any] = {}
 
-                def make_keep(n_cot: int, _arm: str = arm, _sel: torch.Tensor = sel) -> Any:
-                    if _arm not in ("none", "identity") and (m > n_cot or int(_sel.max()) >= n_cot):
-                        return None
-                    return _selection(_arm, _sel, n_cot, m, seed_base)
+                def make_keep(n_cot: int, _arm: str = arm, _sel: Any = sel) -> Any:
+                    if _arm not in ("none", "identity", "pre"):
+                        if m > n_cot:
+                            return None
+                        if _sel is not None and int(_sel.max()) >= n_cot:
+                            return None
+                    return _selection(_arm, _sel, n_cot, m, seed_base, geom)
 
                 state["make_keep"] = make_keep
                 arm_batch = {**batch, "tokenized_data": dict(tok0)}

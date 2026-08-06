@@ -1155,6 +1155,32 @@ that is already in that cache. Any future KAVA work should establish a scenario 
 the CoT demonstrably moves the teacher's own trajectory *before* optimising how faithfully
 a student reproduces it.
 
+**On OOD-reasoning clips, with the shortening control.** The above is LCDrive *train*.
+Repeated on 100 clips from `reasoning/ood_reasoning.parquet` (construction zones,
+one-way traffic control — scenarios curated as *needing* reasoning), ordered so the
+1,170 clips outside lcdrive-train come first. Only the `rkv` arm needs a cached
+`sel_idx`, so dropping it is what allows running on never-cached clips at all.
+
+| | Δ `min_ade` vs `full` | σ |
+|---|---|---|
+| `identity` (remove nothing) | +0.0000 ± 0.0000 | — |
+| `none` (drop all ~14 CoT entries) | −0.095 ± 0.058 | −1.64 |
+| **`pre`** (drop ~14 **prompt/vision** entries, CoT intact) | −0.068 ± 0.057 | −1.19 |
+| **`none` − `pre`** | **−0.028 ± 0.036** | **−0.76** |
+
+`pre` is the control that matters: same count removed, same machinery, different
+content. It improves *as much as* removing the CoT, so **the CoT slice is not
+distinguishable from an arbitrary equal-size slice of the prefix.** Any apparent gain
+from deleting the reasoning is a generic effect of shortening the cache, not a property
+of the reasoning.
+
+⚠️ An earlier version of this section reported `random`/`crop`/`none` beating `full` at
+2.3–3.1σ on these clips and read it as "removing the CoT *helps*". That was measured
+against `full` only, before `pre` existed, and is retracted: an unrelated removal
+produces a comparable effect. Note also that two OOD runs are **not** comparable
+clip-for-clip — differing `cot_mismatch` skip counts change the clip set and the seed
+sequence — so only within-run paired contrasts mean anything here.
+
 ⚠️ **The diffusion sampler is unseeded by default, and it will fool you.** Two runs of
 the identical `full` arm once differed by −0.2475 ± 0.1308 (1.89σ on a true-zero effect),
 which is larger than every effect above. That artifact produced a confident,
