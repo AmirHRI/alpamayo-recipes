@@ -1100,6 +1100,49 @@ correct aggregate to the log but writes only rank 0's shard to the JSON. A 2-ran
 1000-clip eval left a 500-row file strided `0, 2, 4, …, 998`, which silently pairs
 against nothing. Run each eval arm as an independent single-rank job.
 
+### 🛑 Alpamayo-1's CoT is neutral; Alpamayo-1.5's CoT is harmful
+
+Same harness, same 1000 held-out clips, same processor, both models verified to emit
+real reasoning:
+
+```
+1.5 : 'Stop for the red traffic light since the signal is red'
+1   : 'Stop at the stop line because the straight traffic light is red.'
+```
+
+| metric | **AR-1** with CoT | AR-1 Δ | z | **AR-1.5** with CoT | AR-1.5 Δ | z |
+|---|---|---|---|---|---|---|
+| min_ade | **0.6120** | −0.003 | −0.28 | 1.1159 | **−0.128** | **−6.80** |
+| ade | **1.5414** | **+0.045** | **+3.43** | 2.2063 | **−0.185** | **−6.38** |
+| corner_distance | **0.6280** | −0.007 | −0.80 | 1.1040 | **−0.131** | **−7.21** |
+| min_ade @5 s | **0.4056** | −0.004 | −0.64 | 0.7058 | **−0.068** | **−6.00** |
+
+(Δ is `nocot − cot`: positive means the CoT helps.)
+
+**Alpamayo-1's Chain-of-Causation is roughly neutral** — a small real gain on `ade`
+(+0.045, 3.4σ), nothing on min_ade, corner distance, or any horizon.
+**Alpamayo-1.5's CoT is clearly harmful**, 6–7σ on every aggregate metric.
+
+**This doubles as the positive control for the harness.** The same code yields a
+significant CoT *benefit* on one checkpoint and a significant *penalty* on another, so it
+is not biased toward "removal helps". It also undermines the out-of-distribution worry
+about the `nocot` arm: the identical no-CoT path costs Alpamayo-1 accuracy while gaining
+1.5 accuracy, which a systematically broken path could not do.
+
+⚠️ **Alpamayo-1 also outperforms Alpamayo-1.5 by ~45% on min_ade** (0.612 vs 1.116) on
+this subset. Treat that more cautiously than the ablations: the within-model contrasts
+are paired and exactly controlled, whereas a cross-model absolute comparison runs both
+through one recipe's processor rather than each model's own eval path.
+
+**Checked and cleared:** our 1.5 teacher loads from `Alpamayo-1.5-10B-A1-format`, which
+is a 32 KB directory of symlinks into the native `Alpamayo-1.5-10B` blobs. Same weights,
+identical 1159-entry weight map; the only config differences are module renames
+(`alpamayo_r1.*` ↔ `alpamayo1_5.*`) with identical hyperparameters. It is a faithful
+repackaging, so the 1.5 result is not a mis-load.
+
+**Implication.** The recipe distils from **1.5**, i.e. from the generation whose reasoning
+hurts its own driving, not the one where it helps.
+
 ### 🛑 The teacher's CoT makes its own driving ~11% worse (n=1000, held out)
 
 `scripts/eval_cot_vs_nocot.py`. The cleanest instrument in this recipe, and the one that
