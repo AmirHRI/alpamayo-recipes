@@ -65,6 +65,46 @@ SUBSET_1K = (
 )
 
 
+def _batched_loader(dataset: Any, indices: list[int], processor: Any, batch: int, workers: int):
+    """``(idx_list, collated)`` batches of ``batch`` clips.
+
+    ``cache_common.sample_loader`` is fixed at one clip per batch, which leaves the GPU
+    latency-bound: the CoT generation (~13 tokens) and the 10 Euler steps are
+    bandwidth-bound, so they barely use the SMs at b_star=6. Batching multiplies the
+    work per kernel launch. The rollout already supports B>1 -- it loops
+    ``for i in range(b_star)`` when building the per-row attention mask and offsets.
+    """
+    from torch.utils.data import DataLoader
+
+    class _IdxDataset:
+        def __len__(self) -> int:
+            return len(indices)
+
+        def __getitem__(self, j: int):
+            i = indices[j]
+            try:
+                return i, dataset[i]
+            except Exception as ex:
+                print(f"[cot-eval] idx={i} load error: {ex}", flush=True)
+                return i, None
+
+    def _collate(items):
+        good = [(i, s) for i, s in items if s is not None]
+        if not good:
+            return [], None
+        return [i for i, _ in good], processor.collate_fn([s for _, s in good])
+
+    return iter(
+        DataLoader(
+            _IdxDataset(),
+            batch_size=batch,
+            num_workers=workers,
+            collate_fn=_collate,
+            prefetch_factor=2 if workers else None,
+        )
+    )
+
+
 def main() -> None:
     import hydra.utils as hyu
 
@@ -78,6 +118,9 @@ def main() -> None:
     ap.add_argument("--config-name", default="cache_teacher_kv_lcdrive")
     ap.add_argument("--num-traj-samples", type=int, default=6)
     ap.add_argument("--reps", type=int, default=1)
+    ap.add_argument("--batch", type=int, default=1,
+                    help="clips per rollout; the CoT-generation and Euler phases are\n"
+                         "bandwidth-bound, so batching is where the speedup is")
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
@@ -110,24 +153,29 @@ def main() -> None:
     idxs = list(range(n))[args.shard :: args.num_shards][: args.limit]
     print(f"[cot-eval] {n} clips in subset, this shard takes {len(idxs)}", flush=True)
 
-    loaders = {k: cache_common.sample_loader(ds[k], idxs, proc[k], num_workers=4) for k in ds}
+    loaders = {
+        k: _batched_loader(ds[k], idxs, proc[k], args.batch, workers=4) for k in ds
+    }
     rows: list[dict[str, Any]] = []
-    tfs = model.tokenizer.convert_tokens_to_ids("<|traj_future_start|>")
+    n_batch = 0
 
-    for (i_c, b_c), (i_n, b_n) in zip(loaders["cot"], loaders["nocot"]):
-        if i_c != i_n:
-            raise RuntimeError(f"loaders desynced: {i_c} != {i_n}")
+    for (ix_c, b_c), (ix_n, b_n) in zip(loaders["cot"], loaders["nocot"]):
+        # Both arms must hold the SAME clips in the SAME order, or the pairing -- and the
+        # shared diffusion seed -- silently compares different scenes.
+        if ix_c != ix_n:
+            raise RuntimeError(f"loaders desynced: {ix_c} != {ix_n}")
         if b_c is None or b_n is None:
             continue
-        key = ds["cot"]._sample_key(i_c)
-        row: dict[str, Any] = {"clip_id": key}
-        acc: dict[str, list[float]] = {"cot": [], "nocot": []}
+        per_arm: dict[str, list[list[float]]] = {}
         for arm, batch in (("cot", b_c), ("nocot", b_n)):
             batch = cache_common.to_device(batch, device)
             gt = batch["ego_future_xyz"][:, -1].float()
             tok0 = dict(batch["tokenized_data"])
+            reps: list[list[float]] = []
             for rep in range(args.reps):
-                seed = (args.seed * 1_000_003 + len(rows) * 97 + rep) & 0x7FFFFFFF
+                # Seed keyed on the BATCH, identical across arms. Both arms draw the same
+                # noise because total_batch = len(batch) * num_traj_samples matches.
+                seed = (args.seed * 1_000_003 + n_batch * 97 + rep) & 0x7FFFFFFF
                 torch.manual_seed(seed)
                 torch.cuda.manual_seed_all(seed)
                 arm_batch = {**batch, "tokenized_data": dict(tok0)}
@@ -140,13 +188,21 @@ def main() -> None:
                 m = distance_metrics.compute_minade(
                     pred_xyz.float(), gt, disable_summary=True, timestep_horizons=[]
                 )
-                acc[arm].append(float(m["min_ade"].mean()))
-                if rep == 0 and arm == "cot":
-                    row["seq_len"] = int(arm_batch["tokenized_data"].get("input_ids", torch.zeros(1, 0)).shape[-1])
-        row["cot"] = st.mean(acc["cot"])
-        row["nocot"] = st.mean(acc["nocot"])
-        rows.append(row)
-        if len(rows) % 10 == 0 or len(rows) == 1:
+                # [B, N] -> per-clip. .mean() over the whole batch would collapse the rows
+                # and make per-clip pairing impossible.
+                per_clip = m["min_ade"].reshape(len(ix_c), -1).mean(dim=-1)
+                reps.append([float(x) for x in per_clip])
+            per_arm[arm] = reps
+        for j, idx in enumerate(ix_c):
+            rows.append(
+                {
+                    "clip_id": ds["cot"]._sample_key(idx),
+                    "cot": st.mean(r[j] for r in per_arm["cot"]),
+                    "nocot": st.mean(r[j] for r in per_arm["nocot"]),
+                }
+            )
+        n_batch += 1
+        if n_batch % 5 == 1:
             d = [r["nocot"] - r["cot"] for r in rows]
             print(
                 f"[cot-eval] {len(rows)}/{len(idxs)}  cot={st.mean(r['cot'] for r in rows):.4f}  "
