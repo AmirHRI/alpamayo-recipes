@@ -1100,7 +1100,48 @@ correct aggregate to the log but writes only rank 0's shard to the JSON. A 2-ran
 1000-clip eval left a 500-row file strided `0, 2, 4, …, 998`, which silently pairs
 against nothing. Run each eval arm as an independent single-rank job.
 
-### 🛑 Alpamayo-1's CoT is neutral; Alpamayo-1.5's CoT is harmful
+### ⛔ RETRACTED — the two CoT findings below were a prompt-format artifact
+
+Both sections that follow are **wrong** and are kept only for the record.
+
+The runs behind them used `include_camera_ids: false` / `include_frame_nums: false`
+(the repo's `default` processor). Alpamayo-1.5's `config.json` declares **both true**,
+and the reference `create_message()` prefixes every image with `Front left camera:
+frame 0 ...` explicitly "to match the training format". So the 10B was evaluated outside
+the format it was trained on. Alpamayo-1's config requests neither, so *its* numbers were
+unaffected — which is exactly what manufactured a fake gap between the two.
+
+Re-run through the repo's own `evaluate_hf` with the annotations ON
+(`vla_processor=eval_cot_camids` / `eval_nocot_camids`, 1000 clips of
+`lcdrive_val_mysubset_1k`, VLM token head):
+
+| metric | CoT | no CoT | Δ | σ |
+|---|---|---|---|---|
+| min_ade | 0.6259 | 0.6413 | +0.0154 | 0.86 |
+| ade | 1.2417 | 1.2111 | −0.0307 | −0.84 |
+| corner_distance | 0.6736 | 0.6909 | +0.0173 | 0.99 |
+
+**Every metric is null (|z| < 1).** And `min_ade` moves 1.116 → 0.626 — a 44% gain from
+the prompt format alone, the same size as the "Alpamayo-1 wins by 45%" gap that was
+therefore also an artifact. With the correct format the two generations are level
+(1.5: 0.626, AR-1: 0.612).
+
+Retracted specifically:
+* "the teacher's CoT makes its own driving ~11% worse (6–7σ)" — **not reproduced, null**
+* "Alpamayo-1 outperforms Alpamayo-1.5 by ~45%" — **prompt-format artifact**
+
+⚠️ Not fully isolated: the corrected run changed *two* variables — annotations off→on
+**and** expert head→VLM token head. The format is strongly implicated but the clean test
+is the expert path with annotations on, which needs a 10B-with-expert config in
+`alpamayo1_5_sft`.
+
+**Lesson.** A model's own `config.json` states the prompt format it was trained with.
+The repo's `default` processor turns those flags off deliberately, to keep the 10B
+comparable with the 2B (see `sft_eval_10b_token_lcdrive`'s comment) — correct for that
+purpose, wrong for asking whether the 10B's own reasoning helps it. Check the model's
+declared format before reading anything into a cross-model or ablation result.
+
+### 🛑 [RETRACTED] Alpamayo-1's CoT is neutral; Alpamayo-1.5's CoT is harmful
 
 Same harness, same 1000 held-out clips, same processor, both models verified to emit
 real reasoning:
@@ -1143,7 +1184,7 @@ repackaging, so the 1.5 result is not a mis-load.
 **Implication.** The recipe distils from **1.5**, i.e. from the generation whose reasoning
 hurts its own driving, not the one where it helps.
 
-### 🛑 The teacher's CoT makes its own driving ~11% worse (n=1000, held out)
+### 🛑 [RETRACTED — see the banner above] The teacher's CoT makes its own driving ~11% worse
 
 `scripts/eval_cot_vs_nocot.py`. The cleanest instrument in this recipe, and the one that
 should be read first: **no surgery**. The same 10B is run twice over
