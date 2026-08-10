@@ -165,6 +165,10 @@ def main() -> None:
 
     from alpamayo.metrics import distance_metrics
     from alpamayo1_5_distill.scripts import cache_common
+    from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA
+
+    global _VLM_ONLY
+    _VLM_ONLY = TrainableReasoningVLA.sample_trajectories_from_data
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=500)
@@ -185,6 +189,12 @@ def main() -> None:
     # batch=1 vs batch=N comparison isolates padding. NOT for real runs -- greedy is not
     # normal usage and caps num_traj_samples at 1.
     ap.add_argument("--greedy", action="store_true")
+    # Score the VLM's OWN trajectory tokens instead of the action expert's output.
+    # TrainableAlpamayoR1 overrides sample_trajectories_from_data with the expert
+    # rollout; the base TrainableReasoningVLA implementation generates the VLM's 128
+    # discrete traj tokens and decodes them with traj_tokenizer.decode(). Calling the
+    # base method unbound bypasses the expert entirely -- same weights, different head.
+    ap.add_argument("--vlm-only", action="store_true")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -266,11 +276,23 @@ def main() -> None:
                     model.vlm.generate = _greedy
                 try:
                   with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                    pred_xyz, pred_rot = model.sample_trajectories_from_data_with_vlm_rollout(
-                        arm_batch,
-                        num_traj_samples=args.num_traj_samples,
-                        num_traj_sets=1,
-                    )
+                    if args.vlm_only:
+                        # max_generation_length must cover the CoT AND the 128 traj
+                        # tokens; the default is exactly 128, which would truncate the
+                        # trajectory on the `cot` arm and silently score a short one.
+                        pred_xyz, pred_rot = _VLM_ONLY(
+                            model,
+                            arm_batch,
+                            num_traj_samples=args.num_traj_samples,
+                            num_traj_sets=1,
+                            max_generation_length=256,
+                        )
+                    else:
+                        pred_xyz, pred_rot = model.sample_trajectories_from_data_with_vlm_rollout(
+                            arm_batch,
+                            num_traj_samples=args.num_traj_samples,
+                            num_traj_sets=1,
+                        )
                 finally:
                     model.vlm.generate = real_gen
                     model.diffusion.sample = real_sample

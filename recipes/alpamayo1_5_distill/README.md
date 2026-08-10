@@ -21,6 +21,99 @@ teacher-feature cache script, and configs.
 
 ---
 
+## Result: Qwen3-VL-4B student — KV alignment closes 70% of the gap to the teacher
+
+A second student line (Qwen3-VL-4B, chosen because its 36 layers and 8×128 kv-heads match
+the teacher's tower exactly) trained one epoch on LCDrive train (38,340 clips, effective
+batch 24, 1,598 steps, **no CoT anywhere**), then scored on the 1k LCDrive val subset,
+paired per `clip_id`, n=1000.
+
+**Scored through the teacher's action expert** (`slurm_eval_stitched.sh`) — the student's
+VLM produces the K/V cache, the teacher's frozen expert reads it and drives. This is the
+endpoint `L_KV` targets, because the expert self-attends over that cache.
+
+| arm | objectives | ade | min_ade | × teacher | Δ min_ade vs `ce` | gap closed |
+|---|---|---|---|---|---|---|
+| **teacher** (ceiling) | — | **1.3039** | **0.5776** | 1.00× | — | — |
+| **kvonly, 2 epochs** | KV | 3.8633 | **2.5061** | 4.34× | **−4.4887** (z = −13.9) | **+70%** |
+| **kvonly** | KV | 4.1085 | 2.6313 | 4.56× | −4.3636 (z = −13.5) | +68% |
+| **cekv** | CE + KV | 4.9100 | 2.7601 | 4.78× | −4.2347 (z = −13.3) | +66% |
+| `kv` | CE + KD + KV | 5.9970 | 2.9554 | 5.12× | −4.0395 (z = −12.9) | +63% |
+| `ce` (control) | CE | 12.5500 | 6.9948 | 12.11× | — | — |
+| `kd` | CE + KD | 17.4294 | 11.3750 | 19.69× | +4.3802 (z = +13.7) | −68% |
+
+**Every objective other than KV alignment hurts this endpoint, monotonically.** Dropping
+logit-KD buys −0.1953 (z = −4.43); dropping CE as well buys a further −0.1289 (z = −3.09).
+
+**More epochs is not the lever.** A second full epoch of `kvonly` (12 h, 1,598 steps) moved
+min_ade 2.6313 → 2.5061 — real (paired −0.1251, z = −9.12) but worth only 2 more points of
+gap, against the 68 the first epoch bought. Training loss said the same thing in advance:
+`kv_loss` moved 0.5249 → ~0.5232 across that entire epoch. The residual **+1.93** to the
+teacher is a property of the objective or the student's capacity, not of undertraining.
+
+The teacher scores 0.5776 here against 0.6413 on its own token head — two different heads
+agreeing to within 10% is what says the harness is sound rather than flattering one arm.
+
+### ⚠️ The arm ordering INVERTS between the two heads
+
+The same six checkpoints, scored on the student's **own trajectory-token head**
+(`slurm_eval_kd.sh`), rank in essentially the opposite order:
+
+| arm | EXPERT ade | EXPERT min_ade | TOKEN ade | TOKEN min_ade |
+|---|---|---|---|---|
+| teacher | 1.3039 | 0.5776 | 1.2111 | 0.6413 |
+| kvonly, 2 epochs | 3.8633 | **2.5061** *(best)* | not scored | not scored |
+| kvonly | 4.1085 | 2.6313 | 37.5239 | **37.5239** *(worst)* |
+| cekv | 4.9100 | 2.7601 | 3.6427 | 2.9080 |
+| kv | 5.9970 | 2.9554 | 4.7516 | 3.1045 |
+| ce | 12.5500 | 6.9948 | 3.4749 | 2.4697 |
+| kd | 17.4294 | **11.3750** *(worst)* | 4.5953 | **1.9007** *(best)* |
+
+**Each objective helps only the head it targets.** Logit-KD matches output logits and gives
+the best token head while producing the *worst* expert head; KV alignment does the exact
+mirror image. Measure the wrong head and you get the opposite conclusion — which happened
+here, and the token-head reading was reported before the error was caught.
+
+`kvonly` is the extreme case and the clearest evidence: its `ade` and `min_ade` are
+**identical on all 1000 clips**, because every one of its 6 samples is malformed and
+zero-filled (6250 warnings over 6000 sequences). Its own trajectory head is completely
+destroyed — and that same checkpoint is the **best of all six** when the teacher's expert
+reads its cache. *The student VLM does not need to be a working driving model. It only
+needs to produce a cache the expert can read.*
+
+Consistent with this, `kvonly` also reaches the lowest training KV loss of any arm (0.5249
+overall, **0.4924** on the trajectory region vs 0.5769 for `kv`) while its CE barely moves
+(31.65 → 27.76, against `cekv`'s 31.61 → 2.35).
+
+Two token-head signals did **not** survive the change of endpoint:
+
+* *"KV alignment causes mode collapse."*  40.8% of clips produced 6 identical samples on the
+  token head, against 26.0% for the control. On the expert head the arms are equal
+  (15.2–18.0%). A token-sampling artifact, not a property of the representation.
+* *"Malformed generations contaminate the result."*  Real on the token head (7.6–9.6% of
+  clips, against the teacher's 0.4%) but not causal — excluding them moved every metric by
+  <0.06. On the expert head the counter does not apply at all: the trajectory comes from the
+  diffusion head, so `extract_traj_tokens` never runs.
+
+### Caveats
+
+* The residual gap is large and highly significant: `kvonly − teacher = +1.93` at 2 epochs. Closing 70%
+  is a real effect, not parity — the student is still ~4.6× the teacher's error.
+* This student is a **generic Qwen3-VL-4B trained for one epoch, not warm-started** from an
+  Alpamayo checkpoint. The relative arm ordering is what is established; whether KV
+  alignment still buys 68% once the student is already competent is a different regime.
+* A `kvonly` student is **useless standalone** — it cannot emit a trajectory. It is only a
+  cache producer for the teacher's expert, and must never be scored with
+  `slurm_eval_kd.sh` as a quality metric.
+* Weights were set by measurement, not guessed — `scripts/calibrate_kd_weights.py` put KD at
+  14.1% and KV at **0.22%** of the CE gradient at weight 1.0, so the shipped `kv_weight` is
+  45.409. The obvious default of 1.0 would have left `L_KV` inert with a healthy loss curve.
+* An 8-step smoke suggested KV alignment might teach trajectory prediction as a side effect
+  (`ce_loss` 31.4 → 20.6 with CE off). **It does not** — over the full run `kvonly` ends at
+  27.76. That was an early transient.
+
+---
+
 ## Background: how Alpamayo works
 
 ### Two models joined by a KV cache
