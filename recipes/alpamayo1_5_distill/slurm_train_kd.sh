@@ -22,6 +22,7 @@
 #   ARM=kv  sbatch slurm_train_kd.sh     # + all-token/all-layer KV alignment (full recipe)
 #   ARM=cekv   sbatch slurm_train_kd.sh  # CE + KV, no logit-KD
 #   ARM=kvonly sbatch slurm_train_kd.sh  # KV alone, no CE and no KD
+#   ARM=kvband sbatch slurm_train_kd.sh  # KV alone with depth-banded layer weights
 #   ARM=blockonly sbatch slurm_train_kd.sh  # L_block alone (teacher-forced block match)
 #   SMOKE=1 ARM=kv sbatch slurm_train_kd.sh
 #   RESUME=<ckpt> EPOCHS=3 ARM=kvonly sbatch slurm_train_kd.sh   # continue for more epochs
@@ -99,6 +100,17 @@ case "$ARM" in
         # is erased. The magnitude lever is `learning_rate`.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0
                 ++model.kd.kv_weight=0.0 ++model.kd.block_weight=1.0) ;;
+    kvband)
+        # kvonly with DEPTH-BANDED layer weights instead of uniform. Bands measured causally
+        # by scripts/layer_importance.py (n=100): swapping one layer of the student's cache
+        # for the teacher's and re-driving the frozen expert put 0.1% of the recoverable gain
+        # in layers 0-11, 49% in 12-23, 105% in 24-35 (marginal, so they overcount).
+        # Weights renormalised to mean 1.0 so the total loss scale is unchanged -- this is a
+        # DIRECTION change, not a magnitude one.
+        # ⚠️ Start from BASE, not from a kvonly checkpoint: the matched control is uniform
+        # kvonly at 1 epoch (stitched min_ade 2.6313), same init, same schedule, same budget.
+        EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0
+                "++model.kd.kv_layer_bands=[0.01,0.96,2.03]") ;;
     kvonly)
         # KV alone -- no CE, no KD. Asks whether the student needs token supervision at all
         # when the target is a cache read by the teacher's expert.
@@ -112,7 +124,7 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|blockonly)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly)" >&2; exit 1 ;;
 esac
 RUN_TAG="$ARM"
 if [[ -n "$RESUME" ]]; then

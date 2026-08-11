@@ -21,7 +21,7 @@ teacher-feature cache script, and configs.
 
 ---
 
-## Result: Qwen3-VL-4B student — KV alignment closes 71% of the gap to the teacher
+## Result: Qwen3-VL-4B student — block-output matching closes 77% of the gap to the teacher
 
 A second student line (Qwen3-VL-4B, chosen because its 36 layers and 8×128 kv-heads match
 the teacher's tower exactly) trained one epoch on LCDrive train (38,340 clips, effective
@@ -35,7 +35,8 @@ endpoint `L_KV` targets, because the expert self-attends over that cache.
 | arm | objectives | ade | min_ade | × teacher | Δ min_ade vs `ce` | gap closed |
 |---|---|---|---|---|---|---|
 | **teacher** (ceiling) | — | **1.3039** | **0.5776** | 1.00× | — | — |
-| **kvonly, 3 epochs** | KV | 3.8176 | **2.4098** | 4.17× | **−4.5850** (z = −14.1) | **+71%** |
+| **blockonly, 1 epoch** | **L_block** | 3.5824 | **2.0293** | **3.51×** | **−4.9655** (z = −15.7) | **+77%** |
+| kvonly, 3 epochs | KV | 3.8176 | 2.4098 | 4.17× | −4.5850 (z = −14.1) | +71% |
 | kvonly, 2 epochs | KV | 3.8633 | 2.5061 | 4.34× | −4.4887 (z = −13.9) | +70% |
 | **kvonly** | KV | 4.1085 | 2.6313 | 4.56× | −4.3636 (z = −13.5) | +68% |
 | **cekv** | CE + KV | 4.9100 | 2.7601 | 4.78× | −4.2347 (z = −13.3) | +66% |
@@ -43,8 +44,64 @@ endpoint `L_KV` targets, because the expert self-attends over that cache.
 | `ce` (control) | CE | 12.5500 | 6.9948 | 12.11× | — | — |
 | `kd` | CE + KD | 17.4294 | 11.3750 | 19.69× | +4.3802 (z = +13.7) | −68% |
 
-**Every objective other than KV alignment hurts this endpoint, monotonically.** Dropping
+**Every objective other than cache alignment hurts this endpoint, monotonically.** Dropping
 logit-KD buys −0.1953 (z = −4.43); dropping CE as well buys a further −0.1289 (z = −3.09).
+
+### The objective matters more than the compute: `L_block` beats `L_KV`
+
+Elementwise K/V matching is indifferent to *direction* — an error along an axis no expert
+query reads costs as much as one that dominates the softmax. `L_block`
+(`models/block_losses.py`) instead asks whether the student's cache produces the same
+**update** when consumed by the teacher's real frozen action block:
+
+    L_block = 1/L * sum_l || B_l(h^T_l; K^S_l,V^S_l) - sg B_l(h^T_l; K^T_l,V^T_l) ||^2
+
+Teacher-forcing `h^T_l` is what makes it well-posed: identical block weights, action input
+and timestep make Q, K_a and V_a identical *by construction*, so the VLM cache is the only
+difference and each layer's term stands alone with no drift compounding across depth.
+
+| | epochs | min_ade | gap closed | paired vs uniform `L_KV` |
+|---|---|---|---|---|
+| **L_block** | **1** | **2.0293** | **+77%** | **−0.6020** vs 1 ep (z = −10.31) |
+| | | | | **−0.3805** vs 3 ep (z = −7.12) |
+| L_KV uniform | 3 | 2.4098 | +71% | — |
+| L_KV uniform | 1 | 2.6313 | +68% | — |
+
+**One epoch of `L_block` beats three epochs of `L_KV`** — ~12 GPU-hours against ~36 — and
+cuts the residual to the teacher from +1.83 to +1.45.
+
+⚠️ The first `L_block` implementation was WRONG and looked healthy. Calling the decoder layer
+directly with a hand-built mask and self-computed cos/sin attends differently from the real
+forward, because the enclosing `Qwen3VLTextModel.forward` converts the mask to causal 4-D and
+computes the mrope embeddings. Its loss fell 1057 → 720 while the self-test showed
+`identity(teacher's own cache) = 1.04e3` (must be ~0) and a *layer-shuffled* cache scoring
+BETTER than the real student — i.e. it measured nothing. Fixed by capturing each layer's
+kwargs by hook and replaying them verbatim; identity is now exactly `0.000000e+00` and the
+student beats shuffled 0.0280 vs 0.1185. Reproduce with `BLOCK_SELFTEST=1`.
+
+### Which layers the expert actually reads (`scripts/layer_importance.py`)
+
+Uniform `L_KV` weights all 36 layers equally. Nothing had checked whether the expert cares.
+Measured causally at n=100 — swap ONE layer of the student's cache for the teacher's, re-drive
+the frozen expert, and record how much closer to the teacher's own trajectory it gets
+(`fix_gain`, in metres, against a 2.6396 m baseline gap):
+
+| depth | mean fix_gain | sum | share of the gap |
+|---|---|---|---|
+| layers 0–11 | +0.0003 | +0.0031 | **0.1%** |
+| layers 12–23 | +0.1073 | +1.2871 | 49% |
+| layers 24–35 | +0.2316 | +2.7790 | 105% |
+
+**The first third of the network contributes essentially nothing** — uniform weighting spent a
+third of the gradient on layers worth 0.1% of the outcome. Layers 22 (+0.774) and 30 (+0.754)
+alone account for 29% each. Diffusion noise is re-seeded identically before all 37 rollouts
+per clip, so the only difference between variants is the swapped layer.
+
+Caveats: the gains are **marginal, not additive** (they sum to 4.07 against a 2.64 gap,
+because each holds all other layers at student values), and the 36 point estimates are noisy
+— layer 22 at 6.79 beside layer 21 at 1.28 is more likely sampling noise than a real cliff.
+`ARM=kvband` therefore uses three depth **bands** (0.01 / 0.96 / 2.03, renormalised to mean
+1.0 so the total loss scale is unchanged and this is a direction change only).
 
 **More epochs help, but cannot close the gap.** Extra epochs of `kvonly` keep paying, and
 the per-epoch gain decays only slowly:
@@ -109,7 +166,7 @@ Two token-head signals did **not** survive the change of endpoint:
 
 ### Caveats
 
-* The residual gap is large and highly significant: `kvonly − teacher = +1.83` at 3 epochs. Closing 71%
+* The residual gap is large and highly significant: `blockonly − teacher = +1.45`. Closing 77%
   is a real effect, not parity — the student is still ~4.6× the teacher's error.
 * This student is a **generic Qwen3-VL-4B trained for one epoch, not warm-started** from an
   Alpamayo checkpoint. The relative arm ordering is what is established; whether KV
