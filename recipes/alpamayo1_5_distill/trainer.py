@@ -45,6 +45,7 @@ AUX_LOSS_KEYS = (
     "kv_loss_vision",
     "kv_loss_text",
     "kv_loss_traj",
+    "block_loss",
 )
 
 #: Parameters excluded from weight decay on top of HF's own bias/norm exclusions.
@@ -178,6 +179,7 @@ class KaVaTrainer(ReasoningVLA_Trainer):
             "latent": float(getattr(base, "latent_loss_weight", 0.0)),
             "kv": float(getattr(base, "kv_loss_weight", getattr(base, "kv_weight", 0.0))),
             "kd": float(getattr(base, "kd_weight", 0.0)),
+            "block": float(getattr(base, "block_weight", 0.0)),
         }
         try:
             norms = {}

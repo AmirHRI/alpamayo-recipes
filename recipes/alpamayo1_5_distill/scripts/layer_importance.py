@@ -156,6 +156,26 @@ def traj_distance(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(d.min())
 
 
+def _dump(path, done, base_gap, fix, brk):
+    """Write the profile so far. Called every few clips so a kill keeps what it earned."""
+    mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
+    result = {
+        "n_clips": done,
+        "seed": ROLLOUT_SEED,
+        "baseline_student_teacher_gap": mean(base_gap),
+        # Normalised by the baseline gap: the absolute values drift while the denominator
+        # settles (4.79 at n=5 -> 3.46 at n=50 on the first run), but the RANKING is what
+        # this exists to produce and it is scale-free.
+        "fix_gain_frac": {l: (mean(v) / mean(base_gap) if base_gap else float("nan"))
+                          for l, v in fix.items()},
+        "fix_gain": {l: mean(v) for l, v in fix.items()},
+        "break_cost": {l: mean(v) for l, v in brk.items()},
+    }
+    with open(path, "w") as fh:
+        json.dump(result, fh, indent=1)
+    return result
+
+
 @hydra.main(version_base=None, config_path=None, config_name="config")
 def main(cfg: DictConfig) -> None:
     probe = cfg.get("probe", {})
@@ -256,18 +276,15 @@ def main(cfg: DictConfig) -> None:
 
         done += 1
         if done % 5 == 0:
-            print(f"[probe] {done}/{n_clips} clips  mean student-teacher gap {sum(base_gap)/len(base_gap):.4f}", flush=True)
+            # ⚠️ DUMP INCREMENTALLY. Writing only at completion means a cancelled run loses
+            # everything: this probe was once killed at 50/100 clips and six GPU-hours of
+            # per-layer data went with it, because the progress lines carry only the running
+            # mean. A partial profile is the whole point of a long sweep.
+            _dump(out_path, done, base_gap, fix, brk)
+            print(f"[probe] {done}/{n_clips} clips  mean student-teacher gap "
+                  f"{sum(base_gap)/len(base_gap):.4f}  (partial dumped)", flush=True)
 
-    mean = lambda xs: sum(xs) / len(xs) if xs else float("nan")
-    result = {
-        "n_clips": done,
-        "seed": ROLLOUT_SEED,
-        "baseline_student_teacher_gap": mean(base_gap),
-        "fix_gain": {l: mean(v) for l, v in fix.items()},
-        "break_cost": {l: mean(v) for l, v in brk.items()},
-    }
-    with open(out_path, "w") as fh:
-        json.dump(result, fh, indent=1)
+    result = _dump(out_path, done, base_gap, fix, brk)
 
     print(f"\n[probe] {done} clips, baseline student-teacher trajectory gap "
           f"{result['baseline_student_teacher_gap']:.4f}")

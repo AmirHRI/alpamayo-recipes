@@ -22,6 +22,7 @@
 #   ARM=kv  sbatch slurm_train_kd.sh     # + all-token/all-layer KV alignment (full recipe)
 #   ARM=cekv   sbatch slurm_train_kd.sh  # CE + KV, no logit-KD
 #   ARM=kvonly sbatch slurm_train_kd.sh  # KV alone, no CE and no KD
+#   ARM=blockonly sbatch slurm_train_kd.sh  # L_block alone (teacher-forced block match)
 #   SMOKE=1 ARM=kv sbatch slurm_train_kd.sh
 #   RESUME=<ckpt> EPOCHS=3 ARM=kvonly sbatch slurm_train_kd.sh   # continue for more epochs
 #
@@ -88,6 +89,16 @@ case "$ARM" in
         # head (+4.38 min_ade vs control, z=+13.7). Removing it should let KV do better than
         # the 2.9554 the kv arm reached.
         EXTRA+=(++model.kd.kd_weight=0.0) ;;
+    blockonly)
+        # L_block ALONE -- teacher-forced block-output matching, no CE, no KD, no L_KV.
+        # Alone by design: every arm so far showed that adding objectives to a cache-matching
+        # term HURTS the expert head (logit-KD +4.38, and dropping CE from cekv bought -0.13).
+        # block_weight is nominally 1.0 and is NOT a tuning knob here: with a single loss and
+        # max_grad_norm=1.0 clipping active on every step (observed pre-clip norms 5.6-126),
+        # the gradient is renormalised to unit norm, so any uniform scaling of the sole loss
+        # is erased. The magnitude lever is `learning_rate`.
+        EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0
+                ++model.kd.kv_weight=0.0 ++model.kd.block_weight=1.0) ;;
     kvonly)
         # KV alone -- no CE, no KD. Asks whether the student needs token supervision at all
         # when the target is a cache read by the teacher's expert.
@@ -101,7 +112,7 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|blockonly)" >&2; exit 1 ;;
 esac
 RUN_TAG="$ARM"
 if [[ -n "$RESUME" ]]; then

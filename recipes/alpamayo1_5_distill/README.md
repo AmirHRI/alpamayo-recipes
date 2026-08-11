@@ -21,7 +21,7 @@ teacher-feature cache script, and configs.
 
 ---
 
-## Result: Qwen3-VL-4B student — KV alignment closes 70% of the gap to the teacher
+## Result: Qwen3-VL-4B student — KV alignment closes 71% of the gap to the teacher
 
 A second student line (Qwen3-VL-4B, chosen because its 36 layers and 8×128 kv-heads match
 the teacher's tower exactly) trained one epoch on LCDrive train (38,340 clips, effective
@@ -35,7 +35,8 @@ endpoint `L_KV` targets, because the expert self-attends over that cache.
 | arm | objectives | ade | min_ade | × teacher | Δ min_ade vs `ce` | gap closed |
 |---|---|---|---|---|---|---|
 | **teacher** (ceiling) | — | **1.3039** | **0.5776** | 1.00× | — | — |
-| **kvonly, 2 epochs** | KV | 3.8633 | **2.5061** | 4.34× | **−4.4887** (z = −13.9) | **+70%** |
+| **kvonly, 3 epochs** | KV | 3.8176 | **2.4098** | 4.17× | **−4.5850** (z = −14.1) | **+71%** |
+| kvonly, 2 epochs | KV | 3.8633 | 2.5061 | 4.34× | −4.4887 (z = −13.9) | +70% |
 | **kvonly** | KV | 4.1085 | 2.6313 | 4.56× | −4.3636 (z = −13.5) | +68% |
 | **cekv** | CE + KV | 4.9100 | 2.7601 | 4.78× | −4.2347 (z = −13.3) | +66% |
 | `kv` | CE + KD + KV | 5.9970 | 2.9554 | 5.12× | −4.0395 (z = −12.9) | +63% |
@@ -45,11 +46,21 @@ endpoint `L_KV` targets, because the expert self-attends over that cache.
 **Every objective other than KV alignment hurts this endpoint, monotonically.** Dropping
 logit-KD buys −0.1953 (z = −4.43); dropping CE as well buys a further −0.1289 (z = −3.09).
 
-**More epochs is not the lever.** A second full epoch of `kvonly` (12 h, 1,598 steps) moved
-min_ade 2.6313 → 2.5061 — real (paired −0.1251, z = −9.12) but worth only 2 more points of
-gap, against the 68 the first epoch bought. Training loss said the same thing in advance:
-`kv_loss` moved 0.5249 → ~0.5232 across that entire epoch. The residual **+1.93** to the
-teacher is a property of the objective or the student's capacity, not of undertraining.
+**More epochs help, but cannot close the gap.** Extra epochs of `kvonly` keep paying, and
+the per-epoch gain decays only slowly:
+
+| | min_ade | paired Δ vs previous epoch |
+|---|---|---|
+| epoch 1 | 2.6313 | — |
+| epoch 2 | 2.5061 | −0.1251 (z = −9.12) |
+| epoch 3 | 2.4098 | −0.0964 (z = −11.63) |
+
+Both steps are unambiguous, and the gain decayed only ~23% between them — so this is
+*diminishing*, not plateaued. But extrapolating that decay geometrically, every remaining
+epoch together is worth roughly −0.4 more, landing near 2.0 and still ~3.4× the teacher.
+Three epochs cost ~35 GPU-hours for −0.22 total. The residual **+1.83** is therefore a
+property of the objective or the student's capacity, not of undertraining, and the lever is
+the objective (see `models/block_losses.py`) or `kv_weight`, not more compute.
 
 The teacher scores 0.5776 here against 0.6413 on its own token head — two different heads
 agreeing to within 10% is what says the harness is sound rather than flattering one arm.
@@ -62,7 +73,8 @@ The same six checkpoints, scored on the student's **own trajectory-token head**
 | arm | EXPERT ade | EXPERT min_ade | TOKEN ade | TOKEN min_ade |
 |---|---|---|---|---|
 | teacher | 1.3039 | 0.5776 | 1.2111 | 0.6413 |
-| kvonly, 2 epochs | 3.8633 | **2.5061** *(best)* | not scored | not scored |
+| kvonly, 3 epochs | 3.8176 | **2.4098** *(best)* | not scored | not scored |
+| kvonly, 2 epochs | 3.8633 | 2.5061 | not scored | not scored |
 | kvonly | 4.1085 | 2.6313 | 37.5239 | **37.5239** *(worst)* |
 | cekv | 4.9100 | 2.7601 | 3.6427 | 2.9080 |
 | kv | 5.9970 | 2.9554 | 4.7516 | 3.1045 |
@@ -97,7 +109,7 @@ Two token-head signals did **not** survive the change of endpoint:
 
 ### Caveats
 
-* The residual gap is large and highly significant: `kvonly − teacher = +1.93` at 2 epochs. Closing 70%
+* The residual gap is large and highly significant: `kvonly − teacher = +1.83` at 3 epochs. Closing 71%
   is a real effect, not parity — the student is still ~4.6× the teacher's error.
 * This student is a **generic Qwen3-VL-4B trained for one epoch, not warm-started** from an
   Alpamayo checkpoint. The relative arm ordering is what is established; whether KV
