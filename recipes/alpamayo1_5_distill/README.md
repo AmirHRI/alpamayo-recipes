@@ -103,6 +103,48 @@ because each holds all other layers at student values), and the 36 point estimat
 `ARM=kvband` therefore uses three depth **bands** (0.01 / 0.96 / 2.03, renormalised to mean
 1.0 so the total loss scale is unchanged and this is a direction change only).
 
+### ⚠️ RETRACTED as an actionable direction: banding makes it WORSE
+
+`kvband` was trained and scored against its matched control. It lost, decisively:
+
+| arm (1 epoch) | min_ade | vs teacher | paired vs uniform |
+|---|---|---|---|
+| kvonly, uniform | **2.6313** | 4.56× | — |
+| kvband, banded | 3.1763 | 5.50× | **+0.5451** (z = +11.22) |
+
+Better on only 31.2% of clips. **The layer-importance measurement stands; the inference drawn
+from it does not.** A layer being cheap to *repair* in a trained model does not make it cheap
+to *starve* during training: down-weighting layers 0–11 by 100× plausibly degrades the
+representations layers 12–35 are built from, so the cache those later layers emit gets worse
+even though they kept full weight. Marginal importance measured post-hoc is not the same
+object as gradient value during optimisation.
+
+This also closes band-weighting `L_block`, which had been the obvious follow-up.
+
+### Layer CKA on the action expert (`scripts/expert_cka.py`)
+
+An independent, *representational* view — linear CKA (Kornblith et al.) between the frozen
+expert's own layers, with the reference implementation vendored from CLP_VLA and self-tested
+against a faster Gram-space path (agreement 1e-15; `CKA(X,X) = 1`).
+
+Measured at 11 points along the flow, building `x_t = t·x_GT + (1−t)·ε` with
+`build_noisy_action` so every `(x_t, t)` is on-distribution and one noise draw is shared
+across the grid:
+
+* **Layers 6–14 do nearly all the representational work** (most active transitions L8, L7,
+  L11, L9, L6); **L17–L35 are near-identity** at every timestep.
+* Transformation **peaks at t ≈ 0.2–0.4**, not at either endpoint (corner CKA 0.181 at
+  t=0.2 vs 0.572 at t=1) — so `t=0`, the only point `L_block` supervises, is already off the
+  peak. This is the argument for a random-`t` variant.
+* **Train and val are indistinguishable** (n=64 each, zero overlap, seeded samples): C-matrix
+  correlation **0.9870**, mean |diff| 0.0005, same five most-active transitions in the same
+  order. The structure is architectural, not memorised.
+
+⚠️ CKA is representational, NOT causal, and it points the OPPOSITE way to the cache-swap
+sweep: the layers that transform the representation are 6–14, while the layers where the
+cache causally mattered were 24–35. Given the `kvband` result above, "prune L17–35 because
+they are near-identity" is a hypothesis awaiting a causal test, not a finding.
+
 **More epochs help, but cannot close the gap.** Extra epochs of `kvonly` keep paying, and
 the per-epoch gain decays only slowly:
 
