@@ -116,6 +116,42 @@ class FrozenExpert(nn.Module):
             raise RuntimeError(f"frozen expert load failed: unexpected={unexpected[:5]} missing={bad[:5]}")
         logger.info(f"[block] frozen expert: {len(state)} tensors, {len(self.expert.layers)} layers")
 
+    def noisy_action_embeds(self, traj_data: dict, t: torch.Tensor, device, dtype):
+        """Action embeddings at a SAMPLED point on the flow, built from the GT trajectory.
+
+        Reproduces ``FlowMatching.construct_training_data``'s interpolation exactly --
+        ``noisy_x = t * x + (1 - t) * noise`` -- with ``x`` the ground-truth action. At t=0
+        this reduces to :meth:`initial_action_embeds` (pure noise); at t=1 it is the true
+        action. Supervising only t=0, as the original L_block did, covers the single noisiest
+        point on the flow; CKA showed the expert transforms its representation MOST around
+        t~0.2-0.4, which is why sampling t is worth testing.
+
+        ⚠️ The same (x_t, t) drives BOTH sides of the block loss, so the teacher-forcing
+        argument is untouched: Q, K_a and V_a stay identical by construction and the VLM
+        cache remains the only difference.
+        """
+        action = self.action_space.traj_to_action(
+            traj_history_xyz=traj_data["ego_history_xyz"],
+            traj_history_rot=traj_data["ego_history_rot"],
+            traj_future_xyz=traj_data["ego_future_xyz"],
+            traj_future_rot=traj_data["ego_future_rot"],
+        ).reshape(-1, *self.x_dims).to(device=device, dtype=torch.float32)
+        noise = torch.randn(action.shape, device=device, dtype=torch.float32)
+        t = t.to(device=device, dtype=torch.float32)
+        while t.dim() < action.dim():
+            t = t.unsqueeze(-1)
+        x_t = t * action + (1.0 - t) * noise
+        # autocast, not a manual cast -- action_in_proj mixes precisions internally; see
+        # initial_action_embeds for the full reason.
+        with torch.autocast(device.type, dtype=dtype):
+            embeds = self.action_in_proj(x_t, t)
+        if embeds.dim() == 2:
+            embeds = embeds.view(x_t.shape[0], self.n_action_tokens, -1)
+        # ⚠️ .to(dtype) like initial_action_embeds: action_in_proj ends in a LayerNorm, which
+        # autocast keeps in fp32, so the raw output meets the expert's bf16 weights and
+        # raises "expected mat1 and mat2 to have the same dtype".
+        return embeds.to(dtype)
+
     def initial_action_embeds(self, batch: int, device, dtype) -> torch.Tensor:
         """Action embeddings for the sampler's FIRST denoising step.
 

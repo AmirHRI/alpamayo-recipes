@@ -70,6 +70,55 @@ logger = logging.getLogger(__name__)
 TEACHER_PREFIXES = ("expert.", "action_in_proj.", "action_out_proj.")
 
 
+
+class _SkippedExpertLayer(torch.nn.Module):
+    """Identity stand-in for an ablated expert decoder layer.
+
+    ⚠️ It REPLACES the layer in-place rather than shortening the ModuleList, so every
+    surviving layer keeps its original index. That matters: expert layer ``l`` reads VLM
+    cache layer ``l``, so re-indexing would silently re-pair every layer above the cut with
+    the wrong cache and measure something else entirely.
+
+    The skipped layer never appends its action K/V to cache slot ``l``; nothing reads that
+    slot once the layer is gone, and the other slots are untouched.
+    """
+
+    def __init__(self, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
+
+    def forward(self, hidden_states, *args, **kwargs):
+        # ⚠️ Return the BARE tensor, matching what this transformers version's Qwen3 decoder
+        # layer returns. Wrapping it in a tuple crashes the caller with
+        # "'tuple' object has no attribute 'dtype'" -- the enclosing model uses the result
+        # directly, it does not unpack it.
+        return hidden_states
+
+
+def _apply_expert_pruning(model) -> None:
+    """Ablate expert layers named by ``PRUNE_EXPERT_LAYERS`` (comma-separated indices).
+
+    A measurement tool, not a deployment path -- the compute is unchanged, the layer is
+    simply bypassed. It exists to test causally whether layers that CKA calls near-identity
+    can be removed without hurting the trajectory.
+    """
+    spec = os.environ.get("PRUNE_EXPERT_LAYERS", "").strip()
+    if not spec:
+        return
+    idx = sorted({int(x) for x in spec.split(",") if x.strip()})
+    layers = model.expert.layers
+    bad = [i for i in idx if not 0 <= i < len(layers)]
+    if bad:
+        raise ValueError(f"PRUNE_EXPERT_LAYERS out of range for {len(layers)} layers: {bad}")
+    for i in idx:
+        layers[i] = _SkippedExpertLayer(i)
+    logger.warning(
+        "[stitch] PRUNED expert layers %s -- %d of %d bypassed (identity)",
+        idx, len(idx), len(layers),
+    )
+    print(f"[stitch] PRUNED expert layers {idx} ({len(idx)}/{len(layers)})", flush=True)
+
+
 def _load_teacher_non_vlm(checkpoint_path: str, model: torch.nn.Module) -> None:
     """Load the teacher's expert + action projections, leaving ``vlm.*`` untouched.
 
@@ -304,6 +353,7 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         model = cls(config, pretrained_modules=pretrained_modules or None)
         model = load_alpamayo1_vlm(checkpoint_path, model)
         _load_teacher_non_vlm(teacher_checkpoint_path or checkpoint_path, model)
+        _apply_expert_pruning(model)
         return model
 
     def sample_trajectories_from_data(self, data: dict[str, Any], **kwargs: Any):  # type: ignore[override]

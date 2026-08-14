@@ -24,6 +24,7 @@
 #   ARM=kvonly sbatch slurm_train_kd.sh  # KV alone, no CE and no KD
 #   ARM=kvband sbatch slurm_train_kd.sh  # KV alone with depth-banded layer weights
 #   ARM=blockonly sbatch slurm_train_kd.sh  # L_block alone (teacher-forced block match)
+#   ARM=blockrandt sbatch slurm_train_kd.sh # L_block with t sampled, not pinned to 0
 #   SMOKE=1 ARM=kv sbatch slurm_train_kd.sh
 #   RESUME=<ckpt> EPOCHS=3 ARM=kvonly sbatch slurm_train_kd.sh   # continue for more epochs
 #
@@ -90,6 +91,20 @@ case "$ARM" in
         # head (+4.38 min_ade vs control, z=+13.7). Removing it should let KV do better than
         # the 2.9554 the kv arm reached.
         EXTRA+=(++model.kd.kd_weight=0.0) ;;
+    blockrandt)
+        # L_block with t SAMPLED from the teacher's own training schedule (Beta(1.5,1.0)
+        # rescaled by 0.999), instead of pinned to t=0. Same cost per step -- one expert
+        # forward either way -- so any difference is attributable to WHERE on the flow the
+        # cache is supervised, not to extra compute.
+        # Motivation: CKA on the frozen expert shows it transforms its representation most
+        # around t~0.2-0.4 and least at t=1, while the original L_block supervised only t=0.
+        # Control: `blockonly` at 1 epoch (stitched min_ade 2.0293), same init, schedule and
+        # budget.
+        # ⚠️ model.kd.* -- NOT model.*. Hydra's `++` CREATES a missing key instead of
+        # erroring, so the wrong prefix silently leaves every default weight in place and
+        # trains the all-objectives config under this arm's name.
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
     blockonly)
         # L_block ALONE -- teacher-forced block-output matching, no CE, no KD, no L_KV.
         # Alone by design: every arm so far showed that adding objectives to a cache-matching
@@ -124,7 +139,7 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt)" >&2; exit 1 ;;
 esac
 RUN_TAG="$ARM"
 if [[ -n "$RESUME" ]]; then

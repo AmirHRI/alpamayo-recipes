@@ -73,6 +73,20 @@ class KaVaExpertTeacher(TrainableAlpamayoR1):
 
     generate_cot_prefix = DistillReasoningVLA.generate_cot_prefix
 
+    @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        """Load the teacher, then honour ``PRUNE_EXPERT_LAYERS`` if it is set.
+
+        Shares the exact hook the stitched EVAL uses, so a training run and its ablation
+        cannot silently disagree about which layers are gone. Unset -> no pruning, and this
+        is a plain passthrough.
+        """
+        from alpamayo1_5_distill.models.stitched_model import _apply_expert_pruning
+
+        model = super().from_pretrained(*args, **kwargs)
+        _apply_expert_pruning(model)
+        return model
+
 
 @contextmanager
 def _capture_expert_queries(

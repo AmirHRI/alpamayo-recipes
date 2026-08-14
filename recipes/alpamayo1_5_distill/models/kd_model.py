@@ -162,6 +162,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
 
     ce_weight: float = 1.0
     block_weight: float = 0.0
+    block_timestep: str = "zero"
     kd_weight: float = 0.0
     kd_temperature: float = 1.0
     kv_weight: float = 0.0
@@ -187,6 +188,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
         teacher: nn.Module | None = None,
         ce_weight: float = 1.0,
         block_weight: float = 0.0,
+        block_timestep: str = "zero",
         kd_weight: float = 0.0,
         kd_temperature: float = 1.0,
         kv_weight: float = 0.0,
@@ -211,6 +213,17 @@ class KDReasoningVLA(TrainableReasoningVLA):
         """
         self.ce_weight = float(ce_weight)
         self.block_weight = float(block_weight)
+        # "zero"  -> x ~ N(0,I) at t=0, the sampler's first step (the original L_block)
+        # "beta"  -> t ~ the TEACHER'S OWN training schedule, Beta(1.5,1.0) rescaled by
+        #            0.999 (flow_matching.py:54-58); mass concentrated at low t
+        # "uniform" -> t ~ U(0,1)
+        if block_timestep not in ("zero", "beta", "uniform"):
+            raise ValueError(f"block_timestep must be zero|beta|uniform, got {block_timestep}")
+        self.block_timestep = str(block_timestep)
+        self._beta_dist = (
+            torch.distributions.beta.Beta(torch.tensor(1.5), torch.tensor(1.0))
+            if block_timestep == "beta" else None
+        )
         # ⚠️ Held OUTSIDE nn.Module registration, exactly like the teacher: a registered 2.28 B
         # frozen expert would enter the optimizer, the ZeRO shard and every 68 GB checkpoint.
         self._expert_holder: list = []
@@ -453,7 +466,17 @@ class KDReasoningVLA(TrainableReasoningVLA):
         handle = self._text_model().rotary_emb.register_forward_hook(hook)
         return store, handle
 
-    def _block_loss(self, student_kv, teacher_kv, rope, traj_mask, attn_mask):
+    def _sample_block_t(self, b: int, device) -> torch.Tensor:
+        """One timestep per batch element, on the teacher's own training schedule."""
+        if self.block_timestep == "zero":
+            return torch.zeros(b, device=device)
+        if self.block_timestep == "uniform":
+            return torch.rand(b, device=device)
+        t = self._beta_dist.sample((b,)).to(device)
+        return 0.999 - t * 0.999          # flow_matching.py:148-149, verbatim
+
+    def _block_loss(self, student_kv, teacher_kv, rope, traj_mask, attn_mask,
+                    traj_data=None):
         """L_block = mean_l || B_l(h_l^T; K_s,V_s) - sg B_l(h_l^T; K_t,V_t) ||^2.
 
         ⚠️ The per-layer re-run reuses the EXACT kwargs the expert's own forward handed each
@@ -500,7 +523,11 @@ class KDReasoningVLA(TrainableReasoningVLA):
             return hook
 
         with torch.no_grad():
-            embeds = expert.initial_action_embeds(b, device, dtype)
+            if self.block_timestep == "zero" or traj_data is None:
+                embeds = expert.initial_action_embeds(b, device, dtype)
+            else:
+                t_s = self._sample_block_t(b, device)
+                embeds = expert.noisy_action_embeds(traj_data, t_s, device, dtype)
             n_act = embeds.shape[1]
             pos = torch.arange(first_traj, first_traj + n_act, device=device)[None].expand(b, -1)
             e_mask = torch.ones((b, first_traj + n_act), dtype=torch.bool, device=device)
@@ -662,8 +689,19 @@ class KDReasoningVLA(TrainableReasoningVLA):
                     t_kv_b = recompute_kv(self._teacher_text_model(), t_out.hidden_states, h, d)
                 if len(s_kv) != len(t_kv_b):
                     raise RuntimeError(f"layer count differs: student {len(s_kv)} teacher {len(t_kv_b)}")
+                _traj = None
+                if self.block_timestep != "zero":
+                    if ego_future_xyz is None:
+                        raise RuntimeError(
+                            "block_timestep != zero needs the GT trajectory; ego_future_xyz "
+                            "is None. Sampling t without it would silently fall back to t=0."
+                        )
+                    _traj = {"ego_history_xyz": ego_history_xyz,
+                             "ego_history_rot": ego_history_rot,
+                             "ego_future_xyz": ego_future_xyz,
+                             "ego_future_rot": ego_future_rot}
                 block_loss = self._block_loss(s_kv, t_kv_b, rope, traj_mask,
-                                              tokenized_data.get("attention_mask"))
+                                              tokenized_data.get("attention_mask"), _traj)
                 total_loss = total_loss + self.block_weight * block_loss
                 attached["block"] = block_loss
                 del s_kv, t_kv_b

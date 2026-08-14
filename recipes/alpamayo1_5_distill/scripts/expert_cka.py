@@ -175,12 +175,47 @@ def main(cfg: DictConfig) -> None:
     out_dir = c.get("out_dir", f"{TRAIN}/cka")
     os.makedirs(out_dir, exist_ok=True)
 
+    module = str(c.get("module", "expert"))       # "expert" | "vlm"
+    # ⚠️ front_only changes the MODEL'S INPUT, so it measures a different operating point --
+    # the teacher never runs with one camera. It is a comparison between two states, not a
+    # cheaper measurement of the deployed one. Filtering happens BEFORE preprocessing because
+    # the image placeholders in input_ids are emitted per image; dropping images afterwards
+    # would desync tokens from pixels.
+    if bool(c.get("front_only", False)):
+        import alpamayo.data.pai as _pai
+        from alpamayo.common.constants import CAMERA_NAMES_TO_INDICES, FRONT_WIDE_CAMERA_NAME
+        _orig = _pai.load_physical_aiavdataset
+        _want = CAMERA_NAMES_TO_INDICES[FRONT_WIDE_CAMERA_NAME]
+        _nf = int(c.get("n_frames", 4))
+
+        def _front_only(*a, **kw):
+            d = _orig(*a, **kw)
+            ci = d["camera_indices"]
+            keep = (ci == _want).nonzero().flatten()
+            n_chunk = int(ci.shape[0])
+            d["camera_indices"] = ci[keep]
+            for k, v in list(d.items()):
+                if torch.is_tensor(v) and v.dim() >= 1 and v.shape[0] == n_chunk and k != "camera_indices":
+                    d[k] = v[keep]
+            for k in ("image_frames", "absolute_timestamps", "relative_timestamps"):
+                if k in d and torch.is_tensor(d[k]) and d[k].dim() >= 2:
+                    d[k] = d[k][:, :_nf]
+            return d
+
+        _pai.load_physical_aiavdataset = _front_only
+        print(f"[cka] FRONT-WIDE ONLY, {_nf} frames -> {_nf} images "
+              f"(vs 7 cameras normally)", flush=True)
+    n_tokens = int(c.get("n_tokens", 256))
     device = torch.device("cuda")
     model = StitchedAlpamayoR1.from_teacher(
         checkpoint_path=TEACHER_CKPT, vlm_name_or_path=COSMOS, attn_implementation="sdpa"
     ).to(device=device).eval()
-    layers, path = expert_layers(model)
-    print(f"[cka] expert layers: {len(layers)} via model.{path}", flush=True)
+    if module == "vlm":
+        layers = model.vlm.model.language_model.layers
+        path = "vlm.model.language_model.layers"
+    else:
+        layers, path = expert_layers(model)
+    print(f"[cka] {module} layers: {len(layers)} via model.{path}", flush=True)
 
     # ⚠️ SEEDED RANDOM sample, and the chosen ids are written out. Earlier runs took the
     # dataset's first n clips (shuffle=False + break), which is a prefix, not a sample: on the
@@ -200,6 +235,160 @@ def main(cfg: DictConfig) -> None:
                          _convert_="partial", model_config=model.config)
     collate = hyu.instantiate(cfg.data.collate_fn, _convert_="partial", model_config=model.config)
     loader = DataLoader(ds, batch_size=1, collate_fn=collate, num_workers=2, shuffle=False)
+
+    if module == "vlm":
+        # ⚠️ NO t axis here, deliberately. The VLM runs ONCE, before denoising, and its cache
+        # is consumed unchanged at every Euler step -- there is no x_t to condition on. A
+        # "VLM CKA at t=0.5" would be the same numbers relabelled.
+        # ⚠️ Only the PREFILL is recorded (seq_len > 1). The AR decode steps that follow have
+        # seq_len == 1, whose 1x1 Gram makes CKA degenerate (0/0 after centering).
+        vstore: dict[int, list[np.ndarray]] = {i: [] for i in range(len(layers))}
+        done = {"n": -1}
+
+        def vhook(idx):
+            def f(_m, _args, output):
+                y = output[0] if isinstance(output, tuple) else output
+                if y.shape[1] <= 1 or done["n"] == len(vstore[idx]) - 1:
+                    return                          # decode step, or this clip already taken
+                if idx == 0:
+                    print(f"[cka] PREFILL seq_len = {y.shape[1]}", flush=True)
+                a = y.detach().float().cpu().numpy()[0]          # (S, D)
+                # Evenly spaced positions: sequences differ in length across clips, and the
+                # prefix mixes image patches with text, so an even stride keeps both.
+                idxs = np.linspace(0, a.shape[0] - 1, min(n_tokens, a.shape[0])).astype(int)
+                vstore[idx].append(a[idxs])
+            return f
+
+        hs = [layers[i].register_forward_hook(vhook(i)) for i in range(len(layers))]
+        try:
+            for n, batch in enumerate(loader):
+                if n >= n_clips:
+                    break
+                cid = batch["clip_id"]
+                seen = cid[0] if isinstance(cid, list) else str(cid)
+                gpu = send_to_device(dict(batch), device)
+                torch.manual_seed(1234)
+                done["n"] = n - 1
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=gpu, num_traj_samples=1, num_traj_sets=1,
+                        top_p=0.98, temperature=0.6, max_generation_length=256,
+                    )
+                if (n + 1) % 10 == 0:
+                    print(f"[cka] {n + 1}/{n_clips} clips", flush=True)
+        finally:
+            for h in hs:
+                h.remove()
+
+        acts = [np.stack(vstore[i]) for i in range(len(layers))]
+        print(f"[cka] activations per layer: {acts[0].shape} (clips, tokens, channels)",
+              flush=True)
+        _selftest(acts)
+        grams = [centered_grams(a.astype(np.float64)) for a in acts]
+        Mv = cka_matrix_from_grams(grams)
+        np.savez(os.path.join(out_dir, "cka_vlm_teacher.npz"), cka=Mv,
+                 n_clips=len(acts[0]), n_tokens=acts[0].shape[1], clips=np.array(chosen))
+        np.save(os.path.join(out_dir, "reps_vlm.npy"), np.stack(acts).astype(np.float16))
+        fig, ax = plt.subplots(figsize=(7.2, 6.1))
+        im = ax.imshow(Mv, vmin=0, vmax=1, cmap="viridis", interpolation="nearest")
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04).set_label("linear CKA", fontsize=9)
+        tk = list(range(0, len(layers), 4))
+        ax.set_xticks(tk); ax.set_yticks(tk)
+        ax.set_xticklabels(tk, fontsize=8); ax.set_yticklabels(tk, fontsize=8)
+        ax.set_xlabel("VLM layer"); ax.set_ylabel("VLM layer")
+        ax.set_title(f"Teacher VLM — layer CKA\nn={len(acts[0])} clips, "
+                     f"{acts[0].shape[1]} prefill tokens", fontsize=10)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "cka_vlm_teacher.png"), dpi=130); plt.close(fig)
+        adj = [Mv[i, i + 1] for i in range(len(layers) - 1)]
+        print(f"[cka] VLM adjacent: mean {np.mean(adj):.4f}  min {min(adj):.4f} "
+              f"(L{int(np.argmin(adj))}->L{int(np.argmin(adj)) + 1})  "
+              f"corner CKA(L0,L{len(layers) - 1})={Mv[0, -1]:.4f}", flush=True)
+        return
+
+    if str(c.get("source", "gt_interp")) == "rollout":
+        # ⚠️ ON-POLICY: x_t is whatever the model's OWN Euler loop visits, not
+        # t*x_GT + (1-t)*eps. No GT is used at all. The expert is invoked once per denoising
+        # step, so invocation index == step, and `_euler` uses t_i = i/inference_step ->
+        # steps land on t = 0.0 .. 0.9 (there is no forward pass AT t=1.0; the last step
+        # integrates 0.9 -> 1.0). Comparing this against the GT-interpolation run measures
+        # the train/inference distribution gap in representation space.
+        n_steps = int(c.get("n_steps", 10))
+        rstore: dict[tuple[int, int], list[np.ndarray]] = {}
+        cur_step = {"i": -1}
+
+        def step_hook(_m, _args, _kw):
+            cur_step["i"] += 1
+            return None
+
+        def rhook(idx):
+            def f(_m, _args, output):
+                i = cur_step["i"]
+                if 0 <= i < n_steps:
+                    y = output[0] if isinstance(output, tuple) else output
+                    rstore.setdefault((i, idx), []).append(
+                        y.detach().float().cpu().numpy()[0])
+            return f
+
+        ph = model.expert.register_forward_pre_hook(step_hook, with_kwargs=True)
+        hs = [layers[i].register_forward_hook(rhook(i)) for i in range(len(layers))]
+        seen_clips = []
+        try:
+            for n, batch in enumerate(loader):
+                if n >= n_clips:
+                    break
+                cid = batch["clip_id"]
+                seen_clips.append(cid[0] if isinstance(cid, list) else str(cid))
+                cur_step["i"] = -1
+                gpu = send_to_device(dict(batch), device)
+                torch.manual_seed(1234)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    model.sample_trajectories_from_data_with_vlm_rollout(
+                        data=gpu, num_traj_samples=1, num_traj_sets=1,
+                        top_p=0.98, temperature=0.6, max_generation_length=256,
+                    )
+                if (n + 1) % 10 == 0:
+                    print(f"[cka] {n + 1}/{n_clips} clips", flush=True)
+        finally:
+            ph.remove()
+            for h in hs:
+                h.remove()
+
+        steps = sorted({k[0] for k in rstore})
+        print(f"[cka] captured denoising steps: {steps}", flush=True)
+        mats = {}
+        for si in steps:
+            acts = [np.stack(rstore[(si, i)]) for i in range(len(layers))]
+            if si == steps[0]:
+                print(f"[cka] activations per layer: {acts[0].shape}", flush=True)
+                _selftest(acts)
+            mats[si] = cka_matrix_from_grams(
+                [centered_grams(a.astype(np.float64)) for a in acts])
+            adj = [mats[si][l - 1, l] for l in range(1, len(layers))]
+            print(f"[cka] step {si} (t={si / n_steps:.2f})  corner "
+                  f"{mats[si][0, -1]:.4f}  mean adj {np.mean(adj):.4f}  min adj "
+                  f"{min(adj):.4f} (L{int(np.argmin(adj))}->L{int(np.argmin(adj)) + 1})",
+                  flush=True)
+        C = np.stack([[mats[si][l - 1, l] for l in range(1, len(layers))] for si in steps])
+        np.save(os.path.join(out_dir, "C_adjacent_cka.npy"), C)
+        np.savez(os.path.join(out_dir, "cka_expert_rollout.npz"),
+                 steps=np.array(steps), clip_ids=np.array(seen_clips),
+                 **{f"cka_s{si}": mats[si] for si in steps})
+        fig, ax = plt.subplots(figsize=(11, 0.55 * len(steps) + 2.0))
+        im = ax.imshow(C, aspect="auto", cmap="viridis", vmin=float(C.min()), vmax=1.0,
+                       interpolation="nearest")
+        ax.set_yticks(range(len(steps)))
+        ax.set_yticklabels([f"step {si} (t={si / n_steps:.1f})" for si in steps], fontsize=8)
+        ax.set_xticks(range(0, len(layers) - 1, 2))
+        ax.set_xticklabels(list(range(1, len(layers), 2)), fontsize=7)
+        ax.set_xlabel("layer transition  l-1 -> l", fontsize=9)
+        fig.colorbar(im, ax=ax, fraction=0.03, pad=0.015).set_label("adjacent CKA", fontsize=8)
+        ax.set_title(f"Action expert, ON-POLICY x_t from the model's own sampler\n"
+                     f"dark = the layer acts   [scale {C.min():.3f}-1.000]", fontsize=10)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "C_adjacent_cka.png"), dpi=140); plt.close(fig)
+        print("[cka] wrote C_adjacent_cka.png", flush=True)
+        return
 
     # ⚠️ t is swept over the flow, not fixed at 0. `build_noisy_action` reproduces
     # FlowMatching's own `noisy_x = t*x + (1-t)*noise` from the clip's GROUND-TRUTH

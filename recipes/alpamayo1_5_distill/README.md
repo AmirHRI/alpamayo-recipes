@@ -121,6 +121,69 @@ object as gradient value during optimisation.
 
 This also closes band-weighting `L_block`, which had been the obvious follow-up.
 
+### More epochs of `L_block`, and sampling the timestep
+
+| arm | e1 | e2 | e3 |
+|---|---|---|---|
+| `blockonly` (t = 0) | 2.0293 | **1.7006** | **1.6576** |
+| `blockrandt` (t ~ Beta) | **1.9518** | running | running |
+| `kvonly` (uniform L_KV) | 2.6313 | — | 2.4098 |
+
+`blockonly` reaches **2.87× teacher** at 3 epochs and beats `kvonly` at matched budget by
+−0.7522 (z = −11.53). It has converged: e2−e1 = −0.3287 (z = −14.24) but **e3−e2 = −0.0430**
+(z = −2.89, better on only 51.7% of clips), and Lane Keeping Curve actually regresses
+3.491 → 3.644. More epochs is a spent lever.
+
+`ARM=blockrandt` samples `t` from the TEACHER'S OWN training schedule — `Beta(1.5,1.0)`
+rescaled by 0.999, verbatim from `flow_matching.py:148` — instead of pinning `t = 0`, with
+`x_t = t·x_GT + (1−t)·ε` built from the ground-truth trajectory. Same cost per step, so the
+only variable is WHERE on the flow the cache is supervised. It buys **−0.0775 (z = −3.89)**
+on min_ade and **−0.1819 (z = −4.93) on ADE** — over twice the effect on the single-draw
+metric, i.e. it improves the typical sample more than the best-of-6.
+
+Worth noting the `ade/min_ade` ratio: teacher **2.26**, block arms 1.74–1.82, `kvonly`
+1.56–1.58. The students are not just less accurate, they are less DIVERSE, which is why
+best-of-6 flatters them less than it flatters the teacher.
+
+### ⚠️ Pruning the expert: three refutations of layer statistics
+
+Bypassing 8 of 36 expert layers (identity stand-ins, indices preserved so layer *l* still
+reads cache *l*), teacher VLM, n=1000:
+
+| set | chosen by | min_ade | vs teacher |
+|---|---|---|---|
+| none | — | 0.5776 | — |
+| **C** `{4,10,13,15,19,25,27,34}` | depth-aligned, scattered, deepstack-protected | **0.7893** | **+37%** |
+| B `{18,19,24,25,27,32,33,34}` | CKA | 0.9306 | +61% |
+| A `{18,19,24,25,32,33,34,35}` | CKA | 0.9323 | +61% |
+
+**No similarity metric survived a causal test.** CKA picked A/B (+61%). Set C — chosen from
+STRUCTURAL constraints rather than a metric — beat them by −0.143 (z = −5.97) but is still
++37%. A and B are statistically indistinguishable (z = −0.07), so the last layer is not
+special either.
+
+The structural constraints that mattered, none of them visible to a similarity metric:
+
+* **Depth alignment.** Expert layer *j* reads cache layer *j*; removing 8 uniformly keeps
+  `(i−k)/28 = i/36`, so every survivor reads a cache at its original relative depth. A
+  contiguous cut shifts everything above it by 8.
+* **Deepstack.** `modeling_qwen3_vl.py` injects the 3 multi-level ViT features into LLM
+  layers **0,1,2** (`layer_idx in range(len(deepstack_visual_embeds))`). Expert layers 0–2
+  read those caches; C leaves them alone.
+* **Spans are super-additive.** Removing L2–L6 costs 1.94× the sum of its per-block BIs, so
+  scattered removals beat contiguous runs.
+
+Metrics computed and their verdicts (`scripts/expert_cka.py`, reps saved so all of this is
+re-derivable with no GPU): CKA says L18–L35 are near-identity — REFUTED. Cosine, Block
+Influence (`1 − cos`) and angular distance (`arccos(cos)/π`) are monotone transforms of each
+other, so they are ONE metric in three forms, and they all point at the early blocks —
+untested. CKA disagrees with the rest because it is invariant to rotation, and a layer that
+rotates the representation scores ~1 while still moving the vectors the next layer reads.
+
+⚠️ These ablations bypass layers **without retraining**, and keep original cache indices. The
++0.212 for set C is the pre-training bar, not a ceiling; `configs/sft_prunedexpert_10b_lcdrive.yaml`
+trains the pruned expert against the teacher's own cache to find out how much comes back.
+
 ### Layer CKA on the action expert (`scripts/expert_cka.py`)
 
 An independent, *representational* view — linear CKA (Kornblith et al.) between the frozen
