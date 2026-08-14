@@ -1,0 +1,35 @@
+# Local (no-Slurm) variant of sft_eval_10b_token_lcdrive with paths fixed for
+# this machine:
+#   - data at /data/02/achahe/physical_ai_av
+#   - LCDrive val UUID filter under alpamayo-recipes/lcdrive_physicalai_av_manifests
+#   - model checkpoint/vlm paths overridden on the CLI to the resolved HF snapshot
+#     dirs (see run_eval_10b_local.sh)
+#   - writable output_dir under /home/achahe
+defaults:
+  - sft_base
+  - /models/alpamayo_1_5_10b_token@model
+  - _self_
+
+data:
+  train_dataset:
+    local_dir: /data/02/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /home/achahe/alpamayo-recipes/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+  val_dataset:
+    local_dir: /data/02/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /home/achahe/alpamayo-recipes/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+
+trainer:
+  report_to: none
+  per_device_eval_batch_size: 8
+
+paths:
+  output_dir: /home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_eval_10b_token_lcdrive
+
+evaluate:
+  # Model weights come from the model config's checkpoint_path
+  # (from_alpamayo_checkpoint), so leave eval_ckpt null to avoid overriding it.
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_eval_10b_token_lcdrive

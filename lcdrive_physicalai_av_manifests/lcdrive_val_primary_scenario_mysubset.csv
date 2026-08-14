@@ -1,0 +1,1001 @@
+clip_uuid,split,scenario_category,scenario_category_paper
+21a558bb-2f65-47da-95cb-f6f49e5a88c0,val,Turning Maneuver,Turning Maneuver
+b8c50258-803f-4ab1-b97a-8cbace3cd83c,val,Merging,Merging
+91e67eb8-ec7d-464f-acb9-21cea525048d,val,General Training/Validation,General Driving
+05c66993-06a5-4884-849f-ae8380e364bf,val,Nudge Maneuver,Nudge Maneuver
+5708350a-9acf-4bb7-b44c-0c0756970975,val,Stop for Vehicle,Stop for Vehicle
+66caac45-0fd4-40be-9791-c9fcf2670404,val,Cut-In,Cut-In
+7335e5be-2dec-4289-9633-9cdae3faf550,val,General Training/Validation,General Driving
+5e597ce0-f352-4c70-8b36-1fbee55cf272,val,General Training/Validation,General Driving
+fb8f186f-c3d7-4298-bfa4-71a5e12b45d5,val,General Training/Validation,General Driving
+e0188448-cd83-40f9-a236-cd5511bcdc8d,val,Stop for Vehicle,Stop for Vehicle
+fd79afcd-d376-4eb8-9eb9-dc192d5af0a8,val,Lead Vehicle Following,Lead Vehicle Following
+2ad39007-8297-42fe-ae0c-3f70677b121f,val,Nudge Maneuver,Nudge Maneuver
+850e2441-3008-4bc1-840d-97a280c8556f,val,Lane Change,Lane Change
+fc6e5cd5-6c19-4d43-b767-a7e4a28a503c,val,General Training/Validation,General Driving
+65607a9e-888d-47a8-bc8c-307922238a4a,val,Speed Control,Speed Control
+0e81524b-d351-487d-a096-eab63a7ffaac,val,General Training/Validation,General Driving
+401f9cf5-a11d-4d40-8887-9ec694d59d87,val,Intersection Navigation,Intersection Navigation
+90713ad8-53ab-42ed-96da-09804bb0324d,val,General Training/Validation,General Driving
+23ce771e-828f-4c89-90d0-26ee527df1a1,val,General Training/Validation,General Driving
+11b51791-d3f8-4141-858d-342c03101717,val,General Training/Validation,General Driving
+0484dc63-090f-499d-8cd1-a61da29074ec,val,General Training/Validation,General Driving
+90228100-7171-409b-92f8-88b048286aa2,val,Lead Vehicle Following,Lead Vehicle Following
+f920d449-adb7-4f77-9841-e5e59cc11e11,val,General Training/Validation,General Driving
+5fbf5faa-db02-4bb3-859f-319464080747,val,General Training/Validation,General Driving
+5e38e230-ec56-49cb-abdd-b60bbfa3522c,val,Merging,Merging
+3a037822-b64c-4c53-bed4-ebf17b01bf27,val,Lane Change,Lane Change
+12c45faa-f54a-4d10-ba65-5bdeffd1fca0,val,General Training/Validation,General Driving
+d1cb75b3-07c4-43d7-97d8-b99591156eb4,val,General Training/Validation,General Driving
+123c0b7e-a9dc-41e2-af2a-b3fda0796d4c,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+e4c40691-a3f7-44ae-95d3-63145b81817c,val,General Training/Validation,General Driving
+9a39b782-896b-4916-8f80-9b527564ba91,val,Traffic Control Compliance,Traffic Control Compliance
+e8bb9fd4-5579-4f40-b664-b6fd96b2a5f3,val,Stop for Vehicle,Stop for Vehicle
+3e5ef311-33a0-4db8-8a0c-436f7ee4cbf3,val,Speed Control,Speed Control
+b973e87c-d27b-4f60-b553-386885f26d39,val,Lane Change,Lane Change
+5a568072-4a0b-4e80-9e08-fab73437a188,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+9050eb66-88dc-43c1-b3ea-dc1c1cd34778,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+b349f24a-33a4-4fc6-ac3c-2ff9ceae0d68,val,Cut-In,Cut-In
+3691ab93-99be-4113-bf05-3212d1710437,val,Lane Keeping Curve,Lane Keeping Curve
+500b7fcb-4325-4b4e-84ef-305221f900dc,val,Intersection Navigation,Intersection Navigation
+a770ae47-758a-4d53-b43e-1715c20a0673,val,General Training/Validation,General Driving
+f9329515-3477-4f1f-bc93-66f6f72d8572,val,General Training/Validation,General Driving
+40c6c2b6-9dbf-4959-80c6-4345ecb96944,val,Turning Maneuver,Turning Maneuver
+2a277bb2-ad25-47ac-b002-960d6dbb1bbd,val,Lane Keeping,Lane Keeping
+3e5cafca-f636-47ca-8b4f-2a004155be87,val,Stop for Vehicle,Stop for Vehicle
+779db04a-18e0-4947-aeef-0f5ea96c120b,val,General Training/Validation,General Driving
+efa37fdb-1980-4ccf-b3dd-db8766578f21,val,Lane Change,Lane Change
+75bdfda7-af58-401e-a9e7-17f9bba287fb,val,Traffic Control Compliance,Traffic Control Compliance
+acaa63c5-d681-4982-baaf-46992f65bdfa,val,General Training/Validation,General Driving
+041fc6b4-d7bf-4b96-a7cd-93311f75c0b9,val,General Training/Validation,General Driving
+92353e24-9a1f-4c0f-894a-74240ded077b,val,Speed Control,Speed Control
+5a5437e5-d82a-4a93-ae4e-451c6b3b3240,val,General Training/Validation,General Driving
+5da9ab7b-5818-446e-939c-1505fb4f3157,val,General Training/Validation,General Driving
+15d5744c-1eeb-4137-85db-1bcc039708a7,val,General Training/Validation,General Driving
+7444dfca-7b74-4989-88c4-94d34e5ba6ab,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+6ccb073a-d5fe-474f-826c-9f908382c219,val,Merging,Merging
+76543613-2312-4207-86de-6b9e74f60c49,val,Speed Control,Speed Control
+b8f2c26d-e902-4b6b-9ded-da8817da8781,val,General Training/Validation,General Driving
+e47d0518-a48d-4c23-8d03-1195d3d38921,val,General Training/Validation,General Driving
+fd82ca76-54d4-4a89-bdc6-b83a377559c8,val,Turning Maneuver,Turning Maneuver
+06cd5b0e-bb05-462c-b726-e86652b056be,val,General Training/Validation,General Driving
+c11ccf9f-65fc-4054-b945-d514c5fc7943,val,Speed Control,Speed Control
+3258f359-4eba-42a9-9df9-98b7c85b6221,val,Lane Keeping,Lane Keeping
+5b85a7f6-b5c2-4710-bd3a-94471eb9f0ba,val,General Training/Validation,General Driving
+30f44087-cda7-4c7e-af3d-34f1d8f0c1e7,val,General Training/Validation,General Driving
+701aeea1-be40-49da-b6f1-f0ef37232b7b,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+897cd638-206f-47fa-8452-0e18b2ccd3a5,val,General Training/Validation,General Driving
+2c356b41-f41f-4466-a565-31e946f54fde,val,General Training/Validation,General Driving
+3b803a79-99d6-43ea-a0e0-fb71ac245c7e,val,Nudge Maneuver,Nudge Maneuver
+50fd88c6-f3f1-45d0-82f3-6955c021c304,val,General Training/Validation,General Driving
+b376830d-8938-4ff1-8f6d-50e5c4a25bc2,val,Speed Control,Speed Control
+04e6aedc-0cc5-4a7f-9874-82bf4ec38368,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+0d32e24d-d0b4-424d-9e2f-6a9dd43d7909,val,General Training/Validation,General Driving
+7438fc7e-0656-43ab-ae32-077a119b8b20,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+f319cdd0-3fa1-402e-ac7e-b45b9256be0c,val,General Training/Validation,General Driving
+ab34bb11-9a53-4f1d-a071-91a8d2d4f033,val,Intersection Navigation,Intersection Navigation
+e9184af5-f69d-4943-9139-8fb91051aec3,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+4107c8da-3b6e-41c3-8d66-6dac47aff0c9,val,Lane Keeping Curve,Lane Keeping Curve
+512b0b82-3136-4415-a772-85483b789667,val,Lane Change,Lane Change
+73e08af8-ba29-4913-a89a-097f2d842228,val,Speed Control,Speed Control
+8704f620-34f9-4a47-b543-990333f67ae0,val,Lane Keeping,Lane Keeping
+0f2a342c-42e2-4135-b5ed-190dd387707d,val,General Training/Validation,General Driving
+a2b8b54b-4296-441f-87c4-34f598eaed7f,val,Lead Vehicle Following,Lead Vehicle Following
+d9e43df0-32e9-4f42-a7ad-75da155ec4be,val,Lane Keeping Curve,Lane Keeping Curve
+4117d80d-bd9f-4b31-8af1-72d6ab68cf79,val,Turning Maneuver,Turning Maneuver
+c4e9cf93-7a5a-43eb-9c77-b4a05254c34d,val,Intersection Navigation,Intersection Navigation
+0c8aae50-d416-446c-af6f-e14e04955fff,val,Stop for Vehicle,Stop for Vehicle
+6eaf9e3d-e90b-4ead-a4ad-5d9751e35801,val,General Training/Validation,General Driving
+e336d1a2-c960-49da-93bc-e52c415aac54,val,Lead Vehicle Following,Lead Vehicle Following
+7aa696e2-02a2-4026-b04d-f9f22e1eec42,val,Lead Vehicle Following,Lead Vehicle Following
+62d95e82-7b7b-450e-9ad6-28715e505cc7,val,Merging,Merging
+6ad7eb35-8dd2-49e4-b7a9-6ef73b53cd99,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+abd7142e-dc90-484a-88d4-38853ac2d518,val,Lead Vehicle Following,Lead Vehicle Following
+b3064a48-59c6-4fca-a92e-6164fabcfc93,val,Intersection Navigation,Intersection Navigation
+a02994dc-c624-4b0d-81ea-fa0667e1aea5,val,General Training/Validation,General Driving
+0788cfe8-815f-40db-a600-e9596bf5f851,val,Lane Keeping,Lane Keeping
+733c7be4-4887-45b7-bd10-dbf28a13318a,val,Lead Vehicle Following,Lead Vehicle Following
+84ae8877-e65d-4d29-83c5-044455f0b1d7,val,Speed Control,Speed Control
+682fa0c3-2851-44c1-b99f-69294ab94cc9,val,General Training/Validation,General Driving
+fd0b35d4-2421-46c2-ba2f-f0391b2658c7,val,Lane Keeping Curve,Lane Keeping Curve
+b49969db-99f2-4741-abfb-eb23dc6e8fab,val,Lane Keeping,Lane Keeping
+a352dbc3-6e1e-4df7-9abd-8e9564f21467,val,Lane Change,Lane Change
+a2b81218-bc11-47f1-863f-ef39779ea02e,val,Merging,Merging
+c76490e4-4cfe-4ae8-aeb2-d39dfb01db35,val,General Training/Validation,General Driving
+5ef383f8-a552-48ec-8460-8fc0425680bd,val,Intersection Navigation,Intersection Navigation
+05076f1a-6c33-45a3-90d6-9e7768384993,val,General Training/Validation,General Driving
+30ef7e99-f25f-40df-93f4-5fa92f90e90f,val,Lane Keeping,Lane Keeping
+a902da9e-9c94-4138-9752-13e5b4118e6f,val,Lane Keeping,Lane Keeping
+13d740e7-ea87-455b-8daa-ad86f8d68bfa,val,Lane Change,Lane Change
+e3ac8f54-c48e-4d25-910f-433c13595b49,val,Cut-In,Cut-In
+ab791b0d-27ae-48d5-a4c6-280726f70181,val,General Training/Validation,General Driving
+69a6cd66-0682-4e8b-a8c6-02bae98dbb06,val,General Training/Validation,General Driving
+067611b5-5c64-46ee-9cbd-5768b09053eb,val,Speed Control,Speed Control
+1f825f99-159d-46c2-be2d-9c4070ba6f87,val,Lead Vehicle Following,Lead Vehicle Following
+f1d79648-6da8-4229-9432-6166ee9ad77b,val,Nudge Maneuver,Nudge Maneuver
+6f2ea44d-571d-4c7f-8850-fea9ae4570db,val,General Training/Validation,General Driving
+6af7e745-4054-48bb-88cc-e0cbf5d397a0,val,Lane Keeping Curve,Lane Keeping Curve
+e33d09d0-10d5-4aaf-bdcb-a2e882242fd8,val,Nudge Maneuver,Nudge Maneuver
+a8d3b0d3-1658-472b-ab21-87bfbc7e6016,val,Lane Keeping Curve,Lane Keeping Curve
+bc6bcbca-6cc5-4a0a-8113-c9b8a0571829,val,Lead Vehicle Following,Lead Vehicle Following
+23e35ed1-4ef9-4d58-8126-13c7df50b7b3,val,Nudge Maneuver,Nudge Maneuver
+34975179-408f-43bc-9b2a-3cdb19b3ef38,val,Lane Change,Lane Change
+d458b57a-14c7-4ac8-b60b-bdc7c2ff1b52,val,Intersection Navigation,Intersection Navigation
+a948a3ea-bc4b-4caa-8d64-20777d07da6f,val,General Training/Validation,General Driving
+3b3e82d8-fde5-4cee-8fc5-00d902732916,val,Cut-In,Cut-In
+700a72c4-3322-40ac-bcb1-613677edda98,val,General Training/Validation,General Driving
+0256545f-f9d9-42a1-ba54-b9f51a432fa8,val,Traffic Control Compliance,Traffic Control Compliance
+164d10bf-3f28-4886-a8f7-65a60fb2d000,val,Lane Keeping Curve,Lane Keeping Curve
+c159e706-7207-490b-9d3a-ffe8cc315064,val,General Training/Validation,General Driving
+4b5654e6-3d75-452c-bbdd-86ac0e1d5a2e,val,Intersection Navigation,Intersection Navigation
+6f87c7aa-6e6d-4bf8-9e1f-5c9eda182b4e,val,Speed Control,Speed Control
+8cc80d83-0938-4b29-8ea6-b7a27b6a5299,val,Lead Vehicle Following,Lead Vehicle Following
+10494342-fea8-4238-8d7b-bd2c4611fa00,val,Lane Keeping,Lane Keeping
+5b2754e5-8671-4fbe-8d70-2a3036bca866,val,Speed Control,Speed Control
+9566af5d-82be-4429-9edf-c1dfd4e03305,val,Stop for Vehicle,Stop for Vehicle
+9f306a1b-fcc0-42b6-bf52-5a194523866c,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+aafdca53-aa86-4201-96f4-1d2a28d41bdd,val,Lane Keeping,Lane Keeping
+cb5cae80-57be-47ac-8eff-5318a24c8d13,val,General Training/Validation,General Driving
+2d4b2db0-edb3-4aff-a512-9d072bd64cb4,val,General Training/Validation,General Driving
+29c00cca-cb38-4036-8b15-2648f8404dcb,val,Nudge Maneuver,Nudge Maneuver
+c5850c4f-75cb-425a-8664-8e7196242b8c,val,Merging,Merging
+72d7a22a-ef36-4b2b-9d74-7d77d5594cc6,val,General Training/Validation,General Driving
+691eb4a3-5d1c-46cf-94b9-e285fec5bcbc,val,Speed Control,Speed Control
+9d288f30-91c0-4c42-880e-fb6b988fbfd9,val,Nudge Maneuver,Nudge Maneuver
+3883e761-e839-49f4-8b55-aacea9a36d1c,val,General Training/Validation,General Driving
+dc16f952-fc13-4fda-a13e-ba861d9c2b9a,val,General Training/Validation,General Driving
+e0dcec7e-8b7b-4d8c-bf63-e6664c7fd966,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+ff30ada2-062d-42d8-a2fa-4ffc2dfe3435,val,Lane Keeping Curve,Lane Keeping Curve
+b4fa8ba8-1f29-4c73-93dc-12011bcda45f,val,Lane Keeping Curve,Lane Keeping Curve
+bc183b05-9a17-4402-a972-a846296ad1dc,val,General Training/Validation,General Driving
+4103c356-d986-4c7d-8a16-d138a165fa34,val,General Training/Validation,General Driving
+1f09a3dd-26cc-44fe-a72e-bcf81e248a9b,val,General Training/Validation,General Driving
+d4c3b7d1-0771-4052-8724-df37f49cbefc,val,General Training/Validation,General Driving
+eec2273c-b82a-414f-9252-19a3084af23d,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+300d5f39-6e09-43d0-b17a-542cf222aa31,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+5fd47d5a-424b-42d2-9378-5d9832ecc74d,val,Cut-In,Cut-In
+ac3c0067-a93a-461c-8387-f36805711ca8,val,Turning Maneuver,Turning Maneuver
+6f5545d6-40f5-48dd-9788-867d3937c765,val,Lead Vehicle Following,Lead Vehicle Following
+0346a5ea-728b-4cf3-99ff-1d30250c1cdf,val,Lane Keeping Curve,Lane Keeping Curve
+3ce22665-eadf-4b54-bb9e-1fc1a7b7fe12,val,Merging,Merging
+87800e24-0175-4bd8-83b8-5202184a8446,val,Lead Vehicle Following,Lead Vehicle Following
+53bfcfaa-6885-4feb-bde6-a572b631cca2,val,Speed Control,Speed Control
+f69f141c-bed1-45ff-8943-70cdf35f9b21,val,Turning Maneuver,Turning Maneuver
+09d7621d-4a9e-46d8-b9af-f0b876373256,val,Stop for Vehicle,Stop for Vehicle
+9dca4134-3c57-46e8-ba6a-d4b8fb946ffa,val,Merging,Merging
+77c68d02-73d6-444a-a555-52d561d2a53f,val,Intersection Navigation,Intersection Navigation
+d639a83b-5a41-4b94-89e8-a121bc29ef9a,val,Lane Keeping Curve,Lane Keeping Curve
+f2646961-d8a3-4efc-9e13-0731471403c8,val,General Training/Validation,General Driving
+dc654ec3-6d61-4d77-89c5-e95c3692eabc,val,Intersection Navigation,Intersection Navigation
+9158811d-046a-4acf-8546-d24d95877476,val,Lane Keeping Curve,Lane Keeping Curve
+f6674b86-bc82-4404-95f8-0cd5a9f68d7b,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+1cf5320d-b63b-44f0-893a-3a6e0b171087,val,Cut-In,Cut-In
+8bfe1bcc-7365-4917-8da9-353b3a3b89ee,val,Lane Change,Lane Change
+fac6b6ca-e53d-4711-8ffd-ee981086ea6f,val,General Training/Validation,General Driving
+93e7f63e-602c-45f8-a5e5-d4835dae6fde,val,Traffic Control Compliance,Traffic Control Compliance
+9e89b7f5-08f4-46e8-9d34-00f6c4b45455,val,Lead Vehicle Following,Lead Vehicle Following
+ce6e3554-7095-4c9b-8941-b037ecb1b5c6,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+f751b5c9-1034-4b9e-b84f-d9ee1845d19f,val,General Training/Validation,General Driving
+dce25dd0-ca92-4751-8c23-32206f25eeee,val,Lane Keeping,Lane Keeping
+a5696728-30f3-4aa3-9230-2b12c273a404,val,Merging,Merging
+b9bc34f0-57dc-4aee-8d6e-4aecde87baf8,val,General Training/Validation,General Driving
+f6cc35b1-da8b-449e-8a7d-2d3b4fa35d30,val,Lane Change,Lane Change
+11228dc5-2321-4000-bcc6-edb48169c51c,val,Turning Maneuver,Turning Maneuver
+e170ec91-caf3-4ca0-94f2-315963bc85c1,val,Lead Vehicle Following,Lead Vehicle Following
+d9b60349-3034-4bd3-83e4-7ccfafbdf940,val,General Training/Validation,General Driving
+ecdaacbe-ad63-498f-9383-8fa8b6e39fac,val,Turning Maneuver,Turning Maneuver
+b30bd323-026f-4abf-b8f4-c9a5b2de9a7b,val,Intersection Navigation,Intersection Navigation
+2bb00dab-9428-4f7f-b37d-6bdefcaa3b10,val,Stop for Vehicle,Stop for Vehicle
+16831509-2b6f-44a3-a3a6-f411875748c6,val,Lead Vehicle Following,Lead Vehicle Following
+07f8b6b9-d804-4fb9-ac24-2741b3a5ae38,val,Lane Change,Lane Change
+a77b53e1-ef8e-494f-bc36-4247d4c9ec16,val,General Training/Validation,General Driving
+947f1e05-3c2d-407e-8a34-0597913cf62f,val,Traffic Control Compliance,Traffic Control Compliance
+b520230f-bc88-4e15-b196-1a9ce5045a29,val,Traffic Control Compliance,Traffic Control Compliance
+dee5c1e7-5fe1-4c3f-bc5c-c07823764219,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+dc5c756f-b75c-43a2-bc96-698d2fcf92b0,val,General Training/Validation,General Driving
+8d0cec46-a0e4-439c-89d5-7164e6422fd1,val,Lane Change,Lane Change
+554df636-d73d-4042-b0be-17344f613aba,val,Stop for Vehicle,Stop for Vehicle
+d80e5343-32c3-4751-aa8d-41514dfa9623,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+00e83e71-07ff-4228-8264-8fcdd8a2167d,val,General Training/Validation,General Driving
+901f311c-021f-47c9-9d3b-6797b139c71d,val,Lane Keeping,Lane Keeping
+affa359f-6e40-41ed-95d2-1a220d71ac9c,val,General Training/Validation,General Driving
+73bfaa50-4dcd-45de-a707-d3b39098e66c,val,Stop for Vehicle,Stop for Vehicle
+3153c528-e249-4759-b763-caefcdb24d02,val,Lead Vehicle Following,Lead Vehicle Following
+6ce2d11d-3968-426a-a218-99ec135bc28f,val,General Training/Validation,General Driving
+00b56f7e-073b-4266-8ea1-d23e6fd14a42,val,Cut-In,Cut-In
+ec8a2dff-4181-4c10-acec-e481a62451e5,val,Traffic Control Compliance,Traffic Control Compliance
+74104158-deef-4f9c-b361-234a11dd8d8c,val,Lane Keeping,Lane Keeping
+77106589-dcef-466e-b71b-7d3d9acbb415,val,Traffic Control Compliance,Traffic Control Compliance
+97392441-637c-4980-aba7-63fdb9115625,val,Nudge Maneuver,Nudge Maneuver
+277a5f18-8614-4e6b-937e-c75284767a62,val,Nudge Maneuver,Nudge Maneuver
+7b650499-9041-44eb-93e3-c7af84972b61,val,Intersection Navigation,Intersection Navigation
+e6b32e93-ebba-4fc7-bd70-d3daf2e79287,val,General Training/Validation,General Driving
+dceb0ceb-548e-4b48-a670-1a057fadb5c6,val,Speed Control,Speed Control
+13420120-113a-46e5-9fef-f9911fe96013,val,General Training/Validation,General Driving
+4a2c468f-e59f-4487-89a2-e33aa36b8d6c,val,Merging,Merging
+2487c033-70cc-4262-a8e7-984ea0adbc69,val,Merging,Merging
+959dcd5d-1a6b-4149-bb0a-ffb004704abf,val,Turning Maneuver,Turning Maneuver
+ff865292-4a95-450d-8a81-ef2982cf7e82,val,General Training/Validation,General Driving
+4cf7834c-416c-4970-8656-7e0af821cea5,val,General Training/Validation,General Driving
+ef009f57-8abc-45f2-812b-f65dd1ff582d,val,General Training/Validation,General Driving
+c50c933d-d247-48ea-a81b-b9f25ab18837,val,Speed Control,Speed Control
+373b5f29-7ea5-43d7-8c5d-bc36a5901adf,val,Lane Change,Lane Change
+80f10b1c-bd30-442a-9b9c-e31a7663738a,val,Speed Control,Speed Control
+22acaf94-6190-4f02-b60c-0b2eaa97c0c1,val,Cut-In,Cut-In
+95b4c2da-94ee-4641-a873-acce311a1c6d,val,General Training/Validation,General Driving
+aded37a8-cb9c-4766-b090-a45f51149af2,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+234969e2-db49-4156-a5ca-241185f2ed2f,val,General Training/Validation,General Driving
+82c1fe72-a4ce-4a25-8567-9155468c286c,val,Speed Control,Speed Control
+451897fb-92e8-4ac6-b798-776aeda6023d,val,Nudge Maneuver,Nudge Maneuver
+d79e2a74-8644-465d-9e66-7185f291bbb3,val,General Training/Validation,General Driving
+cd58c860-9fd8-4e44-b89a-5b9fb72064ae,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+86c423cc-403d-437e-90b2-e1867630bb79,val,Nudge Maneuver,Nudge Maneuver
+fa0c429d-9e4e-4412-9249-070ff59a3356,val,General Training/Validation,General Driving
+7c3f4a4d-128d-456e-a709-f56c25ff6628,val,Lane Keeping,Lane Keeping
+aad8e19c-bb87-45c0-a3f2-ba1b60c4c4b3,val,Lane Change,Lane Change
+82aca91b-8aba-446a-981f-85f526fddacd,val,General Training/Validation,General Driving
+226340f8-9e99-4fc4-b9dc-f50d43395071,val,General Training/Validation,General Driving
+15e171f2-34c8-420b-ab52-81ae3b1cef11,val,Stop for Vehicle,Stop for Vehicle
+41903224-8c76-4742-bb78-f1425a0e4a26,val,General Training/Validation,General Driving
+a6e7399b-f13d-4507-a916-ec9116298653,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+cf031f02-9705-4ee4-b8c4-88201a356de6,val,General Training/Validation,General Driving
+23b8f21e-3c5e-4353-933a-7d2d77b645ca,val,Nudge Maneuver,Nudge Maneuver
+cda85ed2-5eee-4e74-af75-b15668a6d0a1,val,Lead Vehicle Following,Lead Vehicle Following
+f8a772a3-ebf0-4f8e-a2af-8ec677af1e73,val,General Training/Validation,General Driving
+3c2d6154-1fa7-4d0f-991f-5867c119abab,val,Lane Keeping Curve,Lane Keeping Curve
+4a660ace-6249-444a-a740-bd625e77e7bb,val,Turning Maneuver,Turning Maneuver
+dec94450-87e3-4cf2-8518-949625aa5c7a,val,Lead Vehicle Following,Lead Vehicle Following
+be208d1f-5881-4f8c-a7ec-df6a34762277,val,Lane Keeping Curve,Lane Keeping Curve
+bedc8fef-ee75-4fcb-acf2-e2ccfc20ed3f,val,General Training/Validation,General Driving
+777d8859-78eb-4d50-a6d9-c7b39711a737,val,Lead Vehicle Following,Lead Vehicle Following
+1dd64ff4-67b2-4e74-8a0a-152d7fdb55f0,val,Stop for Vehicle,Stop for Vehicle
+bac6a04e-ed91-497f-9bbc-e5b8b335592b,val,General Training/Validation,General Driving
+964b1e75-aa29-407a-9e32-88d23930bb61,val,Lane Keeping,Lane Keeping
+e87d628d-57e9-494b-add8-6cb222ed2be8,val,General Training/Validation,General Driving
+938726f1-2156-44ef-9144-32abf1515d31,val,Cut-In,Cut-In
+7e77fdf2-3b6f-4273-9f02-00e7490f67a7,val,General Training/Validation,General Driving
+ffe56293-dab7-47ea-b4fc-458d4ceb4f60,val,Lane Change,Lane Change
+2bdc429d-b49f-4649-80e4-d4fee6c083c4,val,Lane Keeping,Lane Keeping
+ebb0008a-f0bf-4c68-a576-a31df6a51955,val,Lead Vehicle Following,Lead Vehicle Following
+e917f997-b1aa-43cb-8a19-644208b08822,val,Intersection Navigation,Intersection Navigation
+b091c79a-edbc-4be3-af77-c687ec105c69,val,General Training/Validation,General Driving
+274f7865-ef1f-42c6-945f-cf036f51e7a6,val,Cut-In,Cut-In
+c7305db6-6d28-4fac-bbd6-4759539be73e,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+4935d10d-5e7c-4e93-974e-0fe81a5ca1c2,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+fb42bdc7-b1e9-4a32-ba05-a9341cc752b5,val,General Training/Validation,General Driving
+db4ff5d4-e326-4046-9309-2308b7edc287,val,Traffic Control Compliance,Traffic Control Compliance
+314bcd75-0047-4878-ad97-e3eb8f467465,val,Speed Control,Speed Control
+1b994c32-c737-4336-8a8b-24f5e2d36459,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+8e4dce9e-5718-4f7a-95cf-cc2a3046e3e4,val,Lead Vehicle Following,Lead Vehicle Following
+44e3b16f-2f05-44cc-a8ac-f7dffef4cf8e,val,Lane Keeping Curve,Lane Keeping Curve
+3d59de7e-1b4b-42bb-ad95-254819828c2f,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+4f444820-86fe-4651-b1c0-af80c10e7c61,val,Stop for Vehicle,Stop for Vehicle
+5c3e8aa7-66cb-4819-b94f-cb5318c005d8,val,Nudge Maneuver,Nudge Maneuver
+6cc0e4c4-ed4b-4819-a915-6334873bc854,val,General Training/Validation,General Driving
+cb017446-b33f-4dc3-8ace-c1a8c0adc96d,val,General Training/Validation,General Driving
+18d70781-efe0-4a50-9e07-699ef3cc5781,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+c20c8eab-8071-4409-b8e7-f1d1cb948521,val,Traffic Control Compliance,Traffic Control Compliance
+11504fa1-4375-4064-b277-5fe4b3175fc0,val,Merging,Merging
+15c9927b-1ef3-445d-8e8d-f275d554de15,val,Nudge Maneuver,Nudge Maneuver
+25afe13f-76bb-497c-81e0-a7eddcd1f63f,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+933a0f17-a688-45d3-8619-661e420c0d76,val,General Training/Validation,General Driving
+887eb1fa-9cfb-4b50-9e6f-2f7184322a6a,val,Cut-In,Cut-In
+31080d8d-07cf-4769-937a-944cc9750731,val,General Training/Validation,General Driving
+091aa914-926a-4744-8d6e-d4476cf8d470,val,Lane Keeping Curve,Lane Keeping Curve
+9862a77f-d34d-4a9d-86cd-2bd83f2ec4f4,val,Traffic Control Compliance,Traffic Control Compliance
+b2387fab-ac7b-41be-97d8-1ed2410d5600,val,Lane Change,Lane Change
+69c04edd-2cdc-4232-9f6b-b8177a34b037,val,General Training/Validation,General Driving
+2cf74c14-7454-4a23-829b-9e43d89ffd2a,val,Traffic Control Compliance,Traffic Control Compliance
+38284500-17ec-4a1c-a953-c61bec1d73ea,val,Merging,Merging
+487a742f-1890-4c21-b922-f607c54ae73b,val,General Training/Validation,General Driving
+a8ef0618-a64a-4063-ab32-aaa2c26a3000,val,General Training/Validation,General Driving
+3bea38ba-b1ac-4d00-978d-2112db9d1a1a,val,Lane Keeping,Lane Keeping
+650a39fb-6a37-4b74-a1da-80d331ebaa2e,val,General Training/Validation,General Driving
+a00b0745-853b-472b-be9d-c97983766015,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+c50e5b27-91b9-48e0-b9f5-ad9a2ebff109,val,Cut-In,Cut-In
+70585237-20de-4879-b132-9075ae3114ae,val,Stop for Vehicle,Stop for Vehicle
+c4eb94e5-493c-448f-a5a3-85ea799f68b3,val,General Training/Validation,General Driving
+32113098-859c-435f-9f3e-1c9daf4ed6b0,val,Turning Maneuver,Turning Maneuver
+29393e53-382e-4656-8c4a-3a12ce92647e,val,Turning Maneuver,Turning Maneuver
+28f91666-0c63-4503-8fda-ab4d2633d5ce,val,Lead Vehicle Following,Lead Vehicle Following
+0ee6461c-0a0f-444b-9aa7-62f630e006c0,val,General Training/Validation,General Driving
+6d7b7da4-0228-43e0-9fc0-ab42b0aa48bd,val,General Training/Validation,General Driving
+a7a8393a-9608-4852-919a-3d9ab6aa041b,val,General Training/Validation,General Driving
+18d3462e-fff9-4541-9c11-7038465cfb8e,val,Lead Vehicle Following,Lead Vehicle Following
+70326ad9-9921-402b-9148-609ecadf949d,val,Lane Keeping Curve,Lane Keeping Curve
+f1dd7ec2-575e-4218-b9b1-79936bbcd1de,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+fbccfd13-8bd3-4276-9014-88ede40aa6ea,val,General Training/Validation,General Driving
+18dfd788-7ad9-4b01-8b4c-a9bcc5029a1d,val,Traffic Control Compliance,Traffic Control Compliance
+7e0d5176-d9d0-4d0e-8f85-5b2fec9a3feb,val,Merging,Merging
+b55812c6-0899-4f06-bf23-8c00662793a8,val,General Training/Validation,General Driving
+dafd6b8d-981f-459a-9807-e0cec8d83037,val,Lane Change,Lane Change
+6d5a4f6f-1183-48d5-aef1-16553baf629b,val,Intersection Navigation,Intersection Navigation
+aa028499-a54b-4201-a86b-fdff88266549,val,Intersection Navigation,Intersection Navigation
+2e82344d-bb34-42d3-b0db-88485d1b99fd,val,Nudge Maneuver,Nudge Maneuver
+fd1ba68b-cae6-4eb5-b53e-fb400e5716d8,val,General Training/Validation,General Driving
+969478e0-2c84-4159-9b4d-14713c6de9c2,val,Intersection Navigation,Intersection Navigation
+d3947025-5066-4898-89df-88ea45528d42,val,Lane Keeping Curve,Lane Keeping Curve
+d15eae91-b2b0-4ce9-929d-e1651c745df9,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+0981ddf0-9dc2-4712-9348-32b4ca8fc6ca,val,General Training/Validation,General Driving
+ffd71678-66e1-4b82-bfc7-0dcccf8dd409,val,General Training/Validation,General Driving
+672973e2-149a-40aa-a5b4-7adf9e6d92e6,val,General Training/Validation,General Driving
+45080e67-859c-4906-84c2-9782f653acf7,val,General Training/Validation,General Driving
+33ce19c8-256f-406b-8bc4-9dfde9a32811,val,Lead Vehicle Following,Lead Vehicle Following
+d5ce1676-1c32-4fc0-a037-2304d7a0ed1e,val,Intersection Navigation,Intersection Navigation
+9abd7ac1-66ca-4f80-8003-7615acdf3ca3,val,General Training/Validation,General Driving
+5c22fc7c-a788-408a-920d-b4455353b6d4,val,General Training/Validation,General Driving
+0a8a8cc6-7114-4fad-8d35-82649a208e56,val,General Training/Validation,General Driving
+ab6d689f-4644-4daf-9a0d-fe4f5f0e48e3,val,General Training/Validation,General Driving
+49ec4249-9d4e-4998-afd3-bb80b5c8ffc5,val,Lead Vehicle Following,Lead Vehicle Following
+011ee582-34de-40e9-9f9d-c8c918a9c4da,val,General Training/Validation,General Driving
+369e6f3a-5910-4879-bb10-2ff7d3722049,val,Lane Change,Lane Change
+e403243b-1581-47e8-baec-335c7006cb6c,val,Merging,Merging
+b81b3d33-783a-4d3e-839f-17fcf1b76df1,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+106cbf85-c891-400b-97de-38119f5e7286,val,General Training/Validation,General Driving
+75a64319-802e-4932-94fd-e21ad664d26e,val,Lane Change,Lane Change
+05838618-7bf5-485d-ba13-35367dd7ef43,val,General Training/Validation,General Driving
+f339d723-57c4-4103-b16e-e71be2ab790e,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+e5925bf7-0df7-4cec-abef-829c8a9b09ca,val,General Training/Validation,General Driving
+0359ac86-7618-44ac-8286-96c38099bda6,val,Lane Keeping,Lane Keeping
+df6718f8-f75d-4433-803d-673a7dd2a25b,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+aeae5749-e842-4266-84f2-166884277fb3,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+dea68171-d8d3-482c-8c1f-4e3aaee12cca,val,Cut-In,Cut-In
+7f046aea-dfc3-4beb-818e-9c47e34072d3,val,Lead Vehicle Following,Lead Vehicle Following
+f98183f0-2893-4a16-87a8-a20c032db253,val,General Training/Validation,General Driving
+46afa401-55b7-4393-92c0-da2fa51537df,val,General Training/Validation,General Driving
+58638ddc-559f-42fb-9a74-3920ccfa343e,val,General Training/Validation,General Driving
+5959d85e-e90b-4f56-ae97-1022fb53f197,val,General Training/Validation,General Driving
+4e35ec0b-20e1-4af6-bac1-c5acf9c4e491,val,General Training/Validation,General Driving
+51090e0c-f391-4b1d-869c-ea697504ca85,val,General Training/Validation,General Driving
+9b779394-bcc2-4e20-a148-6c1cd9949db1,val,General Training/Validation,General Driving
+83590cca-5086-4ab7-89ff-163494e89b7e,val,Nudge Maneuver,Nudge Maneuver
+1edbb19e-c32c-462e-9657-4ab84111e778,val,General Training/Validation,General Driving
+ecce0e80-6c3d-4de6-9e1b-a8c3a0db0342,val,Speed Control,Speed Control
+8b044ea2-162b-4aba-ad65-de9540cef9b0,val,Lane Keeping Curve,Lane Keeping Curve
+7ceea29d-549e-4991-8e08-c62f62af82df,val,Cut-In,Cut-In
+1f1f90a1-bfc7-41fc-9b95-d3301537831a,val,Traffic Control Compliance,Traffic Control Compliance
+9b2ddd7b-20a3-4af3-916b-516f1e1fbe8d,val,Lane Change,Lane Change
+741eb665-0ee3-4052-9765-cc6d26783e2a,val,General Training/Validation,General Driving
+85bcbdb8-55f5-4887-acd7-6193c7593c46,val,Merging,Merging
+5ce8d5e8-2e29-4ba8-9afb-e23ab1983ca0,val,Lane Change,Lane Change
+c7774eb3-1336-4b42-b9c9-fd7bac33c384,val,Lane Keeping Curve,Lane Keeping Curve
+8346928e-b980-4419-b8a6-f7de652c24ee,val,Lane Keeping Curve,Lane Keeping Curve
+1485a931-cf00-4fbf-9120-0f3cd98ac5bd,val,General Training/Validation,General Driving
+7df03526-d6c1-42f3-a73c-60fccd04acf7,val,General Training/Validation,General Driving
+950daa8e-54a6-41e0-974a-4d11b21ba0e9,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+83e86b13-e424-46d2-98cb-54efd8718cc7,val,General Training/Validation,General Driving
+d7ae8f71-1b42-4aa7-858b-adcdca563505,val,General Training/Validation,General Driving
+6c501d64-c0d3-4a4f-a285-f6e6332ddef8,val,Cut-In,Cut-In
+797a9821-f48e-4acb-978a-f5466cf78a4f,val,Lane Keeping Curve,Lane Keeping Curve
+35389c45-132a-4fc6-a81e-98053570f8cb,val,General Training/Validation,General Driving
+c18df259-f771-4a52-9376-8a3aadcfe57f,val,General Training/Validation,General Driving
+8e08d9c5-f4a2-46a5-aa6e-3ad82ece590c,val,Intersection Navigation,Intersection Navigation
+a35e7cad-c27a-4150-a63d-7cbdba4d77ce,val,General Training/Validation,General Driving
+77309a6a-81e5-43c0-ab37-6f1d709a5cb4,val,General Training/Validation,General Driving
+0f100965-c0c6-4a64-a1ba-abf5c08223e9,val,Intersection Navigation,Intersection Navigation
+e3c66c2c-4653-4dc1-a970-07ac97e6dca1,val,General Training/Validation,General Driving
+b285a9e1-09a7-4b83-8981-9f8fadc0f60f,val,General Training/Validation,General Driving
+617c9012-c2a9-414d-9d32-eee39b58accb,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+73ea0128-fd0b-4ade-9bca-f5b528355c60,val,Lane Keeping,Lane Keeping
+df1c9ea2-c75a-4686-8f62-7a392d8db920,val,General Training/Validation,General Driving
+e688d6fd-b8a3-4cf1-ad57-86fc65d16cd1,val,General Training/Validation,General Driving
+81b919fe-4fd2-4767-86e1-30ec606f5c86,val,Nudge Maneuver,Nudge Maneuver
+d3be8884-2a3e-4b51-bc55-0f71e37c1586,val,Lane Keeping Curve,Lane Keeping Curve
+b415ecd6-05aa-48a0-9d98-0f03bf0154d5,val,General Training/Validation,General Driving
+72d0a673-c790-4baf-907c-774d0f5b4c7a,val,Merging,Merging
+e1d3b0a3-39bc-4a2d-a80a-825af393ec92,val,Nudge Maneuver,Nudge Maneuver
+88bbf0c9-9ba5-45b4-bc15-9dca85ca84b9,val,Intersection Navigation,Intersection Navigation
+009bc415-5126-48c7-a0c5-aa95c79e2753,val,Speed Control,Speed Control
+6a07db16-252a-4683-a0e2-2b246b203683,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+acdfa86f-8d03-41d5-9a2c-a3123a1d81b3,val,General Training/Validation,General Driving
+998a44d0-2e5e-454d-91de-99fdc937ffa0,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+4941f1b8-38a7-49bc-b567-7042037b0617,val,Stop for Vehicle,Stop for Vehicle
+90182d97-9b05-4d58-9c75-32f67a44d5b1,val,General Training/Validation,General Driving
+fb1faa38-8346-485b-9206-292fc46597ba,val,General Training/Validation,General Driving
+f2173af5-8628-40f3-9ddb-81a7bb0cfcbb,val,Speed Control,Speed Control
+82fa8a2b-df4a-48a7-aa38-7ce4f753d598,val,General Training/Validation,General Driving
+cd88dda0-4201-4d24-b2b0-f8c192b57cd6,val,General Training/Validation,General Driving
+a413abeb-cba9-4e1c-b5e3-2f08dcc4b6df,val,General Training/Validation,General Driving
+549d97a5-7fdc-4fbc-8548-0f4a9d9d08b3,val,General Training/Validation,General Driving
+9616a3b4-a81f-4ac9-a776-9d6a3e6cc852,val,Traffic Control Compliance,Traffic Control Compliance
+66ef666d-aaa7-4d9b-be2b-b9542bca0b01,val,Lead Vehicle Following,Lead Vehicle Following
+0c733701-132e-4e8f-9c2b-93604b2393a9,val,Stop for Vehicle,Stop for Vehicle
+9d189d42-0059-43cf-905d-b5a58ac8742a,val,General Training/Validation,General Driving
+22a8d83b-cdfa-4936-8396-ea0a3172881c,val,Lane Keeping,Lane Keeping
+67e4ad10-a0cb-4aa0-b121-bf48b3565b78,val,Lane Keeping Curve,Lane Keeping Curve
+51727a4a-e926-4a84-bd5c-320e8e1b5721,val,Lane Keeping,Lane Keeping
+f9992ec5-3a07-47ff-9c27-49fe685baa26,val,Speed Control,Speed Control
+98aa73dd-5bcc-4ecf-a57c-d597d57e6dee,val,General Training/Validation,General Driving
+4c72da6f-afda-4a24-bbb3-ca111725842b,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+83902eaa-003f-4287-af12-6e4ba630e9c5,val,Lane Keeping,Lane Keeping
+40ef98e5-5874-4376-a9d7-a661228ceb4c,val,Traffic Control Compliance,Traffic Control Compliance
+1d68ebc0-e80f-4595-b8e5-bc9773780bdb,val,Traffic Control Compliance,Traffic Control Compliance
+81d94f8d-c68b-4ec4-acbc-6248ef722576,val,Lane Keeping Curve,Lane Keeping Curve
+ff2697e5-3a20-4ee4-bd4c-0cb483ddc776,val,Speed Control,Speed Control
+7bec7583-f5c8-4ea0-819c-e729a4b4c89f,val,Turning Maneuver,Turning Maneuver
+ce5101e2-744f-4d90-b87b-2f3b8d59b0dc,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+7694d0b5-c29e-4838-8c37-7b2b6fa0c542,val,General Training/Validation,General Driving
+d4730533-1c5f-4d4c-9d29-70883322756b,val,General Training/Validation,General Driving
+97edaaef-053e-41b7-8c9b-e977c0a0c307,val,General Training/Validation,General Driving
+e5796023-cfdf-4076-b438-20b9f5c33eb5,val,General Training/Validation,General Driving
+107d2595-90c6-4a6d-8f16-bb003942ff64,val,General Training/Validation,General Driving
+adf3c03d-10a5-4965-b437-9991bb541eed,val,Stop for Vehicle,Stop for Vehicle
+c45bb3e7-1878-4408-ba0a-57dd95b2407d,val,Lane Change,Lane Change
+50638036-e080-403b-a861-14e49f30634d,val,Lane Keeping Curve,Lane Keeping Curve
+72f8cf86-0ca3-46de-881f-df70d0d39c69,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+6d0f3dcf-0fa0-4682-a945-7f51cfa6ebaf,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+bfd87a11-184c-472a-a9bc-594664dabd05,val,Lane Keeping,Lane Keeping
+dcd40e77-d527-4901-b6e2-b55ad13c93ea,val,Traffic Control Compliance,Traffic Control Compliance
+92b32acf-ed0f-449d-b8ee-5557484dcd96,val,General Training/Validation,General Driving
+102635c9-f387-44f5-8e07-914b95949563,val,Lead Vehicle Following,Lead Vehicle Following
+eed7667c-8d10-4af1-be67-5f3b841f1f19,val,Speed Control,Speed Control
+f74b8e4e-9b31-43e2-8d08-8bd0703c13d0,val,Turning Maneuver,Turning Maneuver
+9512121c-0531-4e3b-b6d0-23a4890ba690,val,General Training/Validation,General Driving
+b5e5789e-aac4-453a-a6a5-5ec1c626f13e,val,General Training/Validation,General Driving
+9a6c2190-811e-48e6-affa-33d55deb7ec0,val,Intersection Navigation,Intersection Navigation
+b8bf8601-81f3-4204-beed-88f76b4ef943,val,Lead Vehicle Following,Lead Vehicle Following
+a5f75d4d-cd73-446c-ac34-a87511d135e9,val,General Training/Validation,General Driving
+11834a37-a1a8-48b6-99d2-39cffdad6354,val,General Training/Validation,General Driving
+52408183-8161-41f7-badf-7ef3e0db8ae9,val,General Training/Validation,General Driving
+c2288b62-cdff-46c9-a47f-443c6b71b180,val,Traffic Control Compliance,Traffic Control Compliance
+acff14c6-4744-4780-b3dc-cc2207ee0f1f,val,Lane Keeping,Lane Keeping
+22b3564c-2992-431a-9609-da01a24e253c,val,Stop for Vehicle,Stop for Vehicle
+ac0adb81-3c83-4794-8a92-ff8a94e8755f,val,General Training/Validation,General Driving
+cd382a32-77f2-47c2-9aab-b2ee3acfd138,val,Cut-In,Cut-In
+b21774ad-84b4-4193-bc44-fdc3f349d226,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+5162b94a-2852-4606-bb2d-0a153ea2ce0a,val,General Training/Validation,General Driving
+3d013513-d86a-46fb-b1dd-964be08a70f9,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+a44fab3d-2ee3-4cd5-9ec3-d6f09507b929,val,Stop for Vehicle,Stop for Vehicle
+5850d919-12b3-4032-bf84-71d8a959a980,val,General Training/Validation,General Driving
+86266356-2767-48ed-b25d-fb9c8404dc85,val,General Training/Validation,General Driving
+79ef14ee-fb2a-4963-94b3-e5a70f7d13e1,val,Lane Keeping,Lane Keeping
+a6593fce-2ec7-47a0-a618-0812a6d081ef,val,Stop for Vehicle,Stop for Vehicle
+2d29a9ed-69bf-4ff4-a7f1-bcf87fa3b4ee,val,Merging,Merging
+52be9c48-ef89-44c3-b5fb-5ca5443e7115,val,Lead Vehicle Following,Lead Vehicle Following
+ce409176-484a-465d-abf0-f965f138d002,val,Intersection Navigation,Intersection Navigation
+e8d6d423-1e1d-45eb-a987-e83ee7fadf91,val,General Training/Validation,General Driving
+fa2c399b-c091-4f43-ba36-3a0b00a70e8c,val,Lane Keeping Curve,Lane Keeping Curve
+bbd6fcaf-7498-49d7-ab6d-ac68f4ee2e5b,val,Intersection Navigation,Intersection Navigation
+a5c126e3-3ef4-4c8d-bdbc-fdd0447ed177,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+4b8624c1-9088-4900-b91b-c876f38d279b,val,General Training/Validation,General Driving
+84e01e8e-20d7-4009-8900-b3e0ee22ab33,val,Lane Change,Lane Change
+bfac77be-e745-4eca-9c6c-e42bdc36d721,val,Merging,Merging
+312d0b5e-00e3-47db-b4b7-0e2faa14bc05,val,General Training/Validation,General Driving
+f0f5aeb7-4250-4954-9576-0c2f778c7331,val,Lead Vehicle Following,Lead Vehicle Following
+ae343f8e-1de2-41b1-9fda-26d8990a2412,val,General Training/Validation,General Driving
+0e3e068b-586d-42e4-aa03-9c92880e5e72,val,Merging,Merging
+db40449e-5d62-4ef4-bcc8-8166d52f2c55,val,General Training/Validation,General Driving
+34b86843-eafa-4bac-96c8-d10bae303f8c,val,Speed Control,Speed Control
+13b47bd3-ec32-4f04-a81d-c4202fa52889,val,Nudge Maneuver,Nudge Maneuver
+7da2ea1a-9ab6-4e56-ad35-0448161030e3,val,Lane Keeping Curve,Lane Keeping Curve
+6281d4f9-2e63-415c-8592-d47b3ba6cc58,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+1b2b1fcd-a1ca-4abd-90ac-0aeed92a4a07,val,Merging,Merging
+f30a07eb-73db-4520-b1f6-45dabed4eeab,val,Stop for Vehicle,Stop for Vehicle
+a8f5bcfb-c825-4aea-a816-6f6a652dad70,val,General Training/Validation,General Driving
+e008bba3-8f5f-462d-bb6f-39879856cd9f,val,General Training/Validation,General Driving
+5b119174-ddf9-4cdb-9d81-08095a6115fe,val,Nudge Maneuver,Nudge Maneuver
+f534144e-e41e-496c-9624-1c0e0bd58054,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+92aa7acb-ed19-435e-b21f-e8997e351df1,val,General Training/Validation,General Driving
+4370132d-3c60-49fe-8684-04ff216d2b83,val,General Training/Validation,General Driving
+a165ca7a-f15b-4129-b01b-7b4905f1f92b,val,General Training/Validation,General Driving
+c578e5a0-8c59-4ae4-8e65-bf7cd4f19922,val,General Training/Validation,General Driving
+876dbcca-b8d5-4773-a1bd-fc539343bec3,val,Lane Keeping Curve,Lane Keeping Curve
+73f1d9e1-3a4d-4ef3-85d2-26fc71ec9e0d,val,Lane Keeping,Lane Keeping
+5c8bc47b-a8bb-43c4-ad5f-aaf71cf2ad74,val,Lead Vehicle Following,Lead Vehicle Following
+d57e7456-09b3-495e-b4c4-9d6937bcc981,val,General Training/Validation,General Driving
+2843a0e6-4aea-40fe-b880-7f7bfdc6a4d7,val,Lane Keeping Curve,Lane Keeping Curve
+c9f0b19c-faa0-4501-a4dd-4708d11a8068,val,Nudge Maneuver,Nudge Maneuver
+efb0967f-b82a-4b83-9083-8ae309223322,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+f2644fc6-b3ec-4aa5-bbf4-67ad52542759,val,General Training/Validation,General Driving
+f4bd8e65-4c33-4b8e-8fc0-d1a2136efe77,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+ffd24172-c6a0-4389-b985-88d690bdae8b,val,Lead Vehicle Following,Lead Vehicle Following
+78dfb10d-b72c-456c-b133-aac7e33582ef,val,Speed Control,Speed Control
+f9dfcba8-1722-4f31-bbaa-95eab77e0e12,val,Lane Change,Lane Change
+85702ee1-a061-4e87-b4a6-b5f49cf7bf60,val,Cut-In,Cut-In
+2d746278-b94e-440f-b5c6-60916165fe74,val,Stop for Vehicle,Stop for Vehicle
+06534635-d5ae-46cb-882d-c7df775a7c9e,val,General Training/Validation,General Driving
+f57b2a3b-f613-44a9-bda6-0f31e30b17b9,val,Lane Keeping,Lane Keeping
+1f23c5a0-2eef-46f0-a743-9e94f9198c79,val,General Training/Validation,General Driving
+98121ed9-4b1e-4e1d-9e5e-79a6cf76ed5a,val,Lane Keeping Curve,Lane Keeping Curve
+e337da46-4708-4c51-836e-3a86edab2507,val,Lane Keeping,Lane Keeping
+a85af579-0e44-4b22-ad1c-a54784233835,val,Lane Keeping Curve,Lane Keeping Curve
+9b3bfd52-f3f4-4bdd-9667-f79f087cef7b,val,Lane Keeping,Lane Keeping
+08118c60-1eda-487d-8f1d-70dd70f8fe0c,val,General Training/Validation,General Driving
+a2b5e068-fda0-43d4-be6a-a303e63b3370,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+a5dc280d-4c26-4f67-942d-d7a4efd1b43b,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+08d189b7-763a-45d4-8724-587588627f0a,val,General Training/Validation,General Driving
+57248099-566e-4d5c-b256-b421a730ed59,val,Nudge Maneuver,Nudge Maneuver
+8213886a-b927-4c90-bafa-02cce1d41519,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+a8842caf-7fc0-4a0d-b6df-f90fa205f1d1,val,Nudge Maneuver,Nudge Maneuver
+d5049de2-ef69-4604-95bd-35afb62e2807,val,Lane Keeping,Lane Keeping
+a567ab58-a20f-452f-946e-53a5bb7fbce8,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+dee3c553-32c8-49b0-bbc4-55cb7493c1ef,val,General Training/Validation,General Driving
+45350c2f-0952-4f77-bca5-674f4fff4d78,val,General Training/Validation,General Driving
+61d75dc3-dedf-4ec9-bc2d-da6d805c869a,val,General Training/Validation,General Driving
+3f82c63d-3601-49da-9547-cd9cdad6fe1d,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+23f77a3b-fb22-4f69-b647-f5a745c449ba,val,Speed Control,Speed Control
+ea212441-444f-4fa7-842e-05b113fe37f1,val,Cut-In,Cut-In
+89f18090-df7a-4bc4-ba6f-368b4c9d407c,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+9f753c29-8b88-4f48-a80f-2cdb16971609,val,Lane Keeping,Lane Keeping
+6381e922-535d-4a47-ba82-f94b3e28451a,val,General Training/Validation,General Driving
+e49979e4-4969-4581-b4f5-af4aad359c61,val,Lane Change,Lane Change
+6d64e278-c105-4eed-85e4-f74591fed807,val,Lead Vehicle Following,Lead Vehicle Following
+165735d5-d9e8-420a-95a4-fc29b7e07917,val,General Training/Validation,General Driving
+e11f77f4-a611-4417-bf30-a2b5ca76ee9e,val,General Training/Validation,General Driving
+1b0a89f0-b8cb-4d6a-b558-9c8fe0fcaf75,val,Speed Control,Speed Control
+4eba307e-543f-4a05-8377-6c5f661cb6cb,val,General Training/Validation,General Driving
+ee1e6b79-a8bc-4c44-937d-634f1fcb37b9,val,Lane Keeping Curve,Lane Keeping Curve
+33ce5862-fac0-45aa-b83a-9c610f8cbe00,val,Lead Vehicle Following,Lead Vehicle Following
+e4fe9d25-57a4-44bc-9d89-5756b0076cd9,val,Lane Change,Lane Change
+7ef346b6-f8ef-48af-b348-ff942a0c27c2,val,Nudge Maneuver,Nudge Maneuver
+a5afcfe3-8a6e-476c-94f8-6d03684c07e3,val,General Training/Validation,General Driving
+da427d20-2b65-4a5f-b87c-6a1605bdc3d8,val,Stop for Vehicle,Stop for Vehicle
+67aa7417-6741-4191-8c6d-a1a24e145bb3,val,Lane Keeping,Lane Keeping
+6a3be221-3b24-4680-ab40-08e3e1fc75f3,val,General Training/Validation,General Driving
+5a8ee4dc-4a92-45b5-a951-124b6450e142,val,General Training/Validation,General Driving
+e4c9dc2c-84e3-4e10-9e40-437e415ca8d0,val,General Training/Validation,General Driving
+c58a83a1-9fc7-4004-83da-557385abbe19,val,Stop for Vehicle,Stop for Vehicle
+94994599-aa6a-4916-9ef5-b9bbba09c81e,val,Lead Vehicle Following,Lead Vehicle Following
+8bfc9926-c9e1-4b3f-a72c-fd5418560985,val,General Training/Validation,General Driving
+ebfaa85a-505d-4204-ad21-1d460b2713e6,val,General Training/Validation,General Driving
+569db6ed-e532-46c6-9fe5-a48be3e3968a,val,General Training/Validation,General Driving
+8c90c4cc-89f6-4857-bd70-7aa50e185e5c,val,Cut-In,Cut-In
+b5dcb687-af23-448d-ad40-a8b9be2b2626,val,Merging,Merging
+69355386-902f-4d80-9e37-e1748a9ce546,val,Lane Keeping,Lane Keeping
+d768e691-dd6f-4c7a-a77e-0932ad0612b6,val,Traffic Control Compliance,Traffic Control Compliance
+86c1ba58-c08f-4f68-a0cd-9731241ede71,val,Lane Keeping Curve,Lane Keeping Curve
+49f97416-f76e-49cc-9542-80f14b72c798,val,Lane Change,Lane Change
+9a2d6b76-7811-42ed-97eb-8f05ca343597,val,General Training/Validation,General Driving
+ece7556d-74b3-4723-9e25-d3ac8db50793,val,Lane Keeping,Lane Keeping
+92ee1005-466e-4342-87ed-975d80c1b884,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+4352abd2-7504-46a2-bbe4-82d7a80f336a,val,Intersection Navigation,Intersection Navigation
+420ea858-9a32-4f01-9b7c-9e9dd956e248,val,Intersection Navigation,Intersection Navigation
+befe3558-480a-44b7-b79c-1f373dc4ea16,val,General Training/Validation,General Driving
+6a8423ca-f819-47da-a534-16f6755be8df,val,General Training/Validation,General Driving
+fae9a9db-31d9-4fe2-97ac-b5362e03bfff,val,Lane Keeping Curve,Lane Keeping Curve
+158f8215-b354-48d7-b2d7-f7884a86dcf3,val,Merging,Merging
+9c302944-4245-4640-9823-6467d667f343,val,Lane Change,Lane Change
+9091de30-8ed4-42b0-80de-ce19d35a8b8f,val,Traffic Control Compliance,Traffic Control Compliance
+52c80dc8-a719-4403-8e02-c6ce59ba9e58,val,Nudge Maneuver,Nudge Maneuver
+439eb750-b8b7-4783-942a-2021ce4e5d5f,val,Merging,Merging
+4c4c0bc8-55f0-45d3-8fa5-ba8c673b46f8,val,General Training/Validation,General Driving
+cd12624e-570b-4bd7-b941-95a271e0e2bf,val,Traffic Control Compliance,Traffic Control Compliance
+82079eda-9cb5-48cc-ac20-27aa12767d3f,val,Lane Keeping Curve,Lane Keeping Curve
+def48d07-0020-4b15-81d3-225cd4df7e7d,val,Stop for Vehicle,Stop for Vehicle
+5481924b-b0fa-4500-945c-4ee2846171ab,val,General Training/Validation,General Driving
+b327ea55-e11c-4a9a-b2b4-b0ceb57784d2,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+e9a79107-239b-48ba-8094-552a072245a8,val,Traffic Control Compliance,Traffic Control Compliance
+720a6690-3245-4904-876f-fb9fe4c6a1e8,val,Cut-In,Cut-In
+8e5e7524-ac2f-4f50-a4cb-48b8ad968aeb,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+0129560e-0f3c-442c-b7a7-c15150bf3ead,val,General Training/Validation,General Driving
+54b4868a-1da0-4fb4-a86f-80cc4f89995a,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+00e7e410-fddf-4869-b0e1-18a13aa667e3,val,Lane Keeping Curve,Lane Keeping Curve
+5ca999df-2e55-4ea5-9cdb-1554411161cb,val,General Training/Validation,General Driving
+4f7acad7-8d04-4b31-9f64-ce586f5615fc,val,General Training/Validation,General Driving
+dcd31ba7-0d14-491e-8ff3-2ecde4263654,val,Lane Keeping,Lane Keeping
+324e231e-9669-4731-b704-6e15afa2dd0b,val,Nudge Maneuver,Nudge Maneuver
+9328b92e-818e-49d7-8ac6-508d795e0a4d,val,General Training/Validation,General Driving
+33fb519a-6337-44ae-a8f6-0ee34814b831,val,General Training/Validation,General Driving
+0c471547-d849-43d3-a375-c88ff2d24ad3,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+80d385ff-545c-486c-a669-6ede736e1e1c,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+2fec3f1c-6cd4-49bd-90e6-f24a7eb4c9df,val,General Training/Validation,General Driving
+b2197ce4-8b33-4438-86e4-96f1acd3a477,val,General Training/Validation,General Driving
+f0a8a661-2d6b-4e6f-8909-8848f2cbecce,val,Lead Vehicle Following,Lead Vehicle Following
+5d42b950-2704-4844-82c0-6d8c6af9225a,val,Traffic Control Compliance,Traffic Control Compliance
+5174e483-c782-4ab9-9899-29cb077dac0f,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+f78565bf-bf0b-4943-a17d-d1904be079ba,val,Traffic Control Compliance,Traffic Control Compliance
+acd3ed23-5500-4a14-bb69-466ad847dc04,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+c6148948-94dd-45b4-bd5e-e7680b825a96,val,Stop for Vehicle,Stop for Vehicle
+e2b4678e-7dad-452d-8fb7-f21031814914,val,Lane Keeping Curve,Lane Keeping Curve
+16c4b871-a605-4609-ad7d-cac9123002b8,val,General Training/Validation,General Driving
+845bc259-61e2-41a6-8e96-1ade34e4e60a,val,Speed Control,Speed Control
+110866ac-9463-41c5-8eba-5704891d7140,val,Nudge Maneuver,Nudge Maneuver
+169d7304-682e-4319-b5c0-abbe6d3ef5a9,val,Lane Keeping Curve,Lane Keeping Curve
+1a6a5e9b-2b84-4f3a-8dec-d8d81baaae47,val,Merging,Merging
+2abddd7d-ee7f-45d7-9c77-d83faf115188,val,Turning Maneuver,Turning Maneuver
+3547c59b-0031-49fe-acae-006842c17842,val,Traffic Control Compliance,Traffic Control Compliance
+535c3591-9137-4a40-af4a-ffb9c1d7113d,val,General Training/Validation,General Driving
+9fddf8fd-1f36-49fa-b734-403c65418f0c,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+d026f4c7-9414-470e-9712-aa74df526685,val,Speed Control,Speed Control
+cd4df8e4-b226-4f32-be9b-3d40e96a1cc4,val,Lead Vehicle Following,Lead Vehicle Following
+14ff55c6-19d7-49f1-ba0f-8003dcb1019c,val,Lead Vehicle Following,Lead Vehicle Following
+8a0d1d49-d1f6-4d38-9330-312490010193,val,Lane Keeping,Lane Keeping
+adeb5d1c-6082-4fe5-adb6-8ef70627d825,val,Lane Keeping,Lane Keeping
+4d419964-8993-4422-98a0-e2fcc368f73b,val,Lead Vehicle Following,Lead Vehicle Following
+1f83d087-1864-4f99-9275-e020211da696,val,Merging,Merging
+9aaf0d96-21e0-4647-a79e-b5f005e8dc23,val,Lane Keeping,Lane Keeping
+9f38c62f-41bd-444a-bf6d-27ed082be322,val,Intersection Navigation,Intersection Navigation
+d8af666d-d1b2-45d6-b477-25c05d193abb,val,General Training/Validation,General Driving
+91a8f4c2-1b8d-4f02-8303-5806c994e5b5,val,Stop for Vehicle,Stop for Vehicle
+3d37b1a1-495c-4a17-a3f0-fbfbd1223a05,val,Lane Keeping,Lane Keeping
+ad973387-e978-4c69-8ae0-4e1903975d06,val,Speed Control,Speed Control
+144ce5f4-1645-415a-9fbc-35f8496ba111,val,General Training/Validation,General Driving
+3c815643-eada-4040-8b6b-a3ed86d1b69b,val,General Training/Validation,General Driving
+87bd339b-25f7-472c-8f85-1cdcfb00dd21,val,General Training/Validation,General Driving
+6606c5a2-5f65-44e3-af45-92648b8c8898,val,Traffic Control Compliance,Traffic Control Compliance
+3c3633ee-35a4-4a86-a409-6d61bdeef391,val,Intersection Navigation,Intersection Navigation
+c0fbd61e-7851-4b4e-8295-12a22c4a722a,val,Lead Vehicle Following,Lead Vehicle Following
+e8742b4a-dcc4-4e3f-af28-0bd3edc83c0b,val,Lane Change,Lane Change
+41e9f815-bc1d-47cc-8168-858e584715bd,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+ed4f36ae-4e47-4181-b32b-d8625f268e84,val,Stop for Vehicle,Stop for Vehicle
+fc67141d-aafb-4836-8405-c5c7650adf46,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+5356a14c-db46-4d42-87d6-b54c3bd3c954,val,Nudge Maneuver,Nudge Maneuver
+a7a0e9f5-49c1-42ca-bda1-4f97357b2f11,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+83ae4e96-5e4c-4b39-9e24-3c7ef6d78303,val,Merging,Merging
+f759ac09-2ce7-4c0f-8371-caa4574160be,val,General Training/Validation,General Driving
+977feada-3770-4279-bb04-34ca062c375e,val,Stop for Vehicle,Stop for Vehicle
+475cef82-5a2e-452e-95f8-a49b095c2754,val,Speed Control,Speed Control
+ffe4c15c-9607-4566-97f0-e818452c3b01,val,General Training/Validation,General Driving
+c2e5fb8b-c1a8-4ec5-9a81-67aea3d266dc,val,Lane Keeping Curve,Lane Keeping Curve
+e96d364c-8ebd-4209-9602-9efaa0bbb8a8,val,Stop for Vehicle,Stop for Vehicle
+0968650b-1cf9-4931-a98f-2d7c212d4328,val,General Training/Validation,General Driving
+4156ac0e-2074-481e-928d-e09f3de0060c,val,Turning Maneuver,Turning Maneuver
+43678728-658d-464b-97c8-ca7a4d29a0a4,val,Lead Vehicle Following,Lead Vehicle Following
+90f9eadd-2389-4e9e-8545-07783fd35478,val,Lane Change,Lane Change
+54a8508f-be95-4148-913c-d730affd5ead,val,Stop for Vehicle,Stop for Vehicle
+a58204c9-a6a3-47b8-bc8d-6baaa5b3098c,val,Merging,Merging
+95f67be9-e436-401c-8783-c06d8cd89bfb,val,Nudge Maneuver,Nudge Maneuver
+579d303e-11aa-44ab-951c-6a9c689fc389,val,Speed Control,Speed Control
+3f6d6171-cbf5-46a5-ae8e-dede2fcdad30,val,Lane Change,Lane Change
+d25e949f-97a2-46c0-90ca-e771a2113d5d,val,Merging,Merging
+d5664512-f76f-4f3e-9c69-4d3dd7df7b89,val,Nudge Maneuver,Nudge Maneuver
+1bbd07fd-f82c-4cff-b00c-609d213f7092,val,Intersection Navigation,Intersection Navigation
+612ba10b-b6af-4565-984f-18f77873f8d7,val,General Training/Validation,General Driving
+ceef7520-356b-43e3-b8fb-869f9814a637,val,General Training/Validation,General Driving
+3c04413c-0b4f-4ec6-bd3b-30bcb09126c7,val,Lead Vehicle Following,Lead Vehicle Following
+95c47ea7-316a-4f35-b78f-353d6f290ea7,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+30043182-c407-45b3-a83e-6346a0448d77,val,General Training/Validation,General Driving
+0850481c-0a92-4fbd-a55f-7cd86d724ab0,val,General Training/Validation,General Driving
+e0cd5b02-562b-41d4-a3ba-2133fa2c0a85,val,Speed Control,Speed Control
+ff99445e-5811-4912-9fb6-72ec25eebe58,val,Turning Maneuver,Turning Maneuver
+7364dc11-abb9-4da3-b578-ddfdb782b793,val,General Training/Validation,General Driving
+6ef74404-0a5a-41d7-8666-0f1cbe6c16e0,val,Lane Keeping,Lane Keeping
+98c216e3-d86c-47ad-bd2d-bdeba1607007,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+8f7d13fb-e5fe-474a-b78e-b4a300f074c0,val,Speed Control,Speed Control
+957d89c1-eef9-42ef-b48b-672591a454f3,val,Cut-In,Cut-In
+74ef21e9-7b03-48de-a278-57c0bc18985b,val,General Training/Validation,General Driving
+4edc94de-27c1-4559-9a1d-52f7d90c6c3f,val,Cut-In,Cut-In
+bbb114c7-8992-4736-b3af-e3b809daa95b,val,Cut-In,Cut-In
+6f24b314-c3e6-4c58-8851-ee468ee10f29,val,Stop for Vehicle,Stop for Vehicle
+6ca4bdb9-71de-4c34-ac67-7595de17bce2,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+0817498b-77f3-41db-9316-614d78cc07c2,val,General Training/Validation,General Driving
+2a42bf95-97fa-4783-a342-ac4ff6a2e2ec,val,General Training/Validation,General Driving
+d307cf66-864d-4838-83f9-9fc1a22c1442,val,Lane Keeping,Lane Keeping
+0e09cc7e-6204-44e0-9a23-b3c6efe18ea8,val,Nudge Maneuver,Nudge Maneuver
+ba36c095-d018-454b-970d-0f3814348af4,val,Merging,Merging
+41142d8e-e157-4f47-bb25-8d1bb1cddddf,val,General Training/Validation,General Driving
+1d119617-a100-46ec-b149-7eb9d08551e9,val,General Training/Validation,General Driving
+bda86905-350f-4e14-bf6c-ccd394d8bd48,val,General Training/Validation,General Driving
+bd6ebed6-cb3b-4467-8388-dbc4394fa50a,val,Speed Control,Speed Control
+fafef694-857f-4a09-8299-010a1b91ef94,val,Intersection Navigation,Intersection Navigation
+3374e760-0ed0-457d-8e07-c0a3c9515d86,val,Stop for Vehicle,Stop for Vehicle
+7d990c94-c58b-4ca0-bed4-83148e8ada0e,val,Nudge Maneuver,Nudge Maneuver
+2a139da0-0340-4225-98c0-721251fb2501,val,General Training/Validation,General Driving
+28707488-a2b4-45b0-b5cd-3fb8e3443531,val,Lead Vehicle Following,Lead Vehicle Following
+1a54d5d3-32b0-416c-bf49-162407ed7132,val,Lead Vehicle Following,Lead Vehicle Following
+0ed6db2e-cbec-4b49-a4ef-71d006005738,val,Cut-In,Cut-In
+cd332510-8406-4790-a324-c7e4e690e729,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+ef53292c-0d7a-4161-a43e-fbf6607b6d94,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+12d81cea-833c-459d-86b8-eb6ecbdb91b2,val,General Training/Validation,General Driving
+385b571a-b802-4002-93d1-47196d1b0f51,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+a79263b8-c098-49d6-a05f-4c04902b7c05,val,General Training/Validation,General Driving
+6f3f345e-8a8e-48f7-a3bf-16b1db8decfc,val,Traffic Control Compliance,Traffic Control Compliance
+8d96098c-738e-466f-a6e6-ad103e97f265,val,Intersection Navigation,Intersection Navigation
+bb9c5858-aa97-4949-a2a6-b7c3ac732f39,val,Lane Keeping,Lane Keeping
+b5d68bdc-4146-41f4-acc9-5e5d8df48105,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+101562af-3d78-4145-b79a-5f668a8ea49c,val,Lane Keeping,Lane Keeping
+41fb9cad-1226-435a-89de-d5b21b31c7ec,val,Cut-In,Cut-In
+4142164b-9714-4905-b8e1-8687a9e3613f,val,Lane Change,Lane Change
+031715e9-0e5c-453d-b176-c1bffe707945,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+741545b4-292e-4ab1-becd-d4634e6c5c90,val,Intersection Navigation,Intersection Navigation
+bfd3cbd5-907b-4f86-807d-49658916fdc8,val,Lane Change,Lane Change
+bb3dbb69-bf7d-479f-95d5-cd0958a87218,val,General Training/Validation,General Driving
+496794c1-c49c-49f2-9849-b6f738fcab54,val,Nudge Maneuver,Nudge Maneuver
+8a2283fd-a4c4-446b-ac57-b696de37ed69,val,Lane Keeping Curve,Lane Keeping Curve
+09666101-90d3-4092-b5e5-e16e1a11506f,val,General Training/Validation,General Driving
+4b70ce74-ba82-43a4-8d6f-4889def7d9a5,val,Nudge Maneuver,Nudge Maneuver
+ed594e59-6a6d-4efa-b286-cb944f1b5848,val,Lead Vehicle Following,Lead Vehicle Following
+ed8991e3-49e8-4541-91f6-9590bc48c67d,val,General Training/Validation,General Driving
+24a53b02-d435-4eb6-9571-5e6bda50e050,val,General Training/Validation,General Driving
+60bab32b-d065-4c18-823f-a842dd00dd2a,val,Intersection Navigation,Intersection Navigation
+ccc91547-3280-4e01-a15b-d90253b61566,val,General Training/Validation,General Driving
+4eadac11-b6ba-4bcc-b316-e298caf20518,val,General Training/Validation,General Driving
+82476b2d-1f95-4bed-abfd-e87b7d55c23b,val,General Training/Validation,General Driving
+2f6d5050-870e-4ebe-b633-aeb3b1a830ff,val,General Training/Validation,General Driving
+cb13510a-b510-4468-8a50-267bb5a9aec5,val,Lead Vehicle Following,Lead Vehicle Following
+2d09886b-b695-42bd-a624-cae4d33dfb1d,val,Lane Change,Lane Change
+1f33566b-6a59-47a2-a6cd-96cd4fe7cc26,val,Cut-In,Cut-In
+8e3c3dc1-79c6-44dc-adbc-eaf21e946f44,val,General Training/Validation,General Driving
+2fd6aed2-8ec7-42bc-a901-d80ad2019550,val,General Training/Validation,General Driving
+b8b063a3-701b-4813-9a4c-2c7f0a5d45bb,val,Lane Keeping Curve,Lane Keeping Curve
+b3428b65-19a0-4b6e-86f6-4637b5d0e986,val,Lane Keeping Curve,Lane Keeping Curve
+6b04e841-19df-40f1-8c3d-602096909367,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+bf8c41ab-896c-4f7c-91cc-c344f8ad98bc,val,Merging,Merging
+c11af873-63fb-4490-98ff-b9c08294a959,val,Merging,Merging
+1243b0c7-88fd-4fa4-90e2-540ac963bca9,val,Lane Change,Lane Change
+99ebcf6d-8d20-4123-b510-124282c56eca,val,General Training/Validation,General Driving
+e13d0367-e15a-4a3e-9384-500aa5bb2a43,val,General Training/Validation,General Driving
+5d860ad0-e2bc-48d8-bb1d-22a1de423cda,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+63bd6f93-242f-4cc7-86fd-29abc9ae987f,val,Traffic Control Compliance,Traffic Control Compliance
+1100a1e1-3650-4ca2-88ff-6277f0a5d57e,val,General Training/Validation,General Driving
+5b8b285a-2b47-49e5-9d2f-ea91f6771a7a,val,Merging,Merging
+11ee5a09-6c46-4f7a-b605-dc44e5faf189,val,General Training/Validation,General Driving
+ffe2d18f-7939-433a-9f00-13fde5535dfc,val,Intersection Navigation,Intersection Navigation
+a1e507d3-e75f-4b26-b7e3-c0918d51e4bf,val,Cut-In,Cut-In
+c26a93e9-50f1-40ef-bf47-1966a01e868b,val,General Training/Validation,General Driving
+f3378ba3-fd25-4283-8b9d-4a867895bc93,val,Lane Keeping,Lane Keeping
+bd124645-9329-460e-9015-4c6f3589b03a,val,General Training/Validation,General Driving
+d8b8139e-9a3a-4b73-ac4e-fa8ab2f50bae,val,General Training/Validation,General Driving
+c8b229e2-397a-4d04-8197-dd657658db3a,val,General Training/Validation,General Driving
+c6cb41cc-1075-4e62-b235-fa015dc40e9b,val,Lane Keeping Curve,Lane Keeping Curve
+a6c67389-159b-4494-a679-d82bf4155b34,val,General Training/Validation,General Driving
+0c4e9067-23d1-4f8e-925a-16c46dd375f5,val,Cut-In,Cut-In
+ec63f426-c820-47fc-b248-624d1aef9b6d,val,General Training/Validation,General Driving
+53cea045-d9d5-4084-87b3-4b44badc59c2,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+c168a9ad-8bf7-4f05-bb4f-eb889b7bc56f,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+f504c4bb-49cb-46dd-a793-a31bbd6e2edd,val,Lane Keeping Curve,Lane Keeping Curve
+41b6a53e-5e16-4387-a405-ea01d94d5efd,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+66af8f58-072e-43a9-9526-6c0b5d589e35,val,General Training/Validation,General Driving
+14d54b36-5751-4d1e-837f-ffdbdd5fc999,val,General Training/Validation,General Driving
+d7d7f7a8-80d5-4423-883c-34f73b544243,val,Lane Keeping Curve,Lane Keeping Curve
+6dcd288e-f0de-4c02-b44b-bcaecd089f2c,val,Nudge Maneuver,Nudge Maneuver
+0293b31d-dd34-4db0-a177-ace2a2496acb,val,Speed Control,Speed Control
+80fe7025-0a3e-4ff7-90ab-9da1878fb30e,val,Nudge Maneuver,Nudge Maneuver
+aaabcaa6-479a-4a92-9587-6e5bcea18c38,val,Traffic Control Compliance,Traffic Control Compliance
+a200efdd-71cc-4b8a-8401-b86461957251,val,Traffic Control Compliance,Traffic Control Compliance
+c5fa94e0-008a-4d78-825b-117089ff2d52,val,Traffic Control Compliance,Traffic Control Compliance
+3c910471-cab3-4c77-b6af-c3d658670d94,val,Lane Keeping,Lane Keeping
+c6dada3c-8c18-4f01-b78b-116d7ac4273c,val,General Training/Validation,General Driving
+4b8dd889-9338-49f8-ab5d-d1c672075180,val,Nudge Maneuver,Nudge Maneuver
+528ecd77-9b96-4e77-bb9d-d5bf90c814c9,val,Traffic Control Compliance,Traffic Control Compliance
+6a4499a3-6db6-4ed5-8df5-4cd138299d00,val,Lane Keeping,Lane Keeping
+f03eeeb3-0a94-4805-97f9-6cd4e8670114,val,Lane Keeping,Lane Keeping
+09e8ce48-fab7-434d-abcf-826d126fc370,val,Traffic Control Compliance,Traffic Control Compliance
+c5902782-e008-4e3b-88d7-37e2e658d94f,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+af29fb7b-8c94-41ed-b80f-af1fe2151335,val,Stop for Vehicle,Stop for Vehicle
+fc701779-b44f-43c7-8bbd-241802738256,val,General Training/Validation,General Driving
+bfecaec7-bec3-420a-bcd8-e4a5830c18fc,val,General Training/Validation,General Driving
+a1b09aa1-15ba-4576-9ece-30f491de298a,val,Speed Control,Speed Control
+9d8cacf1-d756-45f1-9a79-0d6c5fcf5b8f,val,Traffic Control Compliance,Traffic Control Compliance
+67ce128c-5ab3-44f9-809c-f2eb1860b2a5,val,Traffic Control Compliance,Traffic Control Compliance
+935b7e50-730e-4f94-bac8-21f50350d252,val,Merging,Merging
+3d94320b-5b6e-45e3-8140-7e37d2aea786,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+501079f1-2644-49f2-81e6-3f5aa6474044,val,Cut-In,Cut-In
+97028216-1bd6-4e6c-a5c6-f8dc7e55140b,val,Stop for Vehicle,Stop for Vehicle
+17e11b53-c307-4e63-9d9e-6ad6c46d3743,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+6a1c769e-3da2-46c8-90a2-1b56d27c1b22,val,Intersection Navigation,Intersection Navigation
+95416562-1bb9-49fa-81b0-8cd314196f32,val,Stop for Vehicle,Stop for Vehicle
+f6bcd5f9-30c3-4593-a1bf-4b152b38f3d2,val,General Training/Validation,General Driving
+bd154ba7-ae5e-4db4-8e69-94b079f4b78d,val,General Training/Validation,General Driving
+126c40c0-2c20-472e-bbec-da4fa182027b,val,General Training/Validation,General Driving
+cf355883-e602-49d2-ac12-9d3a56aaf9f9,val,Lane Keeping Curve,Lane Keeping Curve
+acd2cbdf-e070-47bb-9c32-504b06d22932,val,General Training/Validation,General Driving
+fd367bff-be70-4d1b-9757-a086fb9b1890,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+3afb9b86-bcf6-42f4-abfa-2aac294e70f7,val,General Training/Validation,General Driving
+cf540195-f07d-4efc-b498-49e11695479e,val,Lane Keeping Curve,Lane Keeping Curve
+9bc45731-f73b-42f4-940d-2f9b0b11d428,val,General Training/Validation,General Driving
+b02d91f6-ad26-4e62-b178-72cdeef761d2,val,General Training/Validation,General Driving
+7afff4ef-d4bd-4c43-8687-782fe27d0653,val,General Training/Validation,General Driving
+c148a945-173c-47b1-96b6-8318eed7e3fd,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+e2aa7a00-198c-453e-80b1-9382d644c7b6,val,Nudge Maneuver,Nudge Maneuver
+54c6515b-59d8-41ee-ba3d-eb73c41387cc,val,General Training/Validation,General Driving
+b7b3611b-752c-483e-b980-729fd2df9d38,val,Cut-In,Cut-In
+0ba7c451-d6fa-498d-ac84-c6e65186d3ad,val,Speed Control,Speed Control
+e3d56b84-d129-4375-b51c-adcc325e3c45,val,Lane Change,Lane Change
+d2e77d9f-9ddf-4ad3-b593-6603d68cdba6,val,Intersection Navigation,Intersection Navigation
+74d362ca-3e66-40a3-b34e-4838b378d51d,val,Nudge Maneuver,Nudge Maneuver
+052b9831-3d54-49e0-a66d-afc44c35a84b,val,General Training/Validation,General Driving
+46ac99b2-bda9-4d94-8366-b07ca7d7504a,val,Lead Vehicle Following,Lead Vehicle Following
+35729282-9acd-4780-a873-73aaa3a8a4d4,val,General Training/Validation,General Driving
+8c8d8d4c-77d0-45bf-a465-de951c70f17c,val,General Training/Validation,General Driving
+77d0f2aa-77f8-456a-b925-8fa82b1af944,val,Turning Maneuver,Turning Maneuver
+9174fef2-e8e6-4b57-a200-8e15d238b610,val,Lead Vehicle Following,Lead Vehicle Following
+9eb46da4-7add-46f3-891b-00e3e587bf8a,val,General Training/Validation,General Driving
+17972e81-815d-4331-9b66-2cd02c2a8c6f,val,Stop for Vehicle,Stop for Vehicle
+3a567a46-8863-4ad4-9fe8-e7005b985174,val,Speed Control,Speed Control
+4dd1522d-d9ed-432b-b510-8a549f6e2708,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+eba12b30-0811-4692-ba14-3fa31215d799,val,General Training/Validation,General Driving
+bc18378d-e1f1-455e-8209-939525b93132,val,Lead Vehicle Following,Lead Vehicle Following
+281859c9-6aa6-4942-8a82-881243c2c2f3,val,General Training/Validation,General Driving
+a768c8b5-7a8e-4a27-86ce-38f553295876,val,General Training/Validation,General Driving
+853bd49d-85f0-4c7c-b5d5-966e9e4e45df,val,General Training/Validation,General Driving
+b4aae97a-2b85-4b9f-b4c7-6d99d1135878,val,General Training/Validation,General Driving
+bb2b0e7c-6c66-4fb4-8836-932727e433dd,val,Nudge Maneuver,Nudge Maneuver
+5c126045-83e5-44bb-ae76-89060d8a32f0,val,Stop for Vehicle,Stop for Vehicle
+81f8bde7-4816-469f-a542-5974ba4cd274,val,Lane Keeping,Lane Keeping
+c22c190e-60c8-44e9-9ffa-335a2edbb380,val,Lead Vehicle Following,Lead Vehicle Following
+4aab4ffe-c6e6-4fec-b762-e5a3fe7f8a80,val,Speed Control,Speed Control
+09761c5f-6d8f-454f-b996-323fbf9918dc,val,General Training/Validation,General Driving
+48cc9f01-d9c7-4e7b-adfc-c8725b8f7e79,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+8f5af28b-6e4a-4156-b9a2-7b1179ba758b,val,General Training/Validation,General Driving
+7a532499-30e5-41a1-b5b3-670de1470ee1,val,Cut-In,Cut-In
+4364f131-2f61-429b-a912-2a977f03745c,val,General Training/Validation,General Driving
+181462b6-10d4-4d8d-a727-5de43bfcbe52,val,Merging,Merging
+3c3fb377-50da-4e30-8a4e-195e3fb89fb3,val,General Training/Validation,General Driving
+e70a4fc2-ecca-43ff-8c22-5bdaec463b6d,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+46af301b-4bcc-4429-aad7-b81233affdbf,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+b69ff057-d68e-4d22-83dc-fad0472e23f5,val,Speed Control,Speed Control
+0dd6178c-1f94-4928-b631-51b466aa3276,val,General Training/Validation,General Driving
+6f45f11c-a8b1-4f87-bcbb-163919f70ac3,val,General Training/Validation,General Driving
+a6c01aaa-b2be-4d75-8e70-0366338fe718,val,General Training/Validation,General Driving
+9e00498f-2c00-49cb-8b15-4a6383f56b81,val,General Training/Validation,General Driving
+bb17b886-cd87-4920-bc94-9904c2452bcc,val,General Training/Validation,General Driving
+f533e576-2d69-422a-aaf6-9c5386f4aba1,val,General Training/Validation,General Driving
+c8fe8936-d68e-4ea9-9abd-58e07deadc27,val,Nudge Maneuver,Nudge Maneuver
+5bd726f9-7f30-49e1-b47c-833fe4b2d820,val,Traffic Control Compliance,Traffic Control Compliance
+938308c5-4485-4752-b96c-5207f335fb1b,val,Lane Keeping,Lane Keeping
+2d458140-cad2-4a6a-babd-8e1ce5d0c0a2,val,General Training/Validation,General Driving
+f936446f-2387-488e-a100-35989a66799d,val,General Training/Validation,General Driving
+fd780149-e7fc-4432-a498-e7ba384b997a,val,Speed Control,Speed Control
+4f76889e-cee6-4bfa-a2a9-8d432df60b41,val,Intersection Navigation,Intersection Navigation
+a1ff9fcc-85f5-45c7-a601-312a48049ec4,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+916a5c20-ec5f-4861-9dab-0604facaf1da,val,General Training/Validation,General Driving
+4a7ea7e6-3323-4f58-9f18-c77fe5c44043,val,Lane Keeping Curve,Lane Keeping Curve
+4faf5341-b781-40a7-a02d-7159b5ea170e,val,Merging,Merging
+729d78a6-46ef-40ea-a309-56b9c86587f9,val,Cut-In,Cut-In
+66307480-e48e-4886-bf6a-da6e3d98c7cd,val,General Training/Validation,General Driving
+e3b65d3e-43ca-4f66-b0be-c3b080fcff71,val,Lane Change,Lane Change
+864340a2-51e9-4095-b73d-18b60f53f579,val,Intersection Navigation,Intersection Navigation
+adfa19d8-bcf6-4f07-b85d-5114c764c457,val,General Training/Validation,General Driving
+52164f16-67de-446f-b46a-fe1feb5b5bbc,val,General Training/Validation,General Driving
+4f8880c2-051c-4321-b6bd-b11797c5cadb,val,General Training/Validation,General Driving
+759564ae-addc-408f-80b8-93e9440f0aaf,val,General Training/Validation,General Driving
+3f350912-d30f-42be-9314-9ee2009070d8,val,Lane Change,Lane Change
+855c1222-e940-43c5-9a59-002e1326de00,val,General Training/Validation,General Driving
+8b1d71ce-a877-4d06-93a7-99a62920bcf2,val,General Training/Validation,General Driving
+c06fa9f9-5af7-48cc-a913-f3d377d18604,val,General Training/Validation,General Driving
+0e0307af-ebb5-4f2d-8994-383ac2c58ded,val,Lane Change,Lane Change
+43cae450-bc2c-49b8-9402-d8a83fac3f78,val,General Training/Validation,General Driving
+ded30c29-b4f0-48d8-99a3-bdf246765d38,val,Turning Maneuver,Turning Maneuver
+81683c1e-0dc6-4266-9bb4-c12ba38204b0,val,General Training/Validation,General Driving
+e3398416-5289-4305-9fbb-f00530cf620b,val,General Training/Validation,General Driving
+a5187670-5d4d-453e-b622-c207900b0099,val,Lane Change,Lane Change
+bd378ec1-d5e9-4a7b-9dc3-d2d682deb0bb,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+b95d0578-778c-4058-a67a-54eecc20e526,val,Nudge Maneuver,Nudge Maneuver
+56b7b4e9-4729-46bb-aee9-d19c143745c7,val,General Training/Validation,General Driving
+5624295b-d5da-44f7-9bab-6f40f91a4109,val,General Training/Validation,General Driving
+fd9cd847-92a2-4289-ad59-4b8dd445dd8b,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+b5649fa3-9e41-4b4b-8d86-34c0f57aa3fa,val,Speed Control,Speed Control
+114ff21d-2491-47f1-b8e7-572f5f3e7340,val,General Training/Validation,General Driving
+87693225-a1c6-4bd1-b933-3fb3b3cdcd26,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+5c61fcfc-1e72-46b6-a8d7-b2e4640bfe16,val,Speed Control,Speed Control
+dda59aa8-7cc2-4475-aa15-9054035d11bf,val,General Training/Validation,General Driving
+271155f5-b7c2-48d6-9ab1-47599c6ef75a,val,Lane Keeping Curve,Lane Keeping Curve
+89733d83-75e8-4dc1-aeb0-b2394c83a48b,val,General Training/Validation,General Driving
+bcf0b039-be3d-4de5-9964-80a69627dea6,val,Stop for Vehicle,Stop for Vehicle
+9e2482d3-0bcd-404a-ad9d-9738a003cad3,val,General Training/Validation,General Driving
+4eb8cdc4-2e72-4cf0-8e78-5f47a0babb2e,val,Merging,Merging
+7595825d-851c-4a6f-8f66-66b5ebae8e03,val,Nudge Maneuver,Nudge Maneuver
+ce4480d8-41f7-4728-9fc0-f1a452875caf,val,Lane Keeping Curve,Lane Keeping Curve
+6c1e42af-11d7-4c62-b9fb-a0615bab24d4,val,Nudge Maneuver,Nudge Maneuver
+3a8e6ee3-9388-41f5-b004-a4c263713c53,val,Lane Keeping Curve,Lane Keeping Curve
+96e86af6-53dd-4f60-8cd8-f8ac25d5ae93,val,General Training/Validation,General Driving
+42de94d4-d53d-4ea1-8e6f-9eaaab2faad0,val,Lane Keeping Curve,Lane Keeping Curve
+33193a83-da93-452d-a13d-77c0596e7e12,val,Nudge Maneuver,Nudge Maneuver
+7c428b77-d868-42e5-9ebe-55a2aae7374f,val,Speed Control,Speed Control
+cc2125a6-01a2-46f4-8137-9ed9bb89472d,val,Lane Keeping Curve,Lane Keeping Curve
+7e942364-7cd5-4b3b-b9fa-e7b66a6503fd,val,Merging,Merging
+d2b0e2d9-6d5c-4494-9165-f49cddcac6c3,val,Traffic Control Compliance,Traffic Control Compliance
+3be96217-2a8a-448b-a51e-dc06f604871f,val,General Training/Validation,General Driving
+9a9e077f-1cc9-45d6-9def-3d1949be3310,val,Stop for Vehicle,Stop for Vehicle
+340aeafe-12b2-41e1-b58f-bf9e4f70464c,val,General Training/Validation,General Driving
+17e59d01-14cf-40a1-8d67-2dbbe5d5d0f5,val,Speed Control,Speed Control
+3f15a812-001a-4507-8a56-e0fed1371e69,val,General Training/Validation,General Driving
+74a794db-6353-40e3-bd79-c29210c7ad7e,val,General Training/Validation,General Driving
+8362f993-be0a-4e70-b989-e5307a39f80c,val,Cut-In,Cut-In
+1beb40bb-8563-493e-8e80-6c49f39136bf,val,Intersection Navigation,Intersection Navigation
+02057a83-028d-4559-b7c8-8f2bae6516ea,val,General Training/Validation,General Driving
+524d685d-2f48-4c3d-b84f-c58c4457774b,val,Speed Control,Speed Control
+42029a2c-b3f4-409a-b1c8-c0c07f5fdfea,val,General Training/Validation,General Driving
+d1720df1-aa7f-46eb-a485-82c47f1ec925,val,Nudge Maneuver,Nudge Maneuver
+8cc0c0e2-bc65-424b-b466-01549ae03d01,val,Traffic Control Compliance,Traffic Control Compliance
+b5f0c101-c3f1-48b0-9c0b-66ba40065596,val,Lane Keeping Curve,Lane Keeping Curve
+e50f115e-5612-4d65-bed6-85117a7843f0,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+0a4e47d3-d1d8-4e79-8d12-0bf4533960e5,val,Lane Change,Lane Change
+016c3d41-7525-4a83-bd7f-e13d9fcec926,val,General Training/Validation,General Driving
+fad9a148-0aea-4547-91bd-18f7b002d900,val,Lane Keeping,Lane Keeping
+203306d3-22ae-4d2d-b032-5a365dee0204,val,General Training/Validation,General Driving
+21e2f703-5a88-400c-897f-557fda9df285,val,Traffic Control Compliance,Traffic Control Compliance
+74799d70-e79f-4a29-9ea0-a493f5174a52,val,General Training/Validation,General Driving
+4b5abdd7-3264-4df8-812f-25e31a99c459,val,Merging,Merging
+1edb6648-6cba-416c-aac9-55fb4b7c7f84,val,General Training/Validation,General Driving
+bd2c4c22-f086-4697-9e41-e1018ab5acf4,val,Cut-In,Cut-In
+83fdc83f-a1de-4794-b4c0-c062bce667e6,val,General Training/Validation,General Driving
+f7f30133-ebb3-49c4-b684-decb43a00ec4,val,Lane Change,Lane Change
+c1166c09-d2a6-4c4f-97f8-be1954d48df1,val,General Training/Validation,General Driving
+5d6524b2-c754-432d-8d5b-d2a84af21126,val,General Training/Validation,General Driving
+b1b54206-c531-4e8d-b5c7-a8764f4703e6,val,General Training/Validation,General Driving
+15e3733c-6bdf-45f2-a6a4-03d2e9c6fa3b,val,Lane Keeping,Lane Keeping
+dabe3c66-6775-44c2-90d1-3ab30576b98e,val,Speed Control,Speed Control
+f511425d-9e2d-47dd-8913-9247fb17378d,val,Speed Control,Speed Control
+0b0daeb1-8fe9-4695-bf1e-9a287c1cd3f0,val,Lane Keeping Curve,Lane Keeping Curve
+99db9797-aaaf-4492-8532-bd5ace58de3a,val,Merging,Merging
+e43f8ad7-7d99-48ee-8241-80e14f79aead,val,General Training/Validation,General Driving
+3983af5f-514d-4ac2-9052-62dda962a8a8,val,General Training/Validation,General Driving
+c4a149ec-838d-4c49-9226-71a888d47f1b,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+60b439b0-2046-41f8-b662-3dfb634cbd70,val,Lane Change,Lane Change
+1eb3e494-6504-4624-b5bf-2f42617fedc1,val,General Training/Validation,General Driving
+8580ffc6-1254-4d8c-8145-0f8968f949a2,val,Merging,Merging
+54aaea16-d349-40e3-8010-72c77b6f7df2,val,General Training/Validation,General Driving
+dc088965-0c49-428c-8d16-0a9d46886d95,val,General Training/Validation,General Driving
+678d8768-2f02-4497-8ea0-b1da73214d47,val,General Training/Validation,General Driving
+6cd4ebb7-2810-490c-b8d0-21a4d0d36d84,val,General Training/Validation,General Driving
+0694d1b0-0770-4507-b4e7-f85baf77dfa2,val,Merging,Merging
+056c9973-4c1d-4955-827d-bf9284bd0567,val,Cut-In,Cut-In
+921f5465-692c-4b87-982e-3f43a58f4bd0,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+927ba2e9-6326-4af3-967b-fb20746f43a7,val,General Training/Validation,General Driving
+f1410aab-f3fb-4aff-bb95-c73e85c3ee1b,val,Speed Control,Speed Control
+a8b3af42-6ece-4795-af69-61fb0fd551a0,val,Lane Keeping Curve,Lane Keeping Curve
+8d2175d4-db15-4008-a85c-e37cc0f83e47,val,General Training/Validation,General Driving
+359b3eab-9b87-443f-9825-45ca611c4f41,val,General Training/Validation,General Driving
+cb54dc4d-8804-4c5e-879c-ac683399ad1e,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+76a1a6b3-78d9-49b4-807d-06ef0e4f00c7,val,Lead Vehicle Following,Lead Vehicle Following
+1e8a506e-a4c2-4ef4-9565-83190fae91b4,val,Nudge Maneuver,Nudge Maneuver
+770fe44f-580e-462c-aa11-668124a82f0e,val,Merging,Merging
+adf02d20-81ba-4b6c-bf43-a0b465e8a1e6,val,General Training/Validation,General Driving
+5a78576a-a7e0-4e68-940e-84ce26131a01,val,Intersection Navigation,Intersection Navigation
+a04e6fd6-eb70-4e90-a8e4-38bee40a833f,val,Intersection Navigation,Intersection Navigation
+177c4d4e-fdc9-4fa1-8fb8-32b4ffe2bfc4,val,General Training/Validation,General Driving
+053bf04a-57bf-470f-84cc-54cc04fcdd16,val,Lane Change,Lane Change
+f10c6e04-80ad-4c76-93cf-82259e08e2ea,val,General Training/Validation,General Driving
+4bc49772-b84d-489b-8edb-f41fe305d3cf,val,General Training/Validation,General Driving
+7e2443d7-0c3d-4cae-a8de-eca64d76aec9,val,Merging,Merging
+33f86696-86c7-4a45-9cff-8af64fc91a31,val,Lead Vehicle Following,Lead Vehicle Following
+dbda3915-1ecf-456d-a525-f1d8f9c5eec3,val,Lead Vehicle Following,Lead Vehicle Following
+a38f9a7e-8ee5-44a3-87ec-fe8dd44119d9,val,Stop for Vehicle,Stop for Vehicle
+db5aa0ff-58f1-45e6-89c8-11d29247af34,val,General Training/Validation,General Driving
+0c401731-9708-4c8e-a766-f3945cd107ce,val,General Training/Validation,General Driving
+01d29037-8f41-4b29-b89b-0161165ab86a,val,Stop for Vehicle,Stop for Vehicle
+c67dd92e-79e0-4b16-8d49-1b757857e912,val,Nudge Maneuver,Nudge Maneuver
+c63cca21-69c5-4ec3-abea-2b73ca6bcc54,val,Nudge Maneuver,Nudge Maneuver
+02b98400-66b7-4604-bca6-8b56cb386431,val,Lane Keeping,Lane Keeping
+dcaa4a47-b02d-46f3-9969-453da9290619,val,Stop for Vehicle,Stop for Vehicle
+bdaec80e-dfaf-4076-b513-36271f2b12db,val,General Training/Validation,General Driving
+dffcf9f8-f80a-4796-99da-d8763d153cc7,val,General Training/Validation,General Driving
+a84d7d6a-810d-4431-8a7c-e3db4b170534,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+014b61de-05ca-48e9-a48d-8f6e6e238d82,val,Intersection Navigation,Intersection Navigation
+208353fb-3e5b-43c3-86bd-07e3f97c24a4,val,General Training/Validation,General Driving
+07f867f5-de9a-4c4c-99c5-cae641c10bb0,val,Lane Keeping,Lane Keeping
+1d3bf9d1-3ed7-4aad-a022-1e0bfd529210,val,Lane Change,Lane Change
+3304ef40-0ce5-4b38-b91c-d3dc5c9e390d,val,Cut-In,Cut-In
+5707c3de-b647-49ed-8f8f-f5a5112db7c9,val,General Training/Validation,General Driving
+388db19e-1357-4752-b9aa-90304bb22791,val,General Training/Validation,General Driving
+b8c924fb-4d34-4d9b-a5cb-e98425084f88,val,Traffic Control Compliance,Traffic Control Compliance
+b2d015e7-b09b-4225-9a92-115e67ff58ea,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+344e6e60-eb2a-491a-bcdb-350c9db6d9de,val,Nudge Static Obstacle Maneuver,Nudge Static Obstacle Maneuver
+a95b1979-4ee1-4e90-98b2-e89d53809c69,val,Traffic Control Compliance,Traffic Control Compliance
+1f04982a-4a51-45c9-8fa3-f790a6725117,val,Stop for Vehicle,Stop for Vehicle
+bc92c0c2-4a06-4a8a-b573-d991b4d8c3c8,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+16661317-1070-4f7c-9177-b38fbdabb720,val,General Training/Validation,General Driving
+53316088-1980-4f32-a433-a1eac5299b5a,val,Intersection Navigation,Intersection Navigation
+3e427b9e-6fdf-4000-b145-2fb897607c15,val,Lane Change,Lane Change
+01400302-367f-4ca7-b354-d5111fad0eeb,val,General Training/Validation,General Driving
+5e6fad00-7820-4c8e-ae83-1c2bb1c1ab5e,val,Traffic Control Compliance,Traffic Control Compliance
+e4163de0-e470-403c-b036-3b8b82ad9697,val,Nudge Maneuver,Nudge Maneuver
+fffd63c0-813f-46c3-b60b-45e75902e458,val,Stop for Vehicle,Stop for Vehicle
+eadb35c3-d3cd-4c9e-8f7b-f444b50002c2,val,Traffic Control Compliance,Traffic Control Compliance
+a9d1080e-88ed-4efc-a0f5-4051c43569c5,val,Turning Maneuver,Turning Maneuver
+0168f035-8c58-4dbc-8a04-3c3005317d0c,val,General Training/Validation,General Driving
+1c0cbfd5-6407-4a91-b1d6-141a2adf4a30,val,General Training/Validation,General Driving
+d1081e87-3f22-4c34-9886-d012813ed533,val,Nudge Maneuver,Nudge Maneuver
+9a538564-bf9c-40ba-b0c5-0f2d910a5d46,val,Lead Vehicle Following,Lead Vehicle Following
+15bcefb2-ccf2-4a64-be01-6a8956488a2f,val,Stop for Vehicle,Stop for Vehicle
+9fba7d33-843d-413b-a361-94c6b0dab8e6,val,General Training/Validation,General Driving
+1078255a-4aae-4910-ac7e-61f5bfd8cceb,val,Lane Keeping Curve,Lane Keeping Curve
+63f1d5ce-4923-4c44-9b51-76a297e83e3a,val,Speed Control,Speed Control
+0c471648-a6f3-4318-aa51-77032a9e71eb,val,Lead Vehicle Following,Lead Vehicle Following
+cc6df833-b2aa-42ce-a1b1-279cf7b290cc,val,General Training/Validation,General Driving
+bf26e7b4-e4fe-4d80-a847-9d2d3585ec3f,val,Speed Control,Speed Control
+22840584-2751-436f-808a-c45bcb0e8d47,val,Lane Change,Lane Change
+f00a4b07-a36a-4365-8006-a8feb933b1a6,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+19c2f81a-5d65-41e7-a807-f5c249530eab,val,General Training/Validation,General Driving
+d1a32883-acb9-4193-9b04-b352d4827eb3,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+0556f4d8-6bfe-4299-9c2d-fb4e7c8efeed,val,General Training/Validation,General Driving
+caecc9a4-874a-43cc-b140-16ed97ad1d4a,val,Lane Keeping Curve,Lane Keeping Curve
+c8ca9951-8c4d-4764-9c87-61f03c028111,val,Stop for Vehicle,Stop for Vehicle
+5a08dcbd-6b1b-4531-b104-1eb94f0925d6,val,Vulnerable Road Users (VRU),Vulnerable Road Users (VRU)
+50f8e97c-a682-4630-ad20-b26f2dda4e47,val,Traffic Control Compliance,Traffic Control Compliance
+d265227a-df8f-4dea-a3cf-ff0909c66aeb,val,General Training/Validation,General Driving
+713825d0-37c5-438a-803d-1cbb547ec474,val,Lane Keeping,Lane Keeping
+4cf0309f-82d5-49a7-9125-d35e6400d4e2,val,Nudge Maneuver,Nudge Maneuver
+7f12aa44-8947-4dee-a136-96b2494dcbbb,val,Stop for Vehicle,Stop for Vehicle

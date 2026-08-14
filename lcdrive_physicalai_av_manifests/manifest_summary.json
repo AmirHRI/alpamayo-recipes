@@ -1,0 +1,91 @@
+{
+  "source_note": "Sanitized LCDrive reproducibility manifest. Contains only PhysicalAI-AV clip UUIDs, split labels, and validation scenario categories.",
+  "external_availability_check": {
+    "checked_against": "clip_index.parquet: PhysicalAI-AV public clip index used by LCDrive subset construction; UUID is parquet index clip_id",
+    "clip_index_rows": 310895,
+    "clip_index_unique_clip_ids": 310895,
+    "clip_index_split_counts": {
+      "train": 156108,
+      "val": 92254,
+      "test": 62533
+    },
+    "missing_from_clip_index_count": 0,
+    "missing_from_clip_index_examples": [],
+    "uuid_format_bad_count": 0,
+    "uuid_format_bad_examples": [],
+    "split_match_check": {
+      "train": {
+        "bad_count": 0,
+        "bad_examples": []
+      },
+      "val": {
+        "bad_count": 0,
+        "bad_examples": []
+      }
+    },
+    "clip_is_valid_check": {
+      "train": {
+        "invalid_or_missing_count": 0,
+        "invalid_or_missing_examples": []
+      },
+      "val": {
+        "invalid_or_missing_count": 0,
+        "invalid_or_missing_examples": []
+      }
+    }
+  },
+  "counts": {
+    "train_unique_clip_uuids": 39072,
+    "val_unique_clip_uuids": 23758,
+    "train_val_overlap_count": 0,
+    "val_primary_scenario_rows": 23758,
+    "val_all_scenario_rows_raw_recovered": 26939,
+    "val_clips_with_more_than_one_recovered_scenario": 72,
+    "val_primary_paper_scenario_category_count": 15
+  },
+  "table2_grouping_semantics": "Primary validation scenario uses the original CVPR category notebook behavior: dict(zip(category_df[\"key\"], category_df[\"odd\"])); if a validation UUID appears multiple times, the last recovered row determines the single category.",
+  "val_primary_scenario_distribution_paper_names": {
+    "Cut-In": 860,
+    "General Driving": 7965,
+    "Intersection Navigation": 998,
+    "Lane Change": 1139,
+    "Lane Keeping": 1222,
+    "Lane Keeping Curve": 1365,
+    "Lead Vehicle Following": 1315,
+    "Merging": 1037,
+    "Nudge Maneuver": 1277,
+    "Nudge Static Obstacle Maneuver": 1346,
+    "Speed Control": 1251,
+    "Stop for Vehicle": 1234,
+    "Traffic Control Compliance": 1062,
+    "Turning Maneuver": 482,
+    "Vulnerable Road Users (VRU)": 1205
+  },
+  "val_raw_scenario_row_distribution_original_names": {
+    "Cut-In": 1223,
+    "General Training/Validation": 8291,
+    "Intersection Navigation": 1424,
+    "Lane Change": 1185,
+    "Lane Keeping": 1558,
+    "Lane Keeping Curve": 1399,
+    "Lead Vehicle Following": 1393,
+    "Merging": 1406,
+    "Nudge Maneuver": 1318,
+    "Nudge Static Obstacle Maneuver": 1419,
+    "Speed Control": 1426,
+    "Stop for Vehicle": 1512,
+    "Traffic Control Compliance": 1423,
+    "Turning Maneuver": 528,
+    "Vulnerable Road Users (VRU)": 1434
+  },
+  "files": [
+    "lcdrive_train_clip_uuids.txt",
+    "lcdrive_train_split_clip_uuids.csv",
+    "lcdrive_train_val_split_clip_uuids.csv",
+    "lcdrive_val_all_scenario_rows.csv",
+    "lcdrive_val_all_scenarios_per_clip_audit.csv",
+    "lcdrive_val_clip_uuids.txt",
+    "lcdrive_val_primary_scenario_for_table2.csv",
+    "lcdrive_val_split_clip_uuids.csv"
+  ]
+}

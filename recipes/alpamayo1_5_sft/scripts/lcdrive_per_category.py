@@ -54,6 +54,25 @@ def main() -> None:
     if not records:
         raise SystemExit(f"No records in {args.per_clip}")
 
+    # De-duplicate by clip_id: DistributedSampler pads the dataset by wrapping
+    # around and repeating a few samples so the total is evenly divisible
+    # across (num_replicas * batch_size), which can cause a handful of clips
+    # to appear more than once in the per-clip dump. Keep only the first
+    # occurrence of each clip_id so every clip is weighted once.
+    n_before = len(records)
+    seen: set[str] = set()
+    deduped_records = []
+    for rec in records:
+        cid = rec["clip_id"]
+        if cid in seen:
+            continue
+        seen.add(cid)
+        deduped_records.append(rec)
+    n_dupes = n_before - len(deduped_records)
+    if n_dupes:
+        print(f"[info] Removed {n_dupes} duplicate clip_id records (kept first occurrence).")
+    records = deduped_records
+
     cat_map = load_categories(args.category_csv)
 
     # Discover metric keys (everything except clip_id).

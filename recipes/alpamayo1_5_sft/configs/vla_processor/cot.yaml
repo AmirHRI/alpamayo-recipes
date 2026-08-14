@@ -1,0 +1,19 @@
+# CoT-generating processor: `cot` is the LAST component, so in generation mode
+# the assistant turn ends with `<|cot_start|>` (ask_for_component) and the model
+# GENERATES its own reasoning before emitting `<|traj_future_start|>`.
+#
+# This mirrors `alpamayo1_5_distill/configs/vla_processor/distill_teacher_generate.yaml`.
+# `cot` must be last and `traj_future` must NOT be in components_order: if
+# `traj_future` were last, the prompt would pre-fill `<|traj_future_start|>` and
+# the model would skip reasoning entirely (empty CoT) -- this is the
+# `components_order` gotcha documented in alpamayo1_5_distill/README.md.
+#
+# components_prompt asks for cot THEN trajectory, so `sample_trajectories_from_data`
+# continues generation past `<|cot_end|>` into the trajectory tokens.
+_target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+chat_template_version: r1_5
+components_order: ["image", "traj_history", "prompt", "cot"]
+components_prompt: ["cot", "traj_future"]
+label_components: ["traj_future"]
+include_camera_ids: false
+include_frame_nums: false
