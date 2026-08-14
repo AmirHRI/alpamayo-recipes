@@ -48,7 +48,8 @@ trainer:
   gradient_accumulation_steps: 1
   # The frozen VLM forward is cheap, so training is I/O-bound on decoding 16 video
   # frames/sample. More workers + prefetch keep the GPU fed (was starving at 2).
-  dataloader_num_workers: 12
+  # 8 (not 12) to stay resilient to host-RAM/swap pressure from co-tenant jobs.
+  dataloader_num_workers: 8
   dataloader_prefetch_factor: 4
   dataloader_persistent_workers: true
   learning_rate: 1e-4

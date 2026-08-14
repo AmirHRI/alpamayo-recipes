@@ -30,8 +30,23 @@ import torch
 
 from alpamayo1_5_sft.trainer import ReasoningVLA_Trainer
 
-#: Detached scalars on ``KaVaVLAOutput`` that get averaged into the training logs.
-AUX_LOSS_KEYS = ("ce_loss", "latent_loss", "kv_loss", "n_valid_slots")
+#: Detached scalars on the model output that get averaged into the training logs.
+#: A key absent from a given output type is skipped (``_stash`` ignores ``None``), so this
+#: covers ``KaVaVLAOutput`` and ``KDVLAOutput`` without either needing to know about the
+#: other. The ``kv_loss_*`` region splits matter because ~93% of positions are vision: a
+#: single ``kv_loss`` scalar cannot show whether the vision region is converging at a
+#: different rate from text and trajectory, or swamping them.
+AUX_LOSS_KEYS = (
+    "ce_loss",
+    "latent_loss",
+    "kv_loss",
+    "n_valid_slots",
+    "kd_loss",
+    "kv_loss_vision",
+    "kv_loss_text",
+    "kv_loss_traj",
+    "block_loss",
+)
 
 #: Parameters excluded from weight decay on top of HF's own bias/norm exclusions.
 #: ``slot_embeddings`` is a soft prompt: decaying it pulls the slots back toward the
@@ -48,8 +63,18 @@ NO_DECAY_PARAMS = ("slot_embeddings",)
 GRAD_PROBE_STEPS = int(os.environ.get("KAVA_GRAD_PROBE_STEPS", 200))
 
 #: The slice of the backbone the probe differentiates. One mid-stack layer is enough to
-#: rank the terms and keeps the probe to a few ms; layer 14 of the student's 28.
-PROBE_LAYER_PREFIX = "vlm.model.language_model.layers.14."
+#: rank the terms and keeps the probe to a few ms.
+#:
+#: Derived from the loaded student rather than hard-coded. It used to be a constant
+#: ``layers.14.`` — mid-stack for the 28-layer 2B, but silently 39% depth on a 36-layer
+#: Qwen3-VL-4B, which would have made gradient shares incomparable between students
+#: without anything looking wrong.
+def probe_layer_prefix(base: Any) -> str:
+    try:
+        n_layers = len(base.vlm.model.language_model.layers)
+    except AttributeError:
+        n_layers = 28
+    return f"vlm.model.language_model.layers.{n_layers // 2}."
 
 
 class KaVaTrainer(ReasoningVLA_Trainer):
@@ -63,6 +88,12 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         super().__init__(*args, **kwargs)
         self._aux_sums: dict[str, float] = {}
         self._aux_count: int = 0
+        # Gradient shares are RATIOS measured once per probe, not per-micro-batch
+        # values. They must not go through _aux_sums, which log() divides by
+        # _aux_count -- with logging_steps=5 x grad_accum=16 that is 80 compute_loss
+        # calls, so the logged curve came out 80x too small while the printed probe
+        # line was right. Kept in their own dict and logged verbatim.
+        self._grad_shares: dict[str, float] = {}
         self._last_probe_step: int = -1
         self._probe_failed: bool = False
 
@@ -112,9 +143,21 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         cost is three partial backwards over one mid-stack layer rather than three
         extra forwards. Nothing is written to ``.grad``, so training is unaffected.
 
-        The probe is best-effort: under ZeRO-3 the parameters are sharded and this
-        cannot work, so a failure disables it for the rest of the run rather than
-        taking the job down.
+        The probe is best-effort, and on some stacks it cannot run at all:
+
+        * ZeRO-3 shards the parameters, so there is nothing local to differentiate.
+        * ZeRO-2 (deepspeed 0.19) registers a post-accumulate hook on every parameter
+          (``stage_1_and_2.py:1075``, ``self._grad_acc_hooks``).  Those fire during the
+          probe's extra backwards too, and reduce into an IPG bucket the real backward has
+          not filled -- observed as ``IndexError`` at ``stage_1_and_2.py:1575``.  Probing
+          an activation instead of parameters does not avoid it.  Note the crash is the
+          *good* outcome; the bad one is those hooks quietly folding probe gradients into
+          the step.
+
+        A failure therefore disables the probe for the rest of the run rather than taking
+        the job down.  When it is unavailable, measure the weights with
+        ``scripts/calibrate_kd_weights.py``, which does the same thing on a plain
+        single-GPU model with no ZeRO engine attached.
         """
         terms = getattr(base, "last_loss_terms", None)
         if not terms:
@@ -122,16 +165,21 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         probe = [
             p
             for name, p in base.named_parameters()
-            if name.startswith(PROBE_LAYER_PREFIX) and p.requires_grad
+            if name.startswith(probe_layer_prefix(base)) and p.requires_grad
         ]
         if not probe:
             self._probe_failed = True
             return
 
+        # Weight per term, so the reported share reflects what actually enters the total.
+        # `kv_weight` / `kd_weight` are the KD student's fields; `kv_loss_weight` /
+        # `latent_loss_weight` are KAVA's. Both spellings are read so one probe serves both.
         weights = {
             "ce": 1.0,
             "latent": float(getattr(base, "latent_loss_weight", 0.0)),
-            "kv": float(getattr(base, "kv_loss_weight", 0.0)),
+            "kv": float(getattr(base, "kv_loss_weight", getattr(base, "kv_weight", 0.0))),
+            "kd": float(getattr(base, "kd_weight", 0.0)),
+            "block": float(getattr(base, "block_weight", 0.0)),
         }
         try:
             norms = {}
@@ -143,7 +191,17 @@ class KaVaTrainer(ReasoningVLA_Trainer):
                     torch.linalg.vector_norm(torch.stack([g.norm() for g in grads]))
                 )
         except Exception as ex:  # ZeRO-3 sharding, a freed graph, ...
-            print(f"[kava] gradient probe disabled: {ex}", flush=True)
+            # Include the traceback. A bare message here ("list index out of range") names
+            # neither the frame nor the library, and sent a debugging session chasing the
+            # wrong hypothesis -- the probe is disabled for the rest of the run, so this is
+            # the only chance to record why.
+            import traceback
+
+            print(
+                f"[kava] gradient probe disabled: {type(ex).__name__}: {ex}\n"
+                + "".join(traceback.format_exc().splitlines(keepends=True)[-8:]),
+                flush=True,
+            )
             self._probe_failed = True
             return
 
@@ -156,8 +214,8 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         print(f"[kava] step {self._last_probe_step} weighted backbone grad: {summary}", flush=True)
         for name, value in norms.items():
             if name != "ce" and reference:
-                self._aux_sums[f"gradshare_{name}"] = value / reference
-                self._aux_count = max(self._aux_count, 1)
+                self._grad_shares[f"gradshare_{name}"] = value / reference
+        self._grad_shares["gradshare_ce_absnorm"] = reference
 
     def _stash(self, outputs: Any) -> None:
         if outputs is None:
@@ -178,4 +236,7 @@ class KaVaTrainer(ReasoningVLA_Trainer):
                 logs[key] = round(total / self._aux_count, 6)
             self._aux_sums = {}
             self._aux_count = 0
+        if self._grad_shares:  # ratios: logged as-is, never averaged
+            logs.update({k: round(v, 6) for k, v in self._grad_shares.items()})
+            self._grad_shares = {}
         super().log(logs, *args, **kwargs)

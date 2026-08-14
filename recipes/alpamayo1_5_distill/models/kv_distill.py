@@ -52,6 +52,8 @@ import torch.nn.functional as F
 
 EvictionMethod = Literal["rkv", "cosine", "attn", "crop"]
 KVLossType = Literal["l1", "mse", "smooth_l1"]
+#: Cross-model K/V alignment, in increasing capacity — see :class:`KVProjectorBank`.
+KVAlignType = Literal["direct", "projector", "mlp"]
 
 
 # --------------------------------------------------------------------- scoring
@@ -240,33 +242,89 @@ def build_layer_map(
 
 
 # -------------------------------------------------------------------- projector
+class _KVAlignMLP(nn.Module):
+    """``x + W2(GELU(W1 x))`` — a nonlinear change of basis that starts at identity.
+
+    A single ``Linear`` can only apply one global linear map per layer.  Teacher and
+    student were trained separately, so there is no reason their ``W_k``/``W_v`` bases
+    are related by a *linear* transform at all — and eviction has already mixed tokens
+    from different positions, so the map that is actually needed may be input-dependent.
+
+    Residual with a **zero-initialised** second layer, so the block is exactly the
+    identity at init.  That is what keeps ``direct`` / ``projector`` / ``mlp`` a clean
+    ablation ladder: all three start at the same objective value and differ only in how
+    far they can move away from it.
+    """
+
+    def __init__(self, width: int, hidden: int | None = None) -> None:
+        super().__init__()
+        hidden = int(hidden or width)
+        self.fc1 = nn.Linear(width, hidden)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden, width)
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.fc2(self.act(self.fc1(x)))
+
+
 class KVProjectorBank(nn.Module):
     """Per-layer ``1024 -> 1024`` maps carrying the student's K/V into teacher space.
 
     KAVA is self-distillation, so its K/V live in one basis.  Here teacher and
     student are separately trained checkpoints: per-layer geometry agrees exactly
     (``8 kv-heads x 128 = 1024`` on both sides) but the learned ``W_k``/``W_v``
-    bases need not.  ``align="projector"`` learns that change of basis;
-    ``align="direct"`` asserts there is nothing to learn and costs no parameters.
+    bases need not.  Three settings, in increasing capacity:
 
-    The projectors are **identity-initialised**, so training starts at exactly the
-    ``direct`` objective and can only move away from it if that helps — which makes
-    the two settings a clean ablation pair rather than two unrelated runs.  They
-    are discarded at inference; nothing outside the loss reads them.
+    ============  ======  ==================================================
+    ``align``     params  map
+    ============  ======  ==================================================
+    ``direct``     0      identity; asserts there is nothing to learn
+    ``projector``  58.7M  one ``Linear`` per layer per K/V (linear basis change)
+    ``mlp``       117.5M  ``x + W2(GELU(W1 x))`` per layer per K/V (nonlinear)
+    ============  ======  ==================================================
+
+    All three are **identity at init** — ``projector`` via ``eye_``, ``mlp`` via a
+    zero-initialised residual branch — so training starts at exactly the ``direct``
+    objective and can only move away if that helps.  That makes them an ablation
+    ladder rather than three unrelated runs.  All are discarded at inference; nothing
+    outside the loss reads them.
+
+    ⚠️ **More capacity here is not automatically better, and may be actively worse.**
+    The action expert consumes the student's *unprojected* cache — these maps exist
+    only inside ``L_KV``.  So a projector with enough capacity can satisfy the loss by
+    absorbing the mismatch itself, leaving the tensor the expert actually reads no
+    closer to the teacher, and the loss curve cannot distinguish the two outcomes.
+    Measured on the 10B->2B LCDrive runs: with ``projector``, ``kv_loss`` floors at
+    ~0.60 by epoch 0.30 and does not move for the remaining 70% of training, nor when
+    Jacobi depth doubles — consistent with the shortcut.  ``mlp`` raises the ceiling
+    on what can be *expressed*; it also raises the ceiling on what can be absorbed.
+    Run it against ``direct`` (the opposite extreme, zero params, no shortcut possible)
+    rather than against ``projector`` alone.
     """
 
     def __init__(
         self,
         n_student_layers: int,
         kv_width: int = 1024,
-        align: Literal["direct", "projector"] = "projector",
+        align: KVAlignType = "projector",
+        mlp_hidden: int | None = None,
     ) -> None:
         super().__init__()
-        if align not in ("direct", "projector"):
+        if align not in ("direct", "projector", "mlp"):
             raise ValueError(f"unknown kv_align {align!r}")
         self.align = align
         self.kv_width = int(kv_width)
         if align == "direct":
+            return
+        if align == "mlp":
+            self.k_proj = nn.ModuleList(
+                [_KVAlignMLP(kv_width, mlp_hidden) for _ in range(n_student_layers)]
+            )
+            self.v_proj = nn.ModuleList(
+                [_KVAlignMLP(kv_width, mlp_hidden) for _ in range(n_student_layers)]
+            )
             return
         self.k_proj = nn.ModuleList(
             [nn.Linear(kv_width, kv_width, bias=False) for _ in range(n_student_layers)]
@@ -289,7 +347,8 @@ class KVProjectorBank(nn.Module):
         proj = (self.k_proj if which == "k" else self.v_proj)[layer]
         b, h, m, d = kv.shape
         flat = kv.permute(0, 2, 1, 3).reshape(b, m, h * d)
-        out = proj(flat.to(proj.weight.dtype))
+        # next(parameters()), not proj.weight: `mlp` is a module with no single weight.
+        out = proj(flat.to(next(proj.parameters()).dtype))
         return out.view(b, m, h, d).permute(0, 2, 1, 3)
 
 
@@ -338,7 +397,9 @@ def kv_matching_loss(
             activations"), so without it the largest layers dominate the gradient.
 
     Returns:
-        Scalar loss; a gradient-free zero if nothing valid is left.
+        Scalar loss.  If every slot is masked the value is 0.0 but the tensor stays
+        **attached to the graph** — see the ``denom == 0`` branch, where a detached zero
+        deadlocks multi-rank training at ``per_device_train_batch_size=1``.
     """
     weight = None
     if valid_mask is not None:
@@ -378,7 +439,27 @@ def kv_matching_loss(
             total = total + k_err.sum() + v_err.sum()
             denom += 2.0 * k_err.numel()
 
-    if not torch.is_tensor(total) or denom == 0:
+    if not torch.is_tensor(total):
+        # No student layers were captured at all, so there is no graph to stay attached
+        # to. Symmetric across ranks (it depends on the model, not the batch), so the
+        # detached zero below is safe here in a way it is NOT in the denom==0 case.
         ref = next(iter(student_kv.values()))[0] if student_kv else teacher_k
         return torch.zeros((), device=ref.device, dtype=torch.float32)
+    if denom == 0:
+        # Every slot in this micro-batch is masked — a clip with no cached teacher CoT,
+        # which `allow_missing=true` deliberately admits (4 of 38,340 LCDrive clips).
+        #
+        # ⚠️ MUST return the graph-connected `total`, not a fresh zero. `total` is already
+        # exactly 0.0 here (w is a 0/1 mask that sums to 0), so the VALUE is identical —
+        # what differs is that `total` still carries the graph. Returning a detached zero
+        # gives `kv_projector` and the KV path no gradient ON THIS RANK ONLY; under ZeRO-2
+        # the ranks then reduce different parameter sets, their NCCL sequences shift by
+        # one, and the next size-mismatched pair deadlocks. Observed twice, deterministic
+        # at the same step, as rank0 ALLREDUCE(numel=54548736) against rank1
+        # ALLREDUCE(numel=1), each timing out after 600 s.
+        #
+        # Only reachable at per_device_train_batch_size=1: at bs>=2 a cache-less clip is
+        # batched with a valid one, so the mask is never entirely empty. That is why every
+        # earlier multi-GPU run (all bs=2) was fine and the first bs=1 2-rank run hung.
+        return total
     return total / denom

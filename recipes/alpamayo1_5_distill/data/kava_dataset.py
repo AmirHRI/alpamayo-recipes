@@ -110,7 +110,18 @@ class KaVaPAIDataset(DistillPAIDataset):
             train part of an epoch with no KV supervision and look like a mysteriously
             weak result.  Turn it ON for the LCDrive build, where 4 of 38,340 clips
             have no handoff token and therefore no cache entry.
+
+            NOTE the substitute ``teacher_tfs_hidden`` is ZEROS, which is only harmless
+            because ``latent_loss_weight`` is 0. With lambda_1 > 0 those few clips would
+            be pulled toward a zero hidden; the latent term would need its own valid
+            mask first.
     """
+
+    #: Class-level default so instances built with ``__new__`` (the GPU-free test
+    #: stubs) still have it. Reading it unguarded in ``_attach_empty_kv`` is
+    #: deliberate — key-set parity between the cached and uncached paths is a hard
+    #: contract, and a silent ``getattr(..., False)`` would let a drift through.
+    attach_tfs_hidden_all: bool = False
 
     def __init__(
         self,
@@ -119,6 +130,7 @@ class KaVaPAIDataset(DistillPAIDataset):
         kv_tier: str | None = None,
         num_slots: int = 16,
         attach_tfs_hidden: bool = True,
+        attach_tfs_hidden_all: bool = False,
         allow_missing: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -127,11 +139,16 @@ class KaVaPAIDataset(DistillPAIDataset):
         self.kv_tier = kv_tier
         self.num_slots = int(num_slots)
         self.attach_tfs_hidden = attach_tfs_hidden
+        self.attach_tfs_hidden_all = attach_tfs_hidden_all
         self.allow_missing = allow_missing
         # Teacher KV geometry, refreshed from every successful load. Seeded with the
         # Alpamayo-1.5-10B values so a miss on the very first sample still produces a
         # correctly-shaped empty target.
         self._teacher_layers, self._teacher_kv_heads, self._head_dim = 36, 8, 128
+        self._teacher_hidden = 4096  # Alpamayo-1.5-10B VLM width; corrected on first hit
+        #: L+1 = 37 for the 36-layer teacher (index 0 is the embedding output, which CoDI
+        #: includes in its average). Corrected on the first cached entry, like the width.
+        self._teacher_hidden_layers = 37
         if kv_cache_root is not None and kv_tier is None:
             raise ValueError("kv_cache_root given without kv_tier; pass the compressed tier name")
 
@@ -152,13 +169,27 @@ class KaVaPAIDataset(DistillPAIDataset):
         sample["teacher_kv_k"] = torch.zeros(shape, dtype=torch.bfloat16)
         sample["teacher_kv_v"] = torch.zeros(shape, dtype=torch.bfloat16)
         sample["teacher_kv_valid"] = torch.zeros(self.num_slots, dtype=torch.bool)
+        if self.attach_tfs_hidden:
+            # MUST match the cached path's key set exactly. `basic_collation_fn` stacks
+            # by key across the batch, so a row missing one key raises KeyError as soon
+            # as it shares a batch with a row that has it -- invisible at bs=1 (one row
+            # per batch, nothing to mismatch) and fatal at bs>=2.
+            sample["teacher_tfs_hidden"] = torch.zeros(self._teacher_hidden, dtype=torch.float32)
+        if self.attach_tfs_hidden_all:
+            sample["teacher_tfs_hidden_all"] = torch.zeros(
+                (self._teacher_hidden_layers, self._teacher_hidden), dtype=torch.float32
+            )
         return sample
 
     def _attach_teacher_kv(self, sample: dict[str, Any] | None, key: str) -> dict[str, Any] | None:
         if sample is None or self.kv_cache_root is None:
             return sample
 
-        names = ("k_pre", "v", "tfs_hidden") if self.attach_tfs_hidden else ("k_pre", "v")
+        names = ("k_pre", "v")
+        if self.attach_tfs_hidden:
+            names += ("tfs_hidden",)
+        if self.attach_tfs_hidden_all:
+            names += ("tfs_hidden_all",)
         try:
             entry = kv_cache_io.load_entry(self.kv_cache_root, self.kv_tier, key, names=names)
         except KeyError:
@@ -172,8 +203,30 @@ class KaVaPAIDataset(DistillPAIDataset):
         sample["teacher_kv_k"] = k
         sample["teacher_kv_v"] = v
         sample["teacher_kv_valid"] = valid
-        if self.attach_tfs_hidden and "tfs_hidden" in entry:
-            sample["teacher_tfs_hidden"] = entry["tfs_hidden"]
+        if self.attach_tfs_hidden:
+            # Unconditional for the same reason: an entry written without tfs_hidden
+            # would otherwise produce a row with a different key set from its batch-mates.
+            hidden = entry.get("tfs_hidden")
+            if hidden is None:
+                hidden = torch.zeros(self._teacher_hidden, dtype=torch.float32)
+            else:
+                self._teacher_hidden = int(hidden.shape[-1])
+            sample["teacher_tfs_hidden"] = hidden
+        if self.attach_tfs_hidden_all:
+            all_h = entry.get("tfs_hidden_all")
+            if all_h is None:
+                # A cache built before the all-layer target existed. Fail loudly rather
+                # than hand the loss a zero target it cannot distinguish from a real one:
+                # the single-vector fallback is silent, this is not.
+                raise KeyError(
+                    f"{self.kv_tier}/{key} has no `tfs_hidden_all`. This cache predates "
+                    "the CoDI all-layer objective -- rebuild it with "
+                    "scripts/generate_teacher_kv.py, or set "
+                    "model.latent_all_layers=false to use the single-vector target."
+                )
+            self._teacher_hidden_layers = int(all_h.shape[0])
+            self._teacher_hidden = int(all_h.shape[-1])
+            sample["teacher_tfs_hidden_all"] = all_h
         return sample
 
     def __getitem__(self, idx: int) -> dict[str, Any] | None:

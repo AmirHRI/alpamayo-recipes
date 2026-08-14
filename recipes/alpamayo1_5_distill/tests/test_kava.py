@@ -206,6 +206,165 @@ def test_kv_loss_ignores_masked_slots() -> None:
     assert kv_matching_loss(student, teacher_k, teacher_v, mapping).item() > 0.0
 
 
+def test_fully_masked_kv_loss_stays_attached_to_the_graph() -> None:
+    """A fully-masked micro-batch must still deliver gradient to every KV parameter.
+
+    Regression test for a two-rank NCCL deadlock. When `allow_missing=true` hands over a
+    clip with no cached teacher CoT, every slot is masked and the loss is 0.0. Returning
+    a *detached* zero there is value-correct and therefore invisible to an assertion on
+    `.item()` — but it silently drops `kv_projector` out of the backward pass, so under
+    ZeRO-2 the two ranks reduce different parameter sets, their collective sequences
+    shift by one, and the next size-mismatched pair hangs until the 600 s watchdog fires.
+
+    Only reachable at per_device_train_batch_size=1: at bs>=2 the cache-less clip shares
+    the micro-batch with a valid one and the mask is never entirely empty.
+    """
+    b, m, n_student = 1, 6, 4
+    teacher_k = torch.zeros(b, L, H, m, D)
+    teacher_v = torch.zeros(b, L, H, m, D)
+    mapping = build_layer_map(n_student, L)
+    student = {
+        i: (
+            torch.randn(b, H, m, D, requires_grad=True),
+            torch.randn(b, H, m, D, requires_grad=True),
+        )
+        for i in range(n_student)
+    }
+    bank = KVProjectorBank(n_student, H * D)
+    valid = torch.zeros(b, m, dtype=torch.bool)  # nothing valid at all
+
+    loss = kv_matching_loss(
+        student, teacher_k, teacher_v, mapping, valid_mask=valid, projector=bank
+    )
+    assert loss.item() == 0.0, "the value must still be zero"
+    assert loss.requires_grad, "a detached zero here deadlocks 2-rank training"
+
+    loss.backward()
+    # Every projector parameter must have a .grad — all zeros, but PRESENT, so that
+    # DeepSpeed reduces the same parameter set on every rank.
+    missing = [n for n, p in bank.named_parameters() if p.requires_grad and p.grad is None]
+    assert not missing, f"no gradient reached: {missing[:4]}"
+    assert all(p.grad is not None for k, v in student.values() for p in (k, v))
+
+
+def test_all_layer_target_keeps_cached_and_uncached_key_sets_identical() -> None:
+    """`teacher_tfs_hidden_all` must obey the same parity contract as every other key.
+
+    basic_collation_fn stacks by key, so one row missing a key that its batch-mates have
+    raises KeyError at bs>=2 while being invisible at bs=1 — the exact way the
+    `teacher_tfs_hidden` addition broke a run before.
+    """
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads = 8, L, H
+    ds._head_dim, ds._teacher_hidden, ds._teacher_hidden_layers = D, 4096, 37
+    ds.attach_tfs_hidden, ds.attach_tfs_hidden_all = True, True
+
+    empty = ds._attach_empty_kv({})
+    assert empty["teacher_tfs_hidden_all"].shape == (37, 4096)
+    assert empty["teacher_tfs_hidden"].shape == (4096,)
+
+    # ... and off by default, so an existing cache/config is untouched.
+    ds.attach_tfs_hidden_all = False
+    assert "teacher_tfs_hidden_all" not in ds._attach_empty_kv({})
+
+
+def test_all_layer_target_missing_from_an_old_cache_raises() -> None:
+    """A cache predating the all-layer target must fail loudly, not fall back.
+
+    Silently substituting the single-vector target (or zeros) would train a different
+    objective than the config says, and the loss curve would look entirely normal.
+    """
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds.kv_tier, ds.kv_cache_root = 8, "compressed_M8_rkv0.1", "/nonexistent"
+    ds.attach_tfs_hidden, ds.attach_tfs_hidden_all, ds.allow_missing = True, True, False
+    ds._teacher_hidden, ds._teacher_hidden_layers = 4096, 37
+
+    entry = {  # an old-format entry: k_pre/v/tfs_hidden present, tfs_hidden_all absent
+        "k_pre": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "v": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "tfs_hidden": torch.zeros(4096),
+    }
+    import alpamayo1_5_distill.data.kava_dataset as mod
+
+    real = mod.kv_cache_io.load_entry
+    mod.kv_cache_io.load_entry = lambda *a, **k: entry
+    try:
+        ds._attach_teacher_kv({}, "someclip::123")
+    except KeyError as ex:
+        assert "tfs_hidden_all" in str(ex) and "rebuild" in str(ex)
+        return
+    finally:
+        mod.kv_cache_io.load_entry = real
+    raise AssertionError("expected a KeyError naming tfs_hidden_all")
+
+
+def test_mlp_align_is_identity_at_init_and_nonlinear() -> None:
+    """`mlp` must start at exactly the `direct` objective, or it is not an ablation.
+
+    The residual branch's second layer is zero-initialised, so `x + W2(GELU(W1 x))` is
+    the identity at init — same trick as `eye_` for the linear projector, and what makes
+    direct / projector / mlp comparable at step 0.
+    """
+    b, h, m, d, n = 2, H, 5, D, 4
+    kv = torch.randn(b, h, m, d)
+    bank = KVProjectorBank(n, kv_width=h * d, align="mlp")
+    out = bank(kv, 0, "k")
+    assert out.shape == kv.shape
+    assert torch.allclose(out, kv, atol=1e-6), "mlp align is not identity at init"
+
+    # ... and once the residual branch is non-zero it is genuinely nonlinear, i.e. not
+    # reproducible by any single matrix: f(2x) != 2 f(x).
+    for p in bank.k_proj[0].fc2.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    f_x, f_2x = bank(kv, 0, "k"), bank(2 * kv, 0, "k")
+    assert not torch.allclose(f_2x, 2 * f_x, atol=1e-3), "mlp collapsed to a linear map"
+
+
+def test_mlp_align_gives_every_parameter_a_grad_on_the_first_step() -> None:
+    """Zero-init W2 makes W1's gradient exactly zero at step 1 — but it must EXIST.
+
+    This is the distinction that deadlocked two-rank training once already (see
+    kv_matching_loss's denom==0 branch): a parameter whose .grad is a zero tensor is
+    reduced normally, one whose .grad is None is not, and under ZeRO-2 that asymmetry
+    desyncs the collective sequence. A zero-init residual is exactly the shape that
+    could trip it, so pin it.
+    """
+    b, m, n = 1, 4, 3
+    teacher_k = torch.randn(b, L, H, m, D)
+    teacher_v = torch.randn(b, L, H, m, D)
+    mapping = build_layer_map(n, L)
+    student = {
+        i: (torch.randn(b, H, m, D, requires_grad=True), torch.randn(b, H, m, D, requires_grad=True))
+        for i in range(n)
+    }
+    bank = KVProjectorBank(n, kv_width=H * D, align="mlp")
+    kv_matching_loss(student, teacher_k, teacher_v, mapping, projector=bank, kind="l1").backward()
+
+    missing = [name for name, p in bank.named_parameters() if p.grad is None]
+    assert not missing, f".grad is None (not zero) for: {missing[:6]}"
+    # fc1 specifically: gradient present, and zero at step 1 because W2 is still zero.
+    fc1 = bank.k_proj[0].fc1.weight
+    assert fc1.grad is not None and float(fc1.grad.abs().sum()) == 0.0
+
+
+def test_kv_align_rejects_unknown_and_direct_stays_free() -> None:
+    """`direct` must allocate nothing — it is the no-shortcut arm of the ablation."""
+    assert sum(p.numel() for p in KVProjectorBank(4, kv_width=H * D, align="direct").parameters()) == 0
+    linear = sum(p.numel() for p in KVProjectorBank(4, kv_width=H * D, align="projector").parameters())
+    mlp = sum(p.numel() for p in KVProjectorBank(4, kv_width=H * D, align="mlp").parameters())
+    assert mlp > linear > 0, (linear, mlp)
+    try:
+        KVProjectorBank(4, kv_width=H * D, align="quadratic")
+    except ValueError as ex:
+        assert "kv_align" in str(ex)
+        return
+    raise AssertionError("expected ValueError for an unknown kv_align")
+
+
 def test_kv_loss_scale_is_independent_of_m_and_depth() -> None:
     """One kv_loss_weight has to transfer across the M / layer-map sweep."""
     torch.manual_seed(0)
@@ -541,6 +700,7 @@ def test_empty_kv_target_is_shaped_and_fully_masked() -> None:
 
     ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
     ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = 6, L, H, D
+    ds.attach_tfs_hidden, ds._teacher_hidden = True, 4096
     out = ds._attach_empty_kv({})
     assert out["teacher_kv_k"].shape == (L, H, 6, D)
     assert out["teacher_kv_valid"].sum() == 0
@@ -553,6 +713,7 @@ def test_uncached_sample_contributes_nothing_to_the_batch_loss() -> None:
 
     ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
     ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = 5, L, H, D
+    ds.attach_tfs_hidden, ds._teacher_hidden = True, 4096
     empty = ds._attach_empty_kv({})
     n_student = 3
     mapping = build_layer_map(n_student, L)
@@ -611,6 +772,7 @@ def _hook_stub(num_slots=2, hidden=4, zero=False):
         num_slots=num_slots,
         slot_embeddings=slots,
         zero_slots=zero,
+        jacobi_iters=1,
         vlm=types.SimpleNamespace(get_input_embeddings=lambda: emb),
     )
     return KaVaReasoningVLA._generation_slot_hook, stub, emb, slots
@@ -672,3 +834,267 @@ def test_generation_hook_noop_without_slots() -> None:
     with hook(stub, None):
         out = emb(torch.zeros(1, 5, dtype=torch.long))
     assert float(out.abs().sum()) == 0.0
+
+
+def test_zero_slots_is_an_explicit_parameter_not_swallowed_by_kwargs() -> None:
+    """`zero_slots` must be a named arg of from_pretrained_vlm, not left to **kwargs.
+
+    The parent's from_pretrained_vlm ends in `config_kwargs.update(kwargs)`, so any
+    unrecognised kwarg silently becomes a CONFIG FIELD instead of a model attribute.
+    `_generation_slot_hook` reads the attribute, so an ablation passed that way does
+    nothing and both arms score identically — which is exactly what happened on the
+    first ablation run (500/500 clips bit-identical, 76 min per arm wasted).
+    """
+    import inspect
+
+    from alpamayo1_5_distill.models.kava_model import KaVaReasoningVLA
+
+    sig = inspect.signature(KaVaReasoningVLA.from_pretrained_vlm)
+    assert "zero_slots" in sig.parameters, (
+        "zero_slots fell out of the signature; it would be swallowed into the config "
+        "and the dead-slot ablation would silently be a no-op"
+    )
+    assert sig.parameters["zero_slots"].default is False
+
+
+def test_gradient_shares_are_logged_verbatim_not_averaged() -> None:
+    """gradshare_* is a ratio, not a per-micro-batch quantity.
+
+    Routing it through `_aux_sums` made log() divide it by `_aux_count` — with
+    logging_steps=5 x grad_accum=16 that is 80 compute_loss calls, so the wandb curve
+    read 0.0026 where the probe had measured 0.21. The printed line and the logged
+    metric disagreed by 80x for a whole 22-hour run.
+    """
+    import types
+
+    from alpamayo1_5_distill.trainer import KaVaTrainer
+
+    tr = KaVaTrainer.__new__(KaVaTrainer)
+    tr._aux_sums, tr._aux_count = {"ce_loss": 8.0}, 4      # 4 micro-batches -> mean 2.0
+    tr._grad_shares = {"gradshare_kv": 0.21}
+    captured: dict = {}
+    tr.__class__.__mro__[1].log = lambda self, logs, *a, **k: captured.update(logs)
+    KaVaTrainer.log(tr, {})
+    assert captured["ce_loss"] == 2.0            # summed value IS averaged
+    assert captured["gradshare_kv"] == 0.21      # ratio is NOT
+
+
+def test_cached_and_uncached_samples_expose_the_same_keys() -> None:
+    """A mixed batch must not raise — this crashed a 3-GPU run at bs=2.
+
+    `basic_collation_fn` stacks by key across the batch, so a row whose key set differs
+    from its batch-mates raises KeyError. At bs=1 every batch holds one row and nothing
+    can mismatch, so the bug was invisible through four single-GPU runs and surfaced
+    only when the batch grew.
+    """
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds.attach_tfs_hidden = 8, True
+    ds._teacher_layers, ds._teacher_kv_heads, ds._head_dim = L, H, D
+    ds._teacher_hidden = 4096
+
+    uncached = ds._attach_empty_kv({"clip_id": "a"})
+    cached = {
+        "clip_id": "b",
+        "teacher_kv_k": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "teacher_kv_v": torch.zeros(L, H, 8, D, dtype=torch.bfloat16),
+        "teacher_kv_valid": torch.ones(8, dtype=torch.bool),
+        "teacher_tfs_hidden": torch.zeros(4096),
+    }
+    assert set(uncached) == set(cached), (
+        f"key sets differ -> KeyError at bs>=2. "
+        f"only-uncached={set(uncached)-set(cached)} only-cached={set(cached)-set(uncached)}"
+    )
+    # and the shared collation path must actually stack them
+    for k in cached:
+        if isinstance(cached[k], torch.Tensor):
+            torch.stack([uncached[k], cached[k]])
+
+
+def test_empty_kv_attaches_tfs_hidden_only_when_requested() -> None:
+    from alpamayo1_5_distill.data.kava_dataset import KaVaPAIDataset
+
+    ds = KaVaPAIDataset.__new__(KaVaPAIDataset)
+    ds.num_slots, ds._teacher_layers, ds._teacher_kv_heads = 8, L, H
+    ds._head_dim, ds._teacher_hidden = D, 4096
+    ds.attach_tfs_hidden = False
+    assert "teacher_tfs_hidden" not in ds._attach_empty_kv({})
+    ds.attach_tfs_hidden = True
+    out = ds._attach_empty_kv({})
+    assert out["teacher_tfs_hidden"].shape == (4096,)
+
+
+def _jacobi_stub(num_slots=4, hidden=3, prefix=6, iters=2):
+    """Duck-typed stand-in for _run_jacobi.
+
+    The fake text stack returns a hidden state whose row ``i`` is the constant
+    ``(i + 1) * 100``, so the identity of the slot that produced each output survives
+    the shift and can be asserted on exactly.
+    """
+    import types
+
+    from alpamayo1_5_distill.models.kava_model import KaVaReasoningVLA
+
+    seq = prefix + num_slots
+
+    class Cache:
+        def __init__(self):
+            self.cropped_to = []
+
+        def crop(self, n):
+            self.cropped_to.append(n)
+
+    cache = Cache()
+
+    def base_model(input_ids=None, attention_mask=None, use_cache=None, **kw):
+        # last_hidden_state row p = (p + 1) * 1000, so the AR shift (slot i seeded from
+        # position start+i-1) is visible in the returned values.
+        n = input_ids.shape[1]
+        h = (torch.arange(1.0, n + 1) * 1000).view(1, n, 1).expand(1, n, hidden)
+        return types.SimpleNamespace(last_hidden_state=h.clone(), past_key_values=cache)
+
+    base_model.get_rope_index = lambda ids, thw, x, mask: (
+        torch.arange(ids.shape[1]).view(1, 1, -1).expand(3, 1, ids.shape[1]).clone(),
+        None,
+    )
+
+    def text_model(inputs_embeds=None, **kw):
+        k = inputs_embeds.shape[1]
+        h = (torch.arange(1.0, k + 1) * 100).view(1, k, 1).expand(1, k, hidden)
+        return types.SimpleNamespace(last_hidden_state=h.clone())
+
+    stub = types.SimpleNamespace(
+        num_slots=num_slots,
+        jacobi_iters=iters,
+        jacobi_proj=lambda x: x,  # identity, so the shift is not masked by a transform
+        vlm=types.SimpleNamespace(model=base_model),
+        _text_model=lambda: text_model,
+    )
+    slot_pos = torch.arange(prefix, prefix + num_slots).view(1, -1)
+    ids = torch.randint(5, 40, (1, seq))
+    return KaVaReasoningVLA._run_jacobi, stub, ids, slot_pos, cache
+
+
+def test_jacobi_initialises_latents_from_the_prefix_with_the_ar_shift() -> None:
+    """PCCoT seeds slot i from position start+i-1, not from a free parameter.
+
+    Regression guard: this used to start from `slot_embeddings` alone, so the initial
+    latents carried no information about the input at all.
+    """
+    run, stub, ids, slot_pos, cache = _jacobi_stub(num_slots=4, prefix=6, iters=1)
+    zeros = torch.zeros(4, 3)
+    out = run(stub, ids, {"attention_mask": torch.ones(1, 10, dtype=torch.long)}, slot_pos, zeros)
+    # iters=1 => no refinement loop, so this is purely the initialisation.
+    # start=6, so slot i is seeded from base_model position 6+i-1 => value (6+i)*1000.
+    assert torch.allclose(out[0, :, 0], torch.tensor([6000.0, 7000.0, 8000.0, 9000.0])), out
+    assert cache.cropped_to == [6], "the cache must be cropped to the slot start"
+
+
+def test_jacobi_feedback_is_shifted_and_slot_zero_is_frozen() -> None:
+    """PCCoT: in_0 stays fixed, in_{i+1} <- out_i, and out_{K-1} is discarded.
+
+    The unshifted form (in_i <- out_i) hands every slot the embedding meant for its
+    successor: under a causal mask the output at position i is the prediction FOR i+1.
+    Measured lower-triangularity is in scripts/validate_jacobi_causality.py.
+    """
+    run, stub, ids, slot_pos, _ = _jacobi_stub(num_slots=4, prefix=6, iters=2)
+    zeros = torch.zeros(4, 3)
+    out = run(stub, ids, {"attention_mask": torch.ones(1, 10, dtype=torch.long)}, slot_pos, zeros)
+    col = out[0, :, 0]
+    # slot 0 keeps its INITIAL value (position start-1 = 5 => 6000), never an output
+    assert col[0].item() == 6000.0, f"slot 0 was overwritten: {col}"
+    # slots 1..3 take outputs 0..2, which the fake stack reports as 100, 200, 300
+    assert torch.allclose(col[1:], torch.tensor([100.0, 200.0, 300.0])), col
+    # and out_3 (=400) must appear nowhere: it predicts the first post-slot token
+    assert 400.0 not in set(col.tolist())
+
+
+def test_jacobi_proj_is_nonlinear_and_starts_at_embedding_scale() -> None:
+    """PCCoT's Linear->GELU->Linear->LayerNorm, with the gain set to measured RMS.
+
+    Their default leaves LayerNorm gain at 1.0, i.e. output RMS ~1, while Qwen3-VL
+    embeddings sit at ~3.19e-2 — a ~31x off-manifold start. A purely linear projection
+    (the earlier RMSNorm->Linear form) cannot reshape the hidden state on the way to
+    becoming an embedding.
+    """
+    import types
+
+    from alpamayo1_5_distill.models.kava_model import KaVaReasoningVLA
+
+    hidden, target_rms = 64, 0.03
+    emb = torch.nn.Embedding(100, hidden)
+    torch.nn.init.normal_(emb.weight, std=target_rms)
+    stub = types.SimpleNamespace(vlm=types.SimpleNamespace(get_input_embeddings=lambda: emb))
+    proj = KaVaReasoningVLA._build_jacobi_proj(stub, hidden)
+
+    kinds = [type(m).__name__ for m in proj]
+    assert kinds == ["Linear", "GELU", "Linear", "LayerNorm"], kinds
+    measured = float(emb.weight.detach().pow(2).mean().sqrt())
+    assert abs(float(proj[3].weight[0]) - measured) < 1e-6, "LayerNorm gain != measured RMS"
+    # A hidden state at Qwen3-VL's real magnitude must come out near embedding scale.
+    out = proj(torch.randn(2, 8, hidden) * 1350.0)
+    assert 0.2 < float(out.pow(2).mean().sqrt()) / measured < 5.0, float(out.pow(2).mean().sqrt())
+
+
+def test_generation_hook_refuses_raw_slots_at_T_above_1() -> None:
+    """A T>1 checkpoint must never be fed the un-refined slot_embeddings.
+
+    Training injects `_run_jacobi(...)`; generation used to inject the raw parameter,
+    which is the iteration's STARTING point. Measured rel-L2 between them is ~1.56, and
+    the mismatch scored min_ade 17.56 against a 4.09 baseline — with the zeroed ablation
+    *better* at 7.94, because zeros are uninformative rather than actively wrong. This
+    now raises instead.
+    """
+    hook, stub, emb, slots = _hook_stub()
+    stub.jacobi_iters = 2
+    try:
+        with hook(stub, torch.tensor([[3, 4]])):
+            pass
+    except RuntimeError as ex:
+        assert "refined" in str(ex).lower()
+        return
+    raise AssertionError("expected RuntimeError when T>1 and no refined slots supplied")
+
+
+def test_generation_hook_uses_refined_slots_when_given() -> None:
+    hook, stub, emb, slots = _hook_stub()
+    stub.jacobi_iters = 2
+    refined = torch.full((1, 2, 4), 9.0)  # [B, K, H], clearly distinct from `slots`
+    with hook(stub, torch.tensor([[1, 2]]), refined_slots=refined):
+        out = emb(torch.zeros(1, 5, dtype=torch.long))
+    torch.testing.assert_close(out[0, 1], refined[0, 0])
+    torch.testing.assert_close(out[0, 2], refined[0, 1])
+    assert not torch.allclose(out[0, 1], slots[0]), "injected the raw parameter, not the refined one"
+
+
+def test_generation_hook_T1_still_uses_raw_slots() -> None:
+    """At T=1 the raw embeddings ARE what training injects — no refinement defined."""
+    hook, stub, emb, slots = _hook_stub()
+    stub.jacobi_iters = 1
+    with hook(stub, torch.tensor([[2, 3]])):
+        out = emb(torch.zeros(1, 5, dtype=torch.long))
+    torch.testing.assert_close(out[0, 2], slots[0])
+
+
+def test_refined_slots_expand_with_num_return_sequences() -> None:
+    """[B,K,H] refined slots must repeat_interleave like slot_pos does.
+
+    The raw path passes [K,H], which broadcasts over any batch — so the missing
+    expansion only surfaced with refined slots, as a shape error at eval:
+    "value tensor of shape [4,8,2048] cannot be broadcast to ... [24,8,2048]".
+    """
+    hook, stub, emb, _ = _hook_stub(num_slots=2)
+    stub.jacobi_iters = 2
+    n_return = 3
+    slot_pos = torch.tensor([[1, 2], [4, 5]])          # 2 samples, distinct columns
+    refined = torch.stack([torch.full((2, 4), 7.0), torch.full((2, 4), 8.0)])  # [2,K,H]
+    with hook(stub, slot_pos, refined_slots=refined):
+        out = emb(torch.zeros(2 * n_return, 8, dtype=torch.long))
+    for sample in (0, 1):
+        for rep in range(n_return):
+            row = out[sample * n_return + rep]
+            for j, col in enumerate(slot_pos[sample].tolist()):
+                torch.testing.assert_close(row[col], refined[sample, j]), (
+                    f"sample {sample} rep {rep} got another sample's refined slots"
+                )

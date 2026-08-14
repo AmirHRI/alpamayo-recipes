@@ -1,0 +1,77 @@
+# Student: Qwen3-VL-4B, distilled from a co-resident Alpamayo-1.5-10B teacher.
+#
+# Why this backbone. Measured against the teacher's tower (Cosmos-Reason2-8B) before this
+# config was written:
+#   text layers          36 == 36            -> build_layer_map is the IDENTITY
+#   kv-heads x head_dim  8x128 == 8x128      -> K/V need NO width projection
+#   vocab / <i0> index   155,697 / 151,669   -> identical on both, KD slice is exact
+#   ViT patch / merge    16 / 2 on both      -> identical vision token counts
+# Verified end to end: the same clip through each model's own processor yields
+# element-wise EQUAL input_ids. That is what makes all-token KV alignment position-exact
+# rather than the compressed proxy the 2B/KAVA pairing was stuck with.
+#
+# from_pretrained_vlm needs `alpamayo_config_path`: that is what extends the vocabulary by
+# the 4000 <i0>..<i3999> trajectory tokens plus the specials, and attaches the pretrained
+# trajectory tokenizer. Without it the student has no trajectory vocabulary at all.
+_target_: alpamayo1_5_distill.models.kd_model.KDReasoningVLA.from_pretrained_vlm
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
+alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+checkpoint_path: null
+
+# The frozen teacher. `from_alpamayo_checkpoint` filters to the `vlm.` prefix, so the
+# action expert and diffusion tensors are never materialised -- ~16 GB, not ~21 GB. Set
+# `kd` to null below to drop the teacher entirely and get the CE-only control arm.
+teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+teacher_vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+
+kd:
+  # MEASURED, not guessed -- scripts/calibrate_kd_weights.py, 4 batches, step 0, at
+  # vlm.model.language_model.layers.18. Raw |grad| per term, with both weights at 1.0:
+  #
+  #   ce  1.270e+02        kd  1.791e+01  (14.1% of ce)     kv  2.797e-01  (0.22% of ce)
+  #
+  # Stable across batches (kd 17.4-18.5, kv 0.268-0.308), so these are the term scales,
+  # not batch noise. Note what that second column means: shipping `kv_weight: 1.0` -- the
+  # obvious default, and what the first smoke run used -- would have left L_KV at 0.2% of
+  # the backbone gradient, i.e. a decorative term with a perfectly healthy loss curve.
+  # That is the same failure L_KV hit in the KAVA runs, and the reason the weights below
+  # are stated as a solved share rather than a round number. They do NOT transfer from
+  # KAVA: that objective normalised over M=8 slots, this one over ~3200 tokens.
+  #
+  # Both set so the term enters at 10% of the CE gradient, which keeps arms 2 and 3
+  # comparable -- each added objective arrives with the same authority.
+  #   share     kd_weight     kv_weight
+  #      1%    7.0921e-02    4.5409e+00
+  #      5%    3.5460e-01    2.2704e+01
+  #     10%    7.0921e-01    4.5409e+01     <-- shipped
+  #     30%    2.1276e+00    1.3623e+02
+  #
+  # ⚠️ These are step-0 shares on an untrained student, where CE is at its largest. As CE
+  # falls the shares drift up. The in-training probe that would have tracked that cannot
+  # run under ZeRO-2 (see trainer._probe_gradient_shares), so re-measure instead by
+  # pointing the calibrator at a checkpoint: ++model.checkpoint_path=<ckpt>.
+  kd_weight: 0.70921
+  kv_weight: 45.409
+
+  # Hinton temperature; the loss multiplies by T^2 so lambda_kd need not be retuned per T.
+  kd_temperature: 1.0
+
+  # "direct" is the PRIMARY arm, not a zero-param control. Widths already match at 1024,
+  # and with eviction gone the positions correspond exactly -- so a learned projector now
+  # has a well-posed target AND enough capacity to absorb the whole cross-model mismatch
+  # without the student's own cache moving, which is the failure the KAVA work spent a
+  # long time chasing. "mlp" is the ablation.
+  kv_align: direct
+
+  # l1, not smooth_l1: smooth_l1's gradient decays ~9x as the residual shrinks and was
+  # measured to self-extinguish on this objective.
+  kv_loss_type: l1
+
+  # Qwen3-VL K/V magnitudes span orders of magnitude across depth ("massive activations");
+  # without this the largest layers own the gradient.
+  kv_layerwise_std: true
+
+  # Report kv_loss separately over vision / text / trajectory positions. ~93% of positions
+  # are vision, so a single scalar cannot show whether that region is converging at a
+  # different rate or swamping the other two.
+  log_kv_regions: true

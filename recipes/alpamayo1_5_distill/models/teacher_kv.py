@@ -56,6 +56,11 @@ class TeacherKVSample:
     imp: torch.Tensor | None  # [L, H, N_C] answer-attention mass, or None
     red: torch.Tensor | None  # [L, H, N_C] redundancy, or None
     tfs_hidden: torch.Tensor  # [H_teacher] hidden at <traj_future_start>
+    #: ``[L+1, H_teacher]`` hidden at ``<traj_future_start>`` for EVERY layer, index 0
+    #: being the embedding output.  CoDI distils all layers and averages
+    #: (``distill_loss /= len(outputs.hidden_states)``); ``tfs_hidden`` above is just
+    #: the last entry of this, kept separate so old caches stay readable.
+    tfs_hidden_all: torch.Tensor | None
     cot_text: str
     n_cot: int
 
@@ -328,6 +333,7 @@ def extract_teacher_kv(
             use_cache=True,
             cache_position=torch.arange(hi, answer_end, device=sequence.device),
             output_attentions=want_attn,
+            output_hidden_states=True,
         )
 
     # last_hidden_state is post-final-norm, i.e. the same quantity as
@@ -336,6 +342,25 @@ def extract_teacher_kv(
     # while the prefix ran flash — irrelevant for a distillation target, but worth
     # knowing before comparing two cache runs element-wise.
     tfs_hidden = answer_out.last_hidden_state[0, -1].detach().float().cpu()
+
+    # Every layer at the same column, for the CoDI-style all-layer objective. HF returns
+    # L+1 entries with index 0 the embedding output, which is what CoDI iterates over
+    # (`zip(outputs.hidden_states, ref_outputs.hidden_states)`) and divides by, so keep
+    # the embedding row rather than trimming it.
+    #
+    # ⚠️ hidden_states[-1] is NOT last_hidden_state for every architecture — some apply
+    # the final norm after collecting the tuple. Assert instead of assuming, since a
+    # silent half-layer offset would corrupt every target in the cache.
+    tfs_hidden_all = None
+    if answer_out.hidden_states:
+        stacked = torch.stack([h[0, -1] for h in answer_out.hidden_states], dim=0)
+        if not torch.allclose(stacked[-1].float(), answer_out.last_hidden_state[0, -1].float()):
+            raise RuntimeError(
+                "hidden_states[-1] != last_hidden_state at the tfs column, so this model "
+                "collects hidden states before the final norm. The all-layer CoDI target "
+                "would then be off by one normalisation; fix the indexing before caching."
+            )
+        tfs_hidden_all = stacked.detach().float().cpu()
 
     imp = None
     if want_attn:
@@ -380,6 +405,7 @@ def extract_teacher_kv(
         imp=None if imp is None else imp.cpu(),
         red=None if red is None else red.cpu(),
         tfs_hidden=tfs_hidden,
+        tfs_hidden_all=tfs_hidden_all,
         cot_text=cot_text,
         n_cot=hi - lo,
     )

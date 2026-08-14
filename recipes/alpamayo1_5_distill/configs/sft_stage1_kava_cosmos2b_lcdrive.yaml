@@ -71,6 +71,9 @@ data:
     kv_tier: compressed_M8_rkv0.1
     num_slots: 8
     attach_tfs_hidden: true
+    # Must be true whenever model.latent_all_layers is. Needs a cache built with
+    # tfs_hidden_all; an older cache raises rather than falling back silently.
+    attach_tfs_hidden_all: false
     # 4 of 38,340 LCDrive clips have no cache entry (the teacher hit max_new_tokens
     # without emitting <traj_future_start>, so there was no handoff to record). They
     # get an all-masked target and train on CE alone; without this the run dies on
@@ -138,7 +141,12 @@ trainer:
   gradient_accumulation_steps: 16
   learning_rate: 1e-5
   warmup_steps: 500
-  num_train_epochs: 3
+  # 1 epoch, not 3. The first run's +0.158 min_ade regression accrued over 7,191 steps
+  # of which only ~300 carried meaningful KAVA gradient — the rest was plain CE
+  # continuation on an already-converged Stage-1 model. With kv_loss_type=l1 the
+  # objective no longer self-extinguishes, so 1 epoch (2,396 steps) is ~8x more
+  # *effective* KAVA training than the 3-epoch run, at a third of the drift exposure.
+  num_train_epochs: 1
 
 paths:
   output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_kava_cosmos2b_lcdrive

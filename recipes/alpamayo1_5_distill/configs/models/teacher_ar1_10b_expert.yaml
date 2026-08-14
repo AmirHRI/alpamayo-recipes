@@ -1,0 +1,15 @@
+# Alpamayo-1 (Alpamayo-R1-10B) WITH its action expert, for the CoT ablation.
+#
+# The v1 sibling of teacher_ar1_5_10b_expert. Alpamayo 1 does "Chain-of-Causation"
+# reasoning rather than 1.5's CoT, but the question is the same: does the reasoning
+# improve the trajectory the action expert produces?
+#
+# Uses the alpamayo1_sft recipe's class, not alpamayo1_5_sft's -- different VLM backbone
+# (Cosmos-Reason vs Qwen3-VL) and a different checkpoint format. Both inherit
+# AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout, which is all the ablation
+# needs.
+_target_: alpamayo1_sft.models.sft_alpamayo_r1.TrainableAlpamayoR1.from_pretrained
+pretrained_model_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-R1-10B/snapshots/d72c6a2757b10cacb69b688ca66ccfad3dafbf37
+dtype: auto
+cotrain_vlm: false
+stage1_vlm_checkpoint_path: null

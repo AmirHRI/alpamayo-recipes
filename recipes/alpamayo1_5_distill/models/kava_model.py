@@ -104,6 +104,9 @@ class KaVaReasoningVLA(DistillReasoningVLA):
     kv_loss_type: str = "smooth_l1"
     kv_layerwise_std: bool = False
     kv_align: str = "projector"
+    latent_all_layers: bool = False
+    latent_layer_map: list[int] | None = None
+    latent_div_std: bool = True
     kv_layer_map: list[int] | None = None
 
     #: When True, ``forward`` also stashes the loss terms **with their graph attached**
@@ -130,6 +133,9 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         kv_loss_type: str = "smooth_l1",
         kv_layerwise_std: bool = False,
         kv_align: str = "projector",
+        latent_all_layers: bool = False,
+        latent_layer_map: list[int] | None = None,
+        latent_div_std: bool = True,
         kv_layer_map: list[int] | None = None,
         slot_init: str = "vocab",
         slot_init_cot_text: str | None = None,
@@ -169,6 +175,11 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         self.kv_loss_type = str(kv_loss_type)
         self.kv_layerwise_std = bool(kv_layerwise_std)
         self.kv_align = str(kv_align)
+        self.latent_all_layers = bool(latent_all_layers)
+        self.latent_layer_map = (
+            None if latent_layer_map is None else [int(x) for x in latent_layer_map]
+        )
+        self.latent_div_std = bool(latent_div_std)
 
         n_student = self._n_student_layers()
         self.kv_layer_map = build_layer_map(n_student, int(teacher_layers), kv_layer_map)
@@ -192,20 +203,36 @@ class KaVaReasoningVLA(DistillReasoningVLA):
     def _build_jacobi_proj(self, hidden: int) -> nn.Module:
         """The PCCoT projection: slot output hidden -> next-iteration input embedding.
 
-        Normalise first.  Qwen3-VL hidden states reach magnitudes ~1350 ("massive
-        activations") while token embeddings sit at ~3.19e-2 RMS, so feeding hidden
-        states straight back in — Coconut-style, i.e. an identity init — starts the
-        refinement four orders of magnitude off-manifold.  The RMSNorm removes the
-        scale entirely and the linear is initialised so its output RMS matches the
-        model's *measured* embedding RMS, rather than a guessed constant.
+        Architecture is the reference implementation's
+        (``github.com/whyNLP/PCCoT``, ``PCCoTLlamaForCausalLM.__init__``)::
+
+            Linear -> GELU -> Linear -> LayerNorm
+
+        Nonlinear, and normalised at the **output** rather than the input.  An earlier
+        version here was ``RMSNorm -> Linear``: normalising first fixes the scale but
+        leaves only a linear map, so the projection cannot reshape the hidden state on
+        its way to becoming an embedding.
+
+        ⚠️ One deliberate deviation, and it is measured rather than assumed.  PCCoT
+        leaves the LayerNorm gain at its default 1.0, which puts the output at RMS ~1.
+        Qwen3-VL token embeddings sit at ~3.19e-2 RMS, so their default would start the
+        latents ~31x off the embedding manifold — the same failure the old RMSNorm-first
+        design existed to avoid, and on Llama (their model) the gap is far smaller.  The
+        gain is therefore initialised to the *measured* embedding RMS, which keeps their
+        architecture and their norm placement while removing the scale mismatch.  It is
+        learnable, so training can move it.
         """
         emb_weight = self.vlm.get_input_embeddings().weight
         target_rms = float(emb_weight.detach().float().pow(2).mean().sqrt())
         proj = nn.Sequential(
-            nn.RMSNorm(hidden, eps=1e-6),
-            nn.Linear(hidden, hidden, bias=False),
+            nn.Linear(hidden, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
         )
-        nn.init.normal_(proj[1].weight, std=target_rms / (hidden**0.5))
+        # LayerNorm output is gamma * unit-variance + beta, so RMS ~= |gamma|.
+        nn.init.constant_(proj[3].weight, target_rms)
+        nn.init.zeros_(proj[3].bias)
         return proj
 
     def _init_slot_values(self, slot_init: str, cot_text: str | None, std: float) -> None:
@@ -270,6 +297,7 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         latent_cosine_weight: float = 0.1,
         kava: dict[str, Any] | None = None,
         kava_checkpoint_path: str | None = None,
+        zero_slots: bool = False,
         **kwargs: Any,
     ) -> "KaVaReasoningVLA":
         """Build the student, the parent's latent projector, then the KAVA state.
@@ -285,6 +313,11 @@ class KaVaReasoningVLA(DistillReasoningVLA):
                 model that was never trained.
             kava: the kwarg block forwarded to :meth:`init_kava`; omit it to get
                 exactly a :class:`DistillReasoningVLA` (the no-slot control arm).
+            zero_slots: the §7a dead-slot ablation.  **Must be an explicit parameter**:
+                left to ``**kwargs`` it is swallowed by the parent's
+                ``config_kwargs.update(kwargs)`` and becomes a *config field* rather
+                than a model attribute, so the ablation silently does nothing and both
+                arms score identically. That is how the first ablation run was wasted.
         """
         model = super().from_pretrained_vlm(
             vlm_name_or_path,
@@ -299,6 +332,13 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             model.init_kava(**kava)
         if kava_checkpoint_path is not None:
             model.load_kava_checkpoint(kava_checkpoint_path)
+        model.zero_slots = bool(zero_slots)
+        if model.zero_slots:
+            print(
+                "[kava] zero_slots=True — DEAD-SLOT ABLATION: the slots are injected as "
+                "zeros at inference. Any metric from this run is the no-reasoning arm.",
+                flush=True,
+            )
         return model
 
     def load_kava_checkpoint(self, path: str) -> None:
@@ -454,12 +494,42 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         "generate the whole student sequence with Jacobi iterations and *then*
         distil".
 
-        Two documented deviations:
+        Aligned with the reference implementation (``github.com/whyNLP/PCCoT``,
+        ``PCCoTLlamaForCausalLM.forward``) on three points that used to differ:
 
-        * the prefix cache is built under ``no_grad``, so during refinement the
-          gradient reaches the slots but not the backbone through the prefix.  The
-          backbone still gets full gradient from the final forward.  This keeps the
-          cost at one extra prefill instead of ``T`` differentiable ones.
+        1. **The feedback is SHIFTED.**  Refinement among the slots is causal —
+           measured, exactly lower-triangular, see
+           ``scripts/validate_jacobi_causality.py`` — so the output at slot ``i`` is
+           the model's prediction *for* slot ``i+1``.  PCCoT routes it there and holds
+           slot 0's input fixed::
+
+               in_0    <- unchanged forever
+               in_i+1  <- proj(out_i)          # and out_{K-1} is discarded
+
+           Feeding ``out_i`` back into ``in_i`` instead (what this did before) hands
+           every slot the embedding meant for its successor, and converges to a
+           self-consistency fixed point rather than the autoregressive-consistent one
+           that Jacobi iteration exists to reach.
+        2. **The initial latents come from the prefix**, not from a free parameter.
+           One forward over ``[0, start + K)`` — whose slot columns still hold the
+           ``'.'`` placeholders — supplies hidden states at ``[start-1, start+K-1)``,
+           i.e. the same AR shift.  ``slot_embeddings`` is kept as an additive learned
+           offset (see below).
+        3. **The prefix is differentiable.**  It used to be built under ``no_grad``,
+           which left the backbone unable to learn a prefix cache that makes refinement
+           work.  (It always did get gradient *through the refinement passes
+           themselves* — those were never detached.)  Costs ``T`` differentiable
+           prefills instead of one; see the memory note in ``slurm_train_kava.sh``.
+
+        Two deviations that remain, both deliberate:
+
+        * ``slot_embeddings`` is added to the derived initial latents rather than
+          replaced by them.  PCCoT has no such parameter, but dropping it here would
+          leave it with **no gradient at all** at ``T>1`` — the exact
+          unused-parameter asymmetry that deadlocked two-rank training in the
+          ``L_KV`` mask path (see ``kv_matching_loss``).  It also gives each slot an
+          identity of its own, which matters more once the input to slot ``i`` is
+          derived from slot ``i-1``'s output.
         * refinement needs one crop point for the whole batch, so slot columns must
           be uniform across the batch.  They are, for every LCDrive config: batches
           are right-aligned by left padding and the span after
@@ -493,15 +563,32 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         slot_positions = position_ids[:, :, start : start + n_slots]
         cache_position = torch.arange(start, start + n_slots, device=input_ids.device)
 
-        with torch.no_grad():
-            prefix_kwargs = {k: v for k, v in tokenized_data.items() if k != "attention_mask"}
-            prefix = self.vlm(
-                input_ids=input_ids[:, :start],
-                attention_mask=None if attention_mask is None else attention_mask[:, :start],
-                use_cache=True,
-                **prefix_kwargs,
+        if start < 1:
+            raise ValueError(
+                f"slots start at column {start}; PCCoT's initial latents are seeded from "
+                "position start-1, so at least one real token must precede them"
             )
+
+        # Differentiable, and run over the prefix PLUS the K placeholder columns, so the
+        # same pass yields both the cache to refine against and PCCoT's initial latents.
+        #
+        # `self.vlm.model`, not `self.vlm`: the base model returns `last_hidden_state`
+        # directly and skips the LM head. Now that this pass carries gradient, running the
+        # head would retain logits over a 155,697 vocab for the whole prefix — ~1.9 GB at
+        # 3k tokens in fp32 — for a tensor nothing here reads.
+        prefix_kwargs = {k: v for k, v in tokenized_data.items() if k != "attention_mask"}
+        upto = start + n_slots
+        prefix = self.vlm.model(
+            input_ids=input_ids[:, :upto],
+            attention_mask=None if attention_mask is None else attention_mask[:, :upto],
+            use_cache=True,
+            **prefix_kwargs,
+        )
         cache = prefix.past_key_values
+        # AR shift: the hidden at position p is the prediction for p+1, so slot i is
+        # seeded from position start+i-1.
+        init_hidden = prefix.last_hidden_state[:, start - 1 : upto - 1]
+        cache.crop(start)  # refinement must attend to the prefix only, never the slots
 
         if attention_mask is None:
             refine_mask = None
@@ -509,7 +596,8 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             ones = attention_mask.new_ones((attention_mask.shape[0], n_slots))
             refine_mask = torch.cat([attention_mask[:, :start], ones], dim=1)
 
-        current = slots.unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+        # PCCoT's init, plus slot_embeddings as a learned per-slot offset (see docstring).
+        current = self.jacobi_proj(init_hidden) + slots.unsqueeze(0)
         text_model = self._text_model()
         for _ in range(self.jacobi_iters - 1):
             out = text_model(
@@ -521,10 +609,75 @@ class KaVaReasoningVLA(DistillReasoningVLA):
                 cache_position=cache_position,
             )
             cache.crop(start)  # roll the cache back so the next iteration re-reads the prefix
-            current = self.jacobi_proj(out.last_hidden_state)
+            # SHIFTED feedback: slot 0's input is never updated, slot i+1 takes slot i's
+            # output, and out_{K-1} is dropped (it predicts the first post-slot token, not
+            # a latent). Matches PCCoT; see the docstring for why the unshifted form is
+            # wrong under a causal mask.
+            projected = self.jacobi_proj(out.last_hidden_state)
+            current = torch.cat([current[:, :1], projected[:, :-1]], dim=1)
         return current
 
     # ------------------------------------------------------------------- loss
+    def _latent_loss_all_layers(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: tuple[torch.Tensor, ...],
+        teacher_all: torch.Tensor,
+    ) -> torch.Tensor:
+        """CoDI's objective: match the handoff column at EVERY layer, then average.
+
+        The reference (``github.com/zhenyi4/codi``, ``src/model.py``) does::
+
+            for out, ref_out in zip(outputs.hidden_states, ref_outputs.hidden_states):
+                out_sel = out.gather(1, model_answer_position...)
+                ref_sel = ref_out.gather(1, ref_answer_position...)
+                distill_loss += loss_fct(out_sel, ref_sel.detach()) / ref_sel.std()
+            distill_loss /= len(outputs.hidden_states)
+
+        Ours matched **one** layer, ``hidden_states[-1]``.  That target converged
+        59.7 -> 0.15 and sat at ~3% of CE's gradient, which is what a too-easy
+        objective looks like: a single 4096-d vector is nearly solvable by the
+        8.4 M-parameter projector alone, without the backbone moving.  All layers is a
+        strictly harder, better-conditioned target.
+
+        Two things differ from CoDI by necessity, both because they self-distil and we
+        do not:
+
+        * **A width projector is required** (student 2048 -> teacher 4096) where they
+          need none.  It is the *same shared* ``latent_proj`` at every layer rather than
+          one per layer: per-layer would be 29 x 8.4 M = 243 M throwaway parameters, and
+          CoDI has no per-layer parameters at all.  Per-layer scale differences are
+          handled by the std normalisation instead, which is cheaper and is what CoDI
+          itself uses.
+        * **Depth differs** (29 student tensors vs 37 teacher), so the same uniform
+          stride as ``L_KV`` maps them, endpoints preserved -- embedding->embedding and
+          final->final.
+
+        ``div_std`` matters more here than it does for them: Qwen3-VL hidden magnitudes
+        span orders of magnitude across depth ("massive activations"), so without it the
+        largest layers own the average.
+        """
+        layer_map = self._codi_layer_map(len(hidden_states), int(teacher_all.shape[1]))
+        teacher_all = teacher_all.to(hidden_states[-1].device).float()
+        total = hidden_states[-1].new_zeros((), dtype=torch.float32)
+        for s_idx, t_idx in enumerate(layer_map):
+            h_s = self.latent_proj(self._gather_tfs_hidden(input_ids, hidden_states[s_idx]))
+            h_t = teacher_all[:, t_idx].detach()
+            term = self._latent_loss(h_s, h_t)
+            if self.latent_div_std:
+                term = term / h_t.std().clamp_min(1e-6)
+            total = total + term
+        return total / len(layer_map)
+
+    def _codi_layer_map(self, n_student: int, n_teacher: int) -> list[int]:
+        """Cached student->teacher map over hidden-state tensors (L+1 of them)."""
+        cached = getattr(self, "_codi_map_cache", None)
+        if cached is not None and cached[0] == (n_student, n_teacher):
+            return cached[1]
+        mapping = build_layer_map(n_student, n_teacher, self.latent_layer_map)
+        self._codi_map_cache = ((n_student, n_teacher), mapping)
+        return mapping
+
     def _kv_loss(
         self,
         teacher_kv_k: torch.Tensor,
@@ -555,7 +708,9 @@ class KaVaReasoningVLA(DistillReasoningVLA):
 
     # -------------------------------------------------------------- inference
     @contextmanager
-    def _generation_slot_hook(self, slot_pos: torch.Tensor | None) -> Iterator[None]:
+    def _generation_slot_hook(
+        self, slot_pos: torch.Tensor | None, refined_slots: torch.Tensor | None = None
+    ) -> Iterator[None]:
         """Inject the learned slots for the duration of a ``generate`` call.
 
         The training path injects via :meth:`_slot_hooks`, but generation never goes
@@ -578,7 +733,19 @@ class KaVaReasoningVLA(DistillReasoningVLA):
             yield
             return
 
-        slots = self.slot_embeddings
+        if refined_slots is not None:
+            slots = refined_slots
+        elif self.jacobi_iters > 1:
+            # Guard, not a fallback. Injecting raw embeddings for a T>1 checkpoint is
+            # what produced min_ade 17.56 vs a 4.09 baseline, silently.
+            raise RuntimeError(
+                f"jacobi_iters={self.jacobi_iters} but no refined slots were supplied to "
+                "the generation hook. Inference must run the same PCCoT refinement as "
+                "training; injecting the raw slot_embeddings feeds the model latents it "
+                "never saw. Call via sample_trajectories_from_data, or pass refined_slots."
+            )
+        else:
+            slots = self.slot_embeddings
         if getattr(self, "zero_slots", False):
             # §7a dead-slot ablation: if quality is unchanged with the slots zeroed,
             # they are decorative and L_KV achieved nothing, whatever the loss said.
@@ -589,14 +756,22 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         def inject(_module: nn.Module, _args: Any, out: torch.Tensor) -> torch.Tensor:
             if out.shape[1] <= max_col:
                 return out  # a decode step, not the prefill
-            positions, n_out = slot_pos, out.shape[0]
+            positions, n_out, values = slot_pos, out.shape[0], slots
             if n_out != batch:
                 if n_out % batch:
                     return out  # unexpected expansion; leave it rather than corrupt it
-                positions = slot_pos.repeat_interleave(n_out // batch, dim=0)
+                repeat = n_out // batch
+                positions = slot_pos.repeat_interleave(repeat, dim=0)
+                # Per-sample slots must be expanded the SAME way. The raw path passes
+                # [K, H], which broadcasts over any batch and hid this; refined slots are
+                # [B, K, H] and previously died with "value tensor of shape [4, 8, 2048]
+                # cannot be broadcast to indexing result of shape [24, 8, 2048]" -- 24 =
+                # 4 x num_traj_samples 6.
+                if values.dim() == 3:
+                    values = values.repeat_interleave(repeat, dim=0)
             rows = torch.arange(n_out, device=out.device).unsqueeze(1)
             out = out.clone()
-            out[rows, positions.to(out.device)] = slots.to(out.dtype)
+            out[rows, positions.to(out.device)] = values.to(out.dtype)
             return out
 
         handle = self.vlm.get_input_embeddings().register_forward_hook(inject)
@@ -605,13 +780,47 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         finally:
             handle.remove()
 
+    def _refined_slots_for_inference(
+        self, data: dict[str, Any], slot_pos: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Reproduce training's PCCoT refinement at inference. -> ``[B, K, H]`` or None.
+
+        Training injects ``_run_jacobi(...)`` when ``T > 1``; generation used to inject
+        the raw ``slot_embeddings``, i.e. the *starting point* of the iteration rather
+        than its result. Those differ by rel-L2 ~1.56 (measured), so a T=2 checkpoint
+        was being fed latents it had never seen: min_ade came out 17.56 against a 4.09
+        baseline, and *zeroing* the slots scored better (7.94) because zeros are merely
+        uninformative rather than actively wrong.
+
+        Returns None at ``T == 1``, where the raw embeddings are exactly what training
+        injects and no refinement is defined.
+        """
+        if self.jacobi_iters <= 1:
+            return None
+        tokenized = dict(data["tokenized_data"])
+        input_ids = tokenized.pop("input_ids")
+        input_ids = self.fuse_traj_tokens(
+            input_ids,
+            {
+                "ego_history_xyz": data.get("ego_history_xyz"),
+                "ego_history_rot": data.get("ego_history_rot"),
+            },
+        )
+        return self._run_jacobi(input_ids, tokenized, slot_pos, self.slot_embeddings)
+
     def sample_trajectories_from_data(self, data: dict[str, Any], *args: Any, **kwargs: Any):
         """Parent's sampler, with the latent slots actually injected.
 
         ``slot_pos`` rides on the batch from ``KaVaCollator``; the parent knows nothing
-        about it, so this wraps the call rather than reimplementing the sampler.
+        about it, so this wraps the call rather than reimplementing the sampler. When
+        ``T > 1`` the slots are refined first, exactly as ``forward`` does — otherwise
+        inference and training disagree about what a "slot" is.
         """
-        with self._generation_slot_hook(data.get("slot_pos")):
+        slot_pos = data.get("slot_pos")
+        refined = None
+        if slot_pos is not None and slot_pos.numel() and self.num_slots > 0:
+            refined = self._refined_slots_for_inference(data, slot_pos.to(self.device))
+        with self._generation_slot_hook(slot_pos, refined_slots=refined):
             return super().sample_trajectories_from_data(data, *args, **kwargs)
 
     # ---------------------------------------------------------------- forward
@@ -624,6 +833,10 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         ego_future_rot: torch.Tensor | None = None,
         labels_mask: torch.Tensor | None = None,
         teacher_tfs_hidden: torch.Tensor | None = None,
+        # Explicit, never **kwargs: a config field swallowed into kwargs is how the
+        # zero_slots ablation silently became a no-op for a whole run (500/500 clips
+        # bit-identical). A missing all-layer target must reach the raise below.
+        teacher_tfs_hidden_all: torch.Tensor | None = None,
         slot_pos: torch.Tensor | None = None,
         teacher_kv_k: torch.Tensor | None = None,
         teacher_kv_v: torch.Tensor | None = None,
@@ -702,10 +915,22 @@ class KaVaReasoningVLA(DistillReasoningVLA):
         total_loss = ce_loss
         attached: dict[str, torch.Tensor] = {"ce": ce_loss}
 
-        # lambda_1: the endpoint hidden match (KAVA's L_CODI analogue).
+        # lambda_1: the CoDI hidden match, at one layer or all of them.
         latent_loss = None
         latent_proj = getattr(self, "latent_proj", None)
-        if teacher_tfs_hidden is not None and latent_proj is not None:
+        if self.latent_all_layers and latent_proj is not None:
+            if teacher_tfs_hidden_all is None:
+                raise ValueError(
+                    "latent_all_layers=true but the batch has no `teacher_tfs_hidden_all`. "
+                    "Set data.train_dataset.attach_tfs_hidden_all=true and use a cache "
+                    "built with the all-layer target."
+                )
+            latent_loss = self._latent_loss_all_layers(
+                input_ids, outputs.hidden_states, teacher_tfs_hidden_all
+            )
+            total_loss = total_loss + self.latent_loss_weight * latent_loss
+            attached["latent"] = latent_loss
+        elif teacher_tfs_hidden is not None and latent_proj is not None:
             h_student = latent_proj(self._gather_tfs_hidden(input_ids, outputs.hidden_states[-1]))
             latent_loss = self._latent_loss(h_student, teacher_tfs_hidden.to(h_student.device))
             total_loss = total_loss + self.latent_loss_weight * latent_loss
