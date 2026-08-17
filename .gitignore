@@ -16,8 +16,10 @@ dist/
 a1_sft/
 a1_5_sft/
 a1_5_eval/
-.venv/
-**/.venv/
+# no trailing slash: also catches a `.venv` that's a symlink (e.g. to a
+# differently-named venv dir), which a `.venv/`-style pattern won't match
+.venv
+**/.venv
 venv/
 env/
 
