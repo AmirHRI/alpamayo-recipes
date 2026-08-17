@@ -39,6 +39,10 @@ wandb/
 *.tmp
 tea_debug.log
 
+# ---- Secrets / env ----
+.env
+.env.*
+
 # ---- OS / editor ----
 .DS_Store
 Thumbs.db
