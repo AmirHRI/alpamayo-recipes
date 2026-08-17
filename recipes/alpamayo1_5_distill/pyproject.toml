@@ -57,6 +57,10 @@ override-dependencies = ["deepspeed==0.19.1"]
 alpamayo1_5_sft = { path = "../alpamayo1_5_sft", editable = true }
 alpamayo_r1 = { git = "https://github.com/NVlabs/alpamayo.git" }
 alpamayo-recipes = { path = "../../src", editable = true }
+# Use the prebuilt wheel instead of building from source, since this avoids
+# requiring nvcc/CUDA toolkit to be present at install time (e.g. on Slurm
+# login nodes without a CUDA dev environment).
+flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3+cu12torch2.8cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
 
 [tool.ruff]
 line-length = 100
