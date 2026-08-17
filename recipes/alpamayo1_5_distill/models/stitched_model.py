@@ -61,6 +61,7 @@ import torch
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
 from safetensors.torch import load_file
 
+from alpamayo1_5_sft.models.sft_alpamayo_r1 import TrainableAlpamayoR1
 from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA, load_alpamayo1_vlm
 
 logger = logging.getLogger(__name__)
@@ -369,3 +370,47 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         for dead in ("last_component", "traj_only_generation", "return_extra"):
             kwargs.pop(dead, None)
         return self.sample_trajectories_from_data_with_vlm_rollout(data=data, **kwargs)
+
+
+class TrainableStitchedAlpamayoR1(StitchedAlpamayoR1):
+    """Student VLM (frozen) + teacher action expert (TRAINABLE), on the flow-matching loss.
+
+    The other half of the compounding fix. ``L_block`` pushes the student's cache toward the
+    teacher's and plateaus, because teacher-forcing hides the error that accumulates when the
+    expert consumes the student's own cache (measured: free-running error 32x the
+    teacher-forced one, 72x at the deepest layers -- ``scripts/freerun_probe.py``). Rather
+    than force the cache to match, this lets the EXPERT adapt to the cache the student
+    actually produces.
+
+    ``StitchedAlpamayoR1`` knows how to pair a Qwen3-VL student tower with the teacher's
+    expert but extends ``AlpamayoR1`` directly, so it only has the inference forward. The
+    training forward lives on ``TrainableAlpamayoR1``, a sibling under ``AlpamayoR1``.
+    Borrowing the three methods is the same pattern ``KaVaExpertTeacher`` uses for
+    ``generate_cot_prefix`` -- if either class starts depending on state the other lacks,
+    this is the line that breaks, loudly.
+
+    ⚠️ ``cotrain_vlm``/``stop_grad_from_vlm`` are set here because they are assigned in
+    ``TrainableAlpamayoR1.__init__``, which this class does not run.
+    """
+
+    forward = TrainableAlpamayoR1.forward
+    _process_traj_future_training = TrainableAlpamayoR1._process_traj_future_training
+    _process_position_ids_qwen2_5_vl = TrainableAlpamayoR1._process_position_ids_qwen2_5_vl
+
+    @classmethod
+    def from_student(cls, checkpoint_path: str, vlm_name_or_path: str,
+                     teacher_checkpoint_path: str, cotrain_vlm: bool = False, **kw):
+        """Student tower from `checkpoint_path`, teacher expert from `teacher_checkpoint_path`."""
+        model = cls.from_stitch(
+            checkpoint_path=checkpoint_path, vlm_name_or_path=vlm_name_or_path,
+            teacher_checkpoint_path=teacher_checkpoint_path, **kw)
+        model.cotrain_vlm = bool(cotrain_vlm)
+        model.stop_grad_from_vlm = True
+        for prm in model.vlm.parameters():
+            prm.requires_grad_(cotrain_vlm)
+        n_tr = sum(q.numel() for q in model.parameters() if q.requires_grad)
+        logger.warning("[stitch-train] VLM %s, trainable params %.2f B",
+                       "TRAINABLE" if cotrain_vlm else "frozen", n_tr / 1e9)
+        print(f"[stitch-train] VLM {'trainable' if cotrain_vlm else 'FROZEN'}, "
+              f"trainable {n_tr / 1e9:.2f} B", flush=True)
+        return model

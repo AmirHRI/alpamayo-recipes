@@ -34,6 +34,7 @@ import copy
 import json
 import logging
 import os
+import re
 
 import torch
 import torch.nn as nn
@@ -107,6 +108,43 @@ class FrozenExpert(nn.Module):
         for shard in sorted({weight_map[k] for k in wanted}):
             sd = load_file(os.path.join(checkpoint_path, shard))
             state.update({k: v for k, v in sd.items() if k.startswith(PREFIXES)})
+        # ⚠️ DEPTH REMAP. The expert's layer count is derived from the VLM's text config, so a
+        # 28-layer student (Cosmos-Reason2-2B) yields a 28-layer expert while the teacher
+        # checkpoint holds 36. Pruning is therefore a LOAD-TIME REMAP -- teacher expert layer
+        # pi(j) becomes student expert layer j -- not identity stand-ins in a 36-slot list.
+        # PRUNE_EXPERT_LAYERS names the teacher layers to DROP; the survivors, in order, are
+        # pi. Without this the load dies on unexpected=['expert.layers.28...'].
+        n_have = len(self.expert.layers)
+        n_ckpt = 1 + max((int(m.group(1)) for m in
+                          (re.match(r"expert\.layers\.(\d+)\.", k) for k in state) if m),
+                         default=-1)
+        if n_ckpt > n_have:
+            drop = {int(x) for x in os.environ.get("PRUNE_EXPERT_LAYERS", "").split(",")
+                    if x.strip()}
+            surv = [i for i in range(n_ckpt) if i not in drop]
+            if len(surv) != n_have:
+                raise RuntimeError(
+                    f"expert depth {n_have} but checkpoint has {n_ckpt}; "
+                    f"PRUNE_EXPERT_LAYERS must drop exactly {n_ckpt - n_have} layers "
+                    f"(currently drops {len(drop)})")
+            remap = {pi: j for j, pi in enumerate(surv)}
+            out: dict[str, torch.Tensor] = {}
+            for k, v in state.items():
+                m = re.match(r"(expert\.layers\.)(\d+)(\..*)", k)
+                if not m:
+                    out[k] = v
+                    continue
+                old_i = int(m.group(2))
+                if old_i in remap:                      # dropped layers are simply not loaded
+                    out[f"{m.group(1)}{remap[old_i]}{m.group(3)}"] = v
+            state = out
+            self._pi = surv
+            logger.warning("[block] expert DEPTH REMAP %d -> %d layers; dropped %s; "
+                           "student expert j <- teacher expert pi(j)",
+                           n_ckpt, n_have, sorted(drop))
+            print(f"[block] expert REMAP {n_ckpt}->{n_have}, dropped {sorted(drop)}", flush=True)
+        else:
+            self._pi = None
         missing, unexpected = self.load_state_dict(state, strict=False)
         params = dict(self.named_parameters())
         # Only a missing PARAMETER is a fault; deterministic buffers (action_in_proj.*.freqs)

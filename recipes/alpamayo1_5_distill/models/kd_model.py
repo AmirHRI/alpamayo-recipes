@@ -91,6 +91,7 @@ class KDVLAOutput(ModelOutput):
     kd_loss: torch.FloatTensor | None = None
     kv_loss: torch.FloatTensor | None = None
     block_loss: torch.FloatTensor | None = None
+    freerun_loss: torch.FloatTensor | None = None
     kv_loss_vision: torch.FloatTensor | None = None
     kv_loss_text: torch.FloatTensor | None = None
     kv_loss_traj: torch.FloatTensor | None = None
@@ -163,6 +164,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
     ce_weight: float = 1.0
     block_weight: float = 0.0
     block_timestep: str = "zero"
+    block_freerun_weight: float = 0.0
+    block_freerun_layers: int = 0
     kd_weight: float = 0.0
     kd_temperature: float = 1.0
     kv_weight: float = 0.0
@@ -189,6 +192,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
         ce_weight: float = 1.0,
         block_weight: float = 0.0,
         block_timestep: str = "zero",
+        block_freerun_weight: float = 0.0,
+        block_freerun_layers: int = 0,
         kd_weight: float = 0.0,
         kd_temperature: float = 1.0,
         kv_weight: float = 0.0,
@@ -220,6 +225,24 @@ class KDReasoningVLA(TrainableReasoningVLA):
         if block_timestep not in ("zero", "beta", "uniform"):
             raise ValueError(f"block_timestep must be zero|beta|uniform, got {block_timestep}")
         self.block_timestep = str(block_timestep)
+        # L_freerun: match the student's OWN chain at the final layer, not the teacher-forced
+        # per-layer output. Measured motivation (scripts/freerun_probe.py, n=32): the
+        # teacher-forced error L_block trains on is flat at ~4.1e-04 across all 36 layers,
+        # while the free-running error grows to 1.3e-02 -- 32x, and 72x at the deepest layers.
+        # Epochs 2-3 cut the teacher-forced term 33% and bought only -0.06 min_ade, because
+        # L_block has no gradient path to the compounded error. This term supplies one.
+        self.block_freerun_weight = float(block_freerun_weight)
+        self._pi_probed = False        # BLOCK_PI_PROBE fires on the first batch only
+        # How many of the DEEPEST layers carry gradient in the free-running chain. 0 = all.
+        # The chain always runs in full, so the compounded error still reaches the final
+        # layer; this only bounds how far back the gradient travels. Justified by where the
+        # error actually lives (freerun_probe, n=32): 3-6x the teacher-forced value at layers
+        # 4-8, but 28x at layer 24 and 71x at layers 28-32.
+        # ⚠️ The cost: the EARLY layers' cache errors are what CAUSE the compounding, and this
+        # variant cannot correct them through this term -- only their consequences at depth.
+        # L_block still supervises all 36 layers, though at ~4% of the gradient when
+        # block_freerun_weight=1.0.
+        self.block_freerun_layers = int(block_freerun_layers)
         self._beta_dist = (
             torch.distributions.beta.Beta(torch.tensor(1.5), torch.tensor(1.0))
             if block_timestep == "beta" else None
@@ -475,6 +498,20 @@ class KDReasoningVLA(TrainableReasoningVLA):
         t = self._beta_dist.sample((b,)).to(device)
         return 0.999 - t * 0.999          # flow_matching.py:148-149, verbatim
 
+    def _surviving_expert_layers(self):
+        """Indices of expert layers NOT replaced by identity stand-ins, or None if unpruned.
+
+        Reads the live module list rather than re-parsing PRUNE_EXPERT_LAYERS, so the mapping
+        can never disagree with what was actually bypassed.
+        """
+        try:
+            layers = self.expert.expert.layers
+        except AttributeError:
+            return None
+        surv = [i for i, m in enumerate(layers)
+                if type(m).__name__ != "_SkippedExpertLayer"]
+        return None if len(surv) == len(layers) else surv
+
     def _block_loss(self, student_kv, teacher_kv, rope, traj_mask, attn_mask,
                     traj_data=None):
         """L_block = mean_l || B_l(h_l^T; K_s,V_s) - sg B_l(h_l^T; K_t,V_t) ||^2.
@@ -548,16 +585,70 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 for h in handles:
                     h.remove()
 
+        # Identity stand-ins only exist in the ABLATION path (whole-teacher, 36 slots, 8
+        # bypassed). With a remapped shallow expert every slot is real, so this is empty.
+        skip = set(range(n_layers)) - set(self._surviving_expert_layers() or range(n_layers))
+
         def _sweep(k_list, v_list):
             acc = None
+            n_used = 0
             for l in range(n_layers):
+                if l in skip:      # identity stand-in: B_l(h) == h, term is trivially 0
+                    continue
+                n_used += 1
                 c = captured[l]
                 term = block_output_loss(
                     expert.expert.layers[l], c["h_in"], c["y_out"],
                     k_list[l], v_list[l], dict(c["kwargs"]),
                 )
                 acc = term if acc is None else acc + term
-            return acc / n_layers
+            return acc / max(n_used, 1)
+
+        # ⚠️ DIAGNOSTIC, opt-in via BLOCK_FREERUN=1. Answers whether teacher-forcing hides
+        # compounding: L_block feeds each block the TEACHER's h_l, so per-layer error is
+        # measured in isolation, while at inference layer l receives whatever the preceding
+        # layers produced from the student's cache. Both curves here use the TRAINING path --
+        # a prefill over the same token sequence, no CoT generation -- so the two caches have
+        # identical length and differ only in values.
+        #   teacher-forced  ||B_l(h^T_l; K^S,V^S) - h^T_{l+1}||^2 / ||h^T_{l+1}||^2
+        #   free-running    ||h^S_l - h^T_l||^2 / ||h^T_l||^2
+        if os.environ.get("BLOCK_FREERUN") == "1":
+            with torch.no_grad():
+                fr_cache = DynamicCache()
+                for i in range(n_layers):
+                    fr_cache.update(s_k[i], s_v[i], i, {})
+                fr_h: dict[int, torch.Tensor] = {}
+
+                def _fr_hook(idx):
+                    def f(_m, args, kw, out):
+                        fr_h[idx] = (args[0] if args else kw["hidden_states"]).detach()
+                        if idx == n_layers - 1:
+                            fr_h[n_layers] = (out[0] if isinstance(out, tuple) else out).detach()
+                    return f
+
+                fh = [expert.expert.layers[i].register_forward_hook(_fr_hook(i), with_kwargs=True)
+                      for i in range(n_layers)]
+                try:
+                    expert.expert(inputs_embeds=embeds, attention_mask=e_mask,
+                                  position_ids=pos, past_key_values=fr_cache, use_cache=True)
+                finally:
+                    for h_ in fh:
+                        h_.remove()
+                rel = lambda a, b: float((a.float() - b.float()).pow(2).mean()
+                                         / b.float().pow(2).mean().clamp_min(1e-9))
+                tf = [float(block_output_loss(expert.expert.layers[l], captured[l]["h_in"],
+                                              captured[l]["y_out"], s_k[l], s_v[l],
+                                              dict(captured[l]["kwargs"])))
+                      for l in range(n_layers)]
+                fr = [rel(fr_h[l], captured[l]["h_in"]) for l in range(n_layers)]
+                fr.append(rel(fr_h[n_layers], captured[n_layers - 1]["y_out"]))
+                print("[freerun] layer teacher_forced free_running", flush=True)
+                for l in range(0, n_layers, 4):
+                    print(f"[freerun] {l:>3} {tf[l]:.4e} {fr[l]:.4e} "
+                          f"ratio {fr[l] / max(tf[l], 1e-12):.1f}", flush=True)
+                print(f"[freerun] FINAL tf_mean {sum(tf) / len(tf):.4e} "
+                      f"fr_last {fr[-1]:.4e} ratio {fr[-1] / max(sum(tf) / len(tf), 1e-12):.1f}",
+                      flush=True)
 
         # ⚠️ SELF-TEST, opt-in via BLOCK_SELFTEST=1. A finite, falling loss is NOT evidence
         # that it measures cache fidelity -- that gap has produced retractions here. Feeding
@@ -576,7 +667,63 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 flush=True,
             )
 
-        return _sweep(s_k, s_v)
+        fr_term = None
+        if self.block_freerun_weight > 0:
+            # ⚠️ WITH gradient, unlike the BLOCK_FREERUN diagnostic above. s_k/s_v carry grad
+            # (recompute_kv -> rotate), the expert is frozen, and `embeds` is detached, so the
+            # only path back is through the student's cache -- which is the point.
+            fr_cache = DynamicCache()
+            for i in range(n_layers):
+                fr_cache.update(s_k[i], s_v[i], i, {})
+            # ⚠️ CHECKPOINTED, one layer at a time. Retaining activations for all 36
+            # layers of this second forward pushed the step from ~75 GB to over the 79 GB
+            # card and OOMed (surfaced as an opaque NCCL "unhandled cuda error").
+            # ⚠️ A FRESH single-layer cache inside the checkpointed function, seeded exactly
+            # as block_output_loss does. A shared DynamicCache would be mutated twice --
+            # once in the forward and again when checkpointing recomputes it -- appending the
+            # action K/V a second time and silently changing what the layer attends to.
+            def _fr_layer(h, l_idx):
+                l = int(l_idx)
+                cache = DynamicCache()
+                cache.update(s_k[l], s_v[l], 0, {})
+                blk = expert.expert.layers[l]
+                orig = blk.self_attn.layer_idx
+                blk.self_attn.layer_idx = 0
+                try:
+                    o = blk(h, past_key_values=cache, use_cache=True,
+                            **dict(captured[l]["kwargs"]))
+                finally:
+                    blk.self_attn.layer_idx = orig
+                return o[0] if isinstance(o, tuple) else o
+
+            # ⚠️ fp32 for the free-running chain, opt-in via BLOCK_FR_FP32=1. Its backward
+            # runs through 36 frozen expert blocks -- far deeper than L_block's single-block
+            # terms -- and in bf16 that produced a NON-FINITE gradient on the very first
+            # backward under plain zero2: deepspeed reported grad_norm as a constant 2.0
+            # sentinel at step 0 while both losses were still finite, then everything went
+            # nan at step 1. zero2_offload did NOT show it, because DeepSpeedCPUAdam works in
+            # fp32 on the host -- which means that path may have been MASKING the overflow
+            # rather than avoiding it.
+            fr_fp32 = os.environ.get("BLOCK_FR_FP32") == "1"
+            n_grad = (self.block_freerun_layers if 0 < self.block_freerun_layers < n_layers
+                      else n_layers)
+            cut = n_layers - n_grad
+            h_s = embeds
+            if cut:
+                with torch.no_grad():          # chain still runs; no activations retained
+                    for _l in range(cut):
+                        h_s = _fr_layer(h_s, _l)
+                h_s = h_s.detach()
+            with torch.autocast("cuda", enabled=not fr_fp32):
+                if fr_fp32:
+                    h_s = h_s.float()
+                for _l in range(cut, n_layers):
+                    h_s = torch.utils.checkpoint.checkpoint(
+                        _fr_layer, h_s, torch.tensor(_l), use_reentrant=False)
+            tgt = captured[n_layers - 1]["y_out"]
+            fr_term = ((h_s.float() - tgt.float()).pow(2).mean()
+                       / tgt.float().pow(2).mean().clamp_min(1e-6))
+        return _sweep(s_k, s_v), fr_term
 
     def forward(
         self,
@@ -611,10 +758,25 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # carry, rather than reconstructing mrope positions. Registered only when needed.
         rope, rope_handle = self._capture_rope() if self.block_weight > 0 else ({}, None)
         try:
+            # ⚠️ Only materialise logits when something actually reads them. CE needs them
+            # (ce_weight>0) and logit-KD needs them (kd_weight>0); the pure cache arms
+            # (blockonly / blockrandt / kvonly) need NEITHER, and the lm_head projects
+            # ~3k positions onto a ~155k vocab -- roughly a 1 GB bf16 tensor per sample plus
+            # the matmul, every step, discarded. `logits_to_keep=1` keeps one position so the
+            # output shape stays valid. Passing `labels` additionally makes HF compute its
+            # OWN cross-entropy internally, which this forward then recomputes and discards.
+            want_logits = self.ce_weight > 0 or self.kd_weight > 0
             outputs = self.vlm(
                 input_ids=input_ids,
-                labels=labels,
+                labels=labels if self.ce_weight > 0 else None,
                 output_hidden_states=want_hidden,
+                # ⚠️ use_cache=False, matching the teacher call below. This is a PREFILL --
+                # nothing here generates, and every K/V the objectives use is recomputed
+                # from `hidden_states` by `recompute_kv`. Leaving it on materialised a
+                # ~450 MB per-sample cache (36 layers x 8 kv heads x ~3k positions x 128)
+                # that was never read.
+                use_cache=False,
+                **({} if want_logits else {"logits_to_keep": 1}),
                 **tokenized_data,
             )
         finally:
@@ -630,13 +792,22 @@ class KDReasoningVLA(TrainableReasoningVLA):
             | (labels == self.special_token_ids["traj_future_start"])
             | (labels == self.special_token_ids["traj_future_end"])
         )
-        losses = {"future_traj": self._compute_next_token_loss(outputs, labels, traj_mask)}
-        ce_labels = labels.clone()
-        ce_labels[traj_mask] = IGNORE_INDEX
-        losses["others"] = self._compute_next_token_loss(
-            outputs, ce_labels, ce_labels != IGNORE_INDEX
-        )
-        ce_loss = sum(losses.values())
+        # ⚠️ Skipped entirely when ce_weight==0: it is a cross-entropy over a ~155k vocab at
+        # every position and it contributed exactly 0 to `total_loss` anyway. The cost of
+        # skipping is the token-head drift diagnostic (ce_loss 31.6 -> 27.7 across an epoch,
+        # which is how we know a CE-free arm destroys its own token head); set
+        # KD_LOG_CE=1 to compute it for logging without putting it in the loss.
+        want_ce = self.ce_weight > 0 or os.environ.get("KD_LOG_CE") == "1"
+        if want_ce:
+            losses = {"future_traj": self._compute_next_token_loss(outputs, labels, traj_mask)}
+            ce_labels = labels.clone()
+            ce_labels[traj_mask] = IGNORE_INDEX
+            losses["others"] = self._compute_next_token_loss(
+                outputs, ce_labels, ce_labels != IGNORE_INDEX
+            )
+            ce_loss = sum(losses.values())
+        else:
+            ce_loss = None
         # ⚠️ ce_weight=0 is a REAL arm, not a degenerate config: it asks whether the student
         # needs token supervision at all when the goal is a teacher-compatible cache read by
         # the teacher's expert. Safe for the stitched eval because `<|traj_future_start|>` is
@@ -644,12 +815,13 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # student must learn to emit -- which is why all four stitched arms logged zero
         # "No <traj_future_start> token found" warnings. The student's own token head is of
         # course destroyed; that is the point of the arm, not a side effect.
-        total_loss = self.ce_weight * ce_loss
+        total_loss = (self.ce_weight * ce_loss) if ce_loss is not None \
+            else torch.zeros((), device=input_ids.device, dtype=self.vlm.dtype)
         # Graph-carrying terms, keyed to match KaVaTrainer's `weights` dict so the
         # gradient probe can weight each one as it enters the total.
-        attached: dict[str, torch.Tensor] = {"ce": ce_loss}
+        attached: dict[str, torch.Tensor] = {} if ce_loss is None else {"ce": ce_loss}
 
-        kd_loss = kv_loss = block_loss = None
+        kd_loss = kv_loss = block_loss = fr_loss = None
         region_losses: dict[str, torch.Tensor] = {}
 
         if need_teacher:
@@ -659,6 +831,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
                     input_ids=input_ids,
                     output_hidden_states=want_hidden,
                     use_cache=False,
+                    # Teacher logits feed logit-KD and nothing else.
+                    **({} if self.kd_weight > 0 else {"logits_to_keep": 1}),
                     **tokenized_data,
                 )
 
@@ -687,8 +861,47 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 s_kv = recompute_kv(self._text_model(), outputs.hidden_states, h, d)
                 with torch.no_grad():
                     t_kv_b = recompute_kv(self._teacher_text_model(), t_out.hidden_states, h, d)
+                # ⚠️ Depth mismatch is EXPECTED with a shallow student: the expert's layer
+                # count follows the VLM's text config, so a 28-layer 2B gives a 28-layer
+                # expert while the teacher VLM still has 36 cache layers. The expert was
+                # loaded with a remap (teacher expert layer pi(j) -> slot j, see
+                # expert_holder._load), so the TEACHER's cache must be subset the same way:
+                # expert slot j reads teacher cache pi(j), the layer that slot was trained on.
+                # The student maps 1:1 -- its layer j is expert slot j.
+                # Zipping the teacher's first 28 layers instead would pair every slot with a
+                # SHALLOWER teacher layer than it expects; it runs clean and trains the wrong
+                # target, so this raises rather than guessing.
                 if len(s_kv) != len(t_kv_b):
-                    raise RuntimeError(f"layer count differs: student {len(s_kv)} teacher {len(t_kv_b)}")
+                    pi = getattr(self.expert, "_pi", None)
+                    if pi is None or len(pi) != len(s_kv):
+                        raise RuntimeError(
+                            f"student has {len(s_kv)} layers, teacher {len(t_kv_b)}, but the "
+                            f"expert reports pi={'None' if pi is None else len(pi)}; set "
+                            f"PRUNE_EXPERT_LAYERS so the remap leaves exactly {len(s_kv)}")
+                    # BLOCK_PI_PROBE=1: score the alternatives ONCE, on real data, before
+                    # committing 3 epochs to one of them. A wrong pairing does not crash --
+                    # every shape matches -- so the only evidence that pi is the right map is
+                    # that it beats the naive first-28 zip and a shuffled control.
+                    if os.environ.get("BLOCK_PI_PROBE") == "1" and not self._pi_probed:
+                        self._pi_probed = True
+                        # ⚠️ recompute_kv returns a DICT keyed by layer index, so slicing it
+                        # raises KeyError; every candidate is rebuilt as {slot: (K, V)}.
+                        n = len(s_kv)
+                        with torch.no_grad():
+                            cands = {
+                                "pi": {j: t_kv_b[i] for j, i in enumerate(pi)},
+                                "first28": {j: t_kv_b[j] for j in range(n)},
+                                "last28": {j: t_kv_b[j + len(t_kv_b) - n] for j in range(n)},
+                                "reversed_pi": {j: t_kv_b[i]
+                                                for j, i in enumerate(pi[::-1])},
+                            }
+                            for nm, tk in cands.items():
+                                lo, _ = self._block_loss(s_kv, tk, rope, traj_mask,
+                                                         tokenized_data.get("attention_mask"),
+                                                         None)
+                                print(f"[pi-probe] {nm:12s} block_loss {float(lo):.6f}",
+                                      flush=True)
+                    t_kv_b = {j: t_kv_b[i] for j, i in enumerate(pi)}
                 _traj = None
                 if self.block_timestep != "zero":
                     if ego_future_xyz is None:
@@ -700,10 +913,14 @@ class KDReasoningVLA(TrainableReasoningVLA):
                              "ego_history_rot": ego_history_rot,
                              "ego_future_xyz": ego_future_xyz,
                              "ego_future_rot": ego_future_rot}
-                block_loss = self._block_loss(s_kv, t_kv_b, rope, traj_mask,
-                                              tokenized_data.get("attention_mask"), _traj)
+                block_loss, fr_loss = self._block_loss(
+                    s_kv, t_kv_b, rope, traj_mask,
+                    tokenized_data.get("attention_mask"), _traj)
                 total_loss = total_loss + self.block_weight * block_loss
                 attached["block"] = block_loss
+                if fr_loss is not None:
+                    total_loss = total_loss + self.block_freerun_weight * fr_loss
+                    attached["freerun"] = fr_loss
                 del s_kv, t_kv_b
 
             # ---- lambda_kv: match the LLM's K/V at every position -------------
@@ -742,10 +959,11 @@ class KDReasoningVLA(TrainableReasoningVLA):
         return KDVLAOutput(
             loss=total_loss,
             logits=outputs.logits,
-            ce_loss=ce_loss.detach(),
+            ce_loss=None if ce_loss is None else ce_loss.detach(),
             kd_loss=None if kd_loss is None else kd_loss.detach(),
             kv_loss=None if kv_loss is None else kv_loss.detach(),
             block_loss=None if block_loss is None else block_loss.detach(),
+            freerun_loss=None if fr_loss is None else fr_loss.detach(),
             kv_loss_vision=region_losses.get("vision"),
             kv_loss_text=region_losses.get("text"),
             kv_loss_traj=region_losses.get("traj"),
