@@ -34,9 +34,16 @@ set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/a1_5_sft/bin
+OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 CACHE_ROOT="${CACHE_ROOT:-/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive}"
 GPUS="${GPUS:-1}"
 SMOKE="${SMOKE:-0}"
+# Sweep knobs. Defaults reproduce the committed config; any override also gets its own
+# output_dir and run_name so arms cannot overwrite each other's checkpoints.
+JACOBI="${JACOBI:-}"      # T (PCCoT iterations); 2+ costs ~+10 GiB/GPU and needs >=2 ranks at bs=2
+BS="${BS:-}"              # per-device batch; bs=2 needs >=2 ranks (ZeRO-2 shards only across ranks)
+ACCUM="${ACCUM:-}"        # effective batch = GPUS x BS x ACCUM; the Stage-1 baseline used 48
+WARMUP="${WARMUP:-}"      # scale with steps/epoch: the baseline ran ~21% of total steps
 
 cd "$RECIPE_DIR"
 export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
@@ -66,17 +73,47 @@ fi
 #   control does not regress    -> something specific to this configuration
 # Done as CLI overrides rather than a second config: hydra forbids inheriting a config
 # that declares hydra.searchpath, and a copied config would drift from this one.
+# NOTE: this must NOT set paths.output_dir itself. The sweep block below sets the same
+# key, hydra keeps the LAST occurrence, and a CONTROL+sweep combination therefore wrote
+# into the KAVA arm's directory — nearly overwriting the checkpoint it was meant to be
+# compared against. CONTROL contributes to SWEEP_TAG instead, so one place owns the path.
+CONTROL_TAG=""
 if [[ "${CONTROL:-0}" == "1" ]]; then
-    EXTRA+=(model.latent_loss_weight=0.0 model.kava.kv_loss_weight=0.0
-            paths.output_dir="$OUT_DIR/output_stage1_kava_control_lcdrive"
-            "run_name=kavactl_noaux_$(date +%m%d-%H%M)")
+    EXTRA+=(model.latent_loss_weight=0.0 model.kava.kv_loss_weight=0.0)
+    CONTROL_TAG="_noaux"
     echo "[slurm] CONTROL arm: lambda_1 = lambda_2 = 0 (gradshare_kv should log 0.0)"
+fi
+
+# Sweep overrides. Effective batch MUST be compared against the Stage-1 baseline's 48:
+# the first runs used 16 at the same lr 1e-5, and the CE-only control regressed
+# +0.203 min_ade against the baseline on that schedule alone.
+SWEEP_TAG="$CONTROL_TAG"
+[[ -n "$JACOBI" ]] && { EXTRA+=(model.kava.jacobi_iters="$JACOBI"); SWEEP_TAG="${SWEEP_TAG}_T$JACOBI"; }
+[[ -n "$BS"     ]] && { EXTRA+=(trainer.per_device_train_batch_size="$BS"); }
+[[ -n "$ACCUM"  ]] && { EXTRA+=(trainer.gradient_accumulation_steps="$ACCUM"); }
+[[ -n "$WARMUP" ]] && { EXTRA+=(trainer.warmup_steps="$WARMUP"); }
+if [[ -n "$BS$ACCUM" ]]; then
+    EFF=$(( GPUS * ${BS:-1} * ${ACCUM:-16} )); SWEEP_TAG="${SWEEP_TAG}_bs$EFF"
+    echo "[slurm] effective batch = $GPUS gpus x ${BS:-1} x ${ACCUM:-16} = $EFF  (baseline: 48)"
+fi
+if [[ -n "$SWEEP_TAG" ]]; then
+    # single owner of output_dir / run_name -- see the CONTROL note above
+    EXTRA+=(paths.output_dir="$OUT_DIR/output_kava${SWEEP_TAG}_lcdrive"
+            "run_name=kava_M8${SWEEP_TAG}_$(date +%m%d-%H%M)")
+    echo "[slurm] sweep arm${SWEEP_TAG} -> $OUT_DIR/output_kava${SWEEP_TAG}_lcdrive"
 fi
 
 # The cgroup exposes roughly half of --cpus-per-task, so 12 workers (the config default,
 # sized for a multi-GPU run) thrash here. Derive it from the actual allocation.
-WORKERS="${WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-16} / 3 ))}"
+WORKERS="${WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-16} / (3 * GPUS) ))}"
+[[ "$WORKERS" -lt 2 ]] && WORKERS=2
 EXTRA+=(++trainer.dataloader_num_workers="$WORKERS")
+
+# Free-form hydra overrides, word-split. For one-off knobs that do not deserve a named
+# variable -- e.g. EXTRA_ARGS='++trainer.ddp_timeout=5400' after a NCCL collective
+# timeout. Deliberately unquoted expansion so multiple overrides can be passed.
+# shellcheck disable=SC2206,SC2086
+[[ -n "${EXTRA_ARGS:-}" ]] && EXTRA+=($EXTRA_ARGS)
 
 echo "[slurm] job=$SLURM_JOB_ID gpus=$CUDA_VISIBLE_DEVICES cache_root=$CACHE_ROOT workers=$WORKERS"
 

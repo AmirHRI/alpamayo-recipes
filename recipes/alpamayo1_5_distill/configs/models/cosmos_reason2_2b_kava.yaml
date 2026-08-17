@@ -21,6 +21,27 @@ teacher_hidden_dim: 4096
 # projector. KAVA sets lambda_1 = 0 on its hardest dataset for the same reason.
 # Set 0.01 to restore it (that value was calibrated to ~131% of CE at step 0).
 latent_loss_weight: 0.0
+# CoDI (github.com/zhenyi4/codi) distils the handoff column at EVERY layer and averages:
+#   for out, ref in zip(outputs.hidden_states, ref_outputs.hidden_states):
+#       loss += fct(out_sel, ref_sel.detach()) / ref_sel.std()
+#   loss /= len(outputs.hidden_states)
+# We matched ONE layer. That is almost certainly why the term looked useless: a single
+# 4096-d vector is nearly solvable by the 8.4M-parameter projector alone, so it hit 0.15
+# without the backbone moving. All 29 student tensors vs 37 teacher ones (index 0 = the
+# embedding output, which CoDI includes) is a much harder, better-conditioned target.
+#
+# ⚠️ Requires a cache rebuilt with `tfs_hidden_all` — scripts/generate_teacher_kv.py now
+# records it (+23.2 GB/tier, 0.61 MB/clip). With an older cache the dataset raises
+# rather than silently falling back to the single vector. Also set
+# data.train_dataset.attach_tfs_hidden_all=true.
+#
+# ⚠️ lambda_1 = 0.01 was calibrated for the SINGLE-vector term and will not transfer:
+# this averages 29 terms and divides each by the teacher's per-layer std. Recalibrate
+# against CE's gradient before trusting a run.
+latent_all_layers: false
+latent_layer_map: null    # null = uniform stride, endpoints preserved (embed->embed, final->final)
+latent_div_std: true      # CoDI's distill_loss_div_std; matters more here than for them,
+                          # since Qwen3-VL hidden magnitudes span orders of magnitude by depth
 latent_cosine_weight: 0.1
 
 kava:
@@ -65,13 +86,32 @@ kava:
   # target's std. Qwen3-VL K/V magnitudes differ by orders of magnitude across depth
   # ("massive activations"), so leaving this off lets the largest layers dominate.
   kv_layerwise_std: true
-  # "projector" learns a per-layer 1024->1024 change of basis (~59M throwaway params,
-  # identity-initialised so training STARTS at the `direct` objective); "direct"
-  # matches raw K/V for free. Per-layer geometry already agrees (8 x 128 = 1024 on
-  # both sides) — what differs is the learned W_k/W_v basis, since unlike KAVA this
-  # is cross-model rather than self-distillation.
-  kv_align: projector
-  # null = uniform stride with endpoints preserved (28 -> 36).
+  # Cross-model K/V alignment. Per-layer geometry already agrees (8 x 128 = 1024 on
+  # both sides); what differs is the learned W_k/W_v basis, since unlike KAVA this is
+  # cross-model rather than self-distillation. All three are identity at init, so they
+  # start at the same loss value and form an ablation ladder:
+  #   direct     0      identity, no parameters
+  #   projector  58.7M  one Linear per layer per K/V — a LINEAR basis change
+  #   mlp       117.5M  x + W2(GELU(W1 x)) — nonlinear; no reason two separately
+  #                     trained bases are related by a linear map at all
+  #
+  # ⚠️ Evaluating a checkpoint trained before this default changed (the T=1 bs16 and
+  # T=2 bs48 arms, both `projector`) needs `model.kava.kv_align=projector` on the CLI.
+  # The kv_projector state-dict keys differ (k_proj.0.weight vs k_proj.0.fc1.weight)
+  # and load_kava_checkpoint raises on the mismatch rather than randomising it.
+  #
+  # ⚠️ More capacity is not automatically better: the action expert reads the
+  # UNPROJECTED student cache, so a projector big enough to absorb the mismatch can
+  # satisfy L_KV without the expert's actual input moving. Always pair an `mlp` run
+  # with `direct` (zero params, no shortcut possible), not with `projector` alone.
+  kv_align: mlp
+  # null = uniform stride with endpoints preserved: student 0 -> teacher 0 and student
+  # 27 -> teacher 35, i.e. the LAST student layer is matched to the LAST teacher layer.
+  # Verified: [0,1,3,4,5,6,8,9,10,12,13,14,16,17,18,19,21,22,23,25,26,27,29,30,31,32,34,35].
+  # Depth *fraction* is what is preserved; skewing the map toward late teacher layers
+  # would match shallow student layers against deep teacher ones, which is a different
+  # and probably worse trade. Every student layer is supervised exactly once because
+  # the action expert reads all 28 of them.
   kv_layer_map: null
   # Seed the slots from the most frequent tokens in the teacher's own CoT. Measured
   # to beat randn on this exact model (§9.1 C3: 3.71 vs 4.98 starting loss, ~3x

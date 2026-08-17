@@ -1,0 +1,23 @@
+# CoT arm for the 10B CoT ablation, in Alpamayo-1.5's OWN trained prompt format.
+#
+# Identical to the distill recipe's distill_teacher_generate (the prompt ends at
+# <|cot_start|> so the model generates its reasoning, then <|traj_future_start|>),
+# except the camera display names and frame numbers are ON.
+#
+# Why they are on: the released Alpamayo-1.5-10B config.json declares
+# include_camera_ids=true / include_frame_nums=true, and the reference
+# create_message() adds "Front left camera" / frame numbers before each image
+# "to match the training format". The repo's `default` processor sets both false --
+# deliberately, so the 10B is comparable with our 2B Stage-1 (see the comment in
+# sft_eval_10b_token_lcdrive.yaml) -- but that makes the 10B run outside the format
+# it was trained on, which is the wrong trade when the question is whether the 10B's
+# OWN reasoning helps it.
+#
+# Must be paired with eval_nocot_camids.yaml, which differs ONLY in the cot component.
+_target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+chat_template_version: r1_5
+components_order: ["image", "traj_history", "prompt", "cot"]
+components_prompt: ["cot", "traj_future"]
+label_components: ["traj_future"]
+include_camera_ids: true
+include_frame_nums: true

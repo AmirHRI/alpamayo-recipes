@@ -5,10 +5,17 @@
 # DistanceMetrics, best-of-6). The model is the 10B VLM loaded token-only (no
 # action expert / diffusion), so `min_ade` here is the VLM discrete-token
 # trajectory quality, directly comparable to sft_stage1_cosmos2b_lcdrive.
+# NOTE no `/wandb: default` here, deliberately. evaluate_hf.py does
+#     if cfg.get("wandb", None) and is_main_process:
+#         wandb_utils.init_wandb(**cfg.wandb)
+# and the `**` expansion resolves every key in the group, including `team: ???`, so
+# merely having the group present raises MissingMandatoryValue before wandb's runtime
+# mode is ever consulted. WANDB_MODE=disabled does NOT help — it is a wandb setting,
+# this is a hydra resolution failure. Dropping the group makes the guard falsy.
+# This is an evaluation config; it has nothing to log to a run anyway.
 defaults:
   - sft_base
   - /models/alpamayo_1_5_10b_token@model
-  - /wandb: default
   - _self_
 
 data:
@@ -22,7 +29,7 @@ data:
     clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
 
 trainer:
-  report_to: wandb
+  report_to: none
   per_device_eval_batch_size: 8
 
 paths:

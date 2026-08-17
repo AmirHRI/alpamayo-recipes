@@ -45,7 +45,8 @@ Layout::
     <cache_root>/
       index.shard0.json
       cot_text.shard0.jsonl
-      full/<bucket>/<clip>__<t0>.safetensors          # k_pre, v, imp, red, tfs_hidden
+      full/<bucket>/<clip>__<t0>.safetensors          # k_pre, v, imp, red,
+                                                      #   tfs_hidden, tfs_hidden_all
       compressed_M16_rkv0.1/<bucket>/<clip>__<t0>.safetensors   # k_pre, v, sel_idx
 """
 
@@ -62,7 +63,7 @@ FORMAT_COMPRESSED = "alpamayo_kava_compressed_v1"
 
 #: Tensors in a ``full/`` entry. ``red`` is recomputable from ``k_pre`` and may be
 #: absent; ``imp`` is not (it needs the answer-token attention) and never is.
-FULL_TENSORS = ("k_pre", "v", "imp", "red", "tfs_hidden")
+FULL_TENSORS = ("k_pre", "v", "imp", "red", "tfs_hidden", "tfs_hidden_all")
 
 
 def compressed_tag(m: int, lam: float, method: str) -> str:
@@ -138,6 +139,7 @@ def save_full_entry(
     imp: torch.Tensor | None = None,
     red: torch.Tensor | None = None,
     tfs_hidden: torch.Tensor | None = None,
+    tfs_hidden_all: torch.Tensor | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Path:
     """Write a ``full/`` entry.
@@ -151,6 +153,10 @@ def save_full_entry(
         tfs_hidden: ``[H_teacher]`` last-layer hidden at ``<traj_future_start>``,
             fp32 — the existing single-vector target, carried along so one cache
             run feeds both objectives.
+        tfs_hidden_all: ``[L+1, H_teacher]`` the same column at EVERY layer (index 0 is
+            the embedding output), fp32 — the CoDI all-layer target.  ~606 KB/clip at
+            37x4096, so ~23 GB over LCDrive-train.  Optional: caches written before this
+            existed simply omit the key, and ``load_entry`` returns None for it.
     """
     meta = dict(metadata or {})
     meta.setdefault("format", FORMAT_FULL)
@@ -164,7 +170,14 @@ def save_full_entry(
             "v": v.to(torch.bfloat16),
             "imp": None if imp is None else imp.to(torch.float32),
             "red": None if red is None else red.to(torch.float32),
-            "tfs_hidden": None if tfs_hidden is None else tfs_hidden.to(torch.float32),
+            # .clone(): `tfs_hidden` is the last row of `tfs_hidden_all`, so a caller
+            # that passes a VIEW (`all_h[-1]`) makes the two share storage and
+            # safetensors refuses the whole file -- which would abort a multi-hour cache
+            # run partway through. Both are small (16 KB / 606 KB); cloning is free.
+            "tfs_hidden": None if tfs_hidden is None else tfs_hidden.to(torch.float32).clone(),
+            "tfs_hidden_all": (
+                None if tfs_hidden_all is None else tfs_hidden_all.to(torch.float32).clone()
+            ),
         },
         meta,
     )
@@ -179,6 +192,7 @@ def save_compressed_entry(
     sel_idx: torch.Tensor | None = None,
     n_valid: int | None = None,
     tfs_hidden: torch.Tensor | None = None,
+    tfs_hidden_all: torch.Tensor | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Path:
     """Write one compressed tier entry.
@@ -207,7 +221,13 @@ def save_compressed_entry(
             "k_pre": k_pre.to(torch.bfloat16),
             "v": v.to(torch.bfloat16),
             "sel_idx": None if sel_idx is None else sel_idx.to(torch.int32),
-            "tfs_hidden": None if tfs_hidden is None else tfs_hidden.to(torch.float32),
+            "tfs_hidden": None if tfs_hidden is None else tfs_hidden.to(torch.float32).clone(),
+            # Copied in for the same reason as tfs_hidden: training reads ONE file per
+            # sample. Adds ~606 KB to a ~2.4 MB entry. .clone() for the aliasing reason
+            # noted in save_full_entry.
+            "tfs_hidden_all": (
+                None if tfs_hidden_all is None else tfs_hidden_all.to(torch.float32).clone()
+            ),
         },
         meta,
     )

@@ -21,6 +21,273 @@ teacher-feature cache script, and configs.
 
 ---
 
+## Result: Qwen3-VL-4B student — block-output matching closes 77% of the gap to the teacher
+
+A second student line (Qwen3-VL-4B, chosen because its 36 layers and 8×128 kv-heads match
+the teacher's tower exactly) trained one epoch on LCDrive train (38,340 clips, effective
+batch 24, 1,598 steps, **no CoT anywhere**), then scored on the 1k LCDrive val subset,
+paired per `clip_id`, n=1000.
+
+**Scored through the teacher's action expert** (`slurm_eval_stitched.sh`) — the student's
+VLM produces the K/V cache, the teacher's frozen expert reads it and drives. This is the
+endpoint `L_KV` targets, because the expert self-attends over that cache.
+
+| arm | objectives | ade | min_ade | × teacher | Δ min_ade vs `ce` | gap closed |
+|---|---|---|---|---|---|---|
+| **teacher** (ceiling) | — | **1.3039** | **0.5776** | 1.00× | — | — |
+| **blockonly, 1 epoch** | **L_block** | 3.5824 | **2.0293** | **3.51×** | **−4.9655** (z = −15.7) | **+77%** |
+| kvonly, 3 epochs | KV | 3.8176 | 2.4098 | 4.17× | −4.5850 (z = −14.1) | +71% |
+| kvonly, 2 epochs | KV | 3.8633 | 2.5061 | 4.34× | −4.4887 (z = −13.9) | +70% |
+| **kvonly** | KV | 4.1085 | 2.6313 | 4.56× | −4.3636 (z = −13.5) | +68% |
+| **cekv** | CE + KV | 4.9100 | 2.7601 | 4.78× | −4.2347 (z = −13.3) | +66% |
+| `kv` | CE + KD + KV | 5.9970 | 2.9554 | 5.12× | −4.0395 (z = −12.9) | +63% |
+| `ce` (control) | CE | 12.5500 | 6.9948 | 12.11× | — | — |
+| `kd` | CE + KD | 17.4294 | 11.3750 | 19.69× | +4.3802 (z = +13.7) | −68% |
+
+**Every objective other than cache alignment hurts this endpoint, monotonically.** Dropping
+logit-KD buys −0.1953 (z = −4.43); dropping CE as well buys a further −0.1289 (z = −3.09).
+
+### The objective matters more than the compute: `L_block` beats `L_KV`
+
+Elementwise K/V matching is indifferent to *direction* — an error along an axis no expert
+query reads costs as much as one that dominates the softmax. `L_block`
+(`models/block_losses.py`) instead asks whether the student's cache produces the same
+**update** when consumed by the teacher's real frozen action block:
+
+    L_block = 1/L * sum_l || B_l(h^T_l; K^S_l,V^S_l) - sg B_l(h^T_l; K^T_l,V^T_l) ||^2
+
+Teacher-forcing `h^T_l` is what makes it well-posed: identical block weights, action input
+and timestep make Q, K_a and V_a identical *by construction*, so the VLM cache is the only
+difference and each layer's term stands alone with no drift compounding across depth.
+
+| | epochs | min_ade | gap closed | paired vs uniform `L_KV` |
+|---|---|---|---|---|
+| **L_block** | **1** | **2.0293** | **+77%** | **−0.6020** vs 1 ep (z = −10.31) |
+| | | | | **−0.3805** vs 3 ep (z = −7.12) |
+| L_KV uniform | 3 | 2.4098 | +71% | — |
+| L_KV uniform | 1 | 2.6313 | +68% | — |
+
+**One epoch of `L_block` beats three epochs of `L_KV`** — ~12 GPU-hours against ~36 — and
+cuts the residual to the teacher from +1.83 to +1.45.
+
+⚠️ The first `L_block` implementation was WRONG and looked healthy. Calling the decoder layer
+directly with a hand-built mask and self-computed cos/sin attends differently from the real
+forward, because the enclosing `Qwen3VLTextModel.forward` converts the mask to causal 4-D and
+computes the mrope embeddings. Its loss fell 1057 → 720 while the self-test showed
+`identity(teacher's own cache) = 1.04e3` (must be ~0) and a *layer-shuffled* cache scoring
+BETTER than the real student — i.e. it measured nothing. Fixed by capturing each layer's
+kwargs by hook and replaying them verbatim; identity is now exactly `0.000000e+00` and the
+student beats shuffled 0.0280 vs 0.1185. Reproduce with `BLOCK_SELFTEST=1`.
+
+### Which layers the expert actually reads (`scripts/layer_importance.py`)
+
+Uniform `L_KV` weights all 36 layers equally. Nothing had checked whether the expert cares.
+Measured causally at n=100 — swap ONE layer of the student's cache for the teacher's, re-drive
+the frozen expert, and record how much closer to the teacher's own trajectory it gets
+(`fix_gain`, in metres, against a 2.6396 m baseline gap):
+
+| depth | mean fix_gain | sum | share of the gap |
+|---|---|---|---|
+| layers 0–11 | +0.0003 | +0.0031 | **0.1%** |
+| layers 12–23 | +0.1073 | +1.2871 | 49% |
+| layers 24–35 | +0.2316 | +2.7790 | 105% |
+
+**The first third of the network contributes essentially nothing** — uniform weighting spent a
+third of the gradient on layers worth 0.1% of the outcome. Layers 22 (+0.774) and 30 (+0.754)
+alone account for 29% each. Diffusion noise is re-seeded identically before all 37 rollouts
+per clip, so the only difference between variants is the swapped layer.
+
+Caveats: the gains are **marginal, not additive** (they sum to 4.07 against a 2.64 gap,
+because each holds all other layers at student values), and the 36 point estimates are noisy
+— layer 22 at 6.79 beside layer 21 at 1.28 is more likely sampling noise than a real cliff.
+`ARM=kvband` therefore uses three depth **bands** (0.01 / 0.96 / 2.03, renormalised to mean
+1.0 so the total loss scale is unchanged and this is a direction change only).
+
+### ⚠️ RETRACTED as an actionable direction: banding makes it WORSE
+
+`kvband` was trained and scored against its matched control. It lost, decisively:
+
+| arm (1 epoch) | min_ade | vs teacher | paired vs uniform |
+|---|---|---|---|
+| kvonly, uniform | **2.6313** | 4.56× | — |
+| kvband, banded | 3.1763 | 5.50× | **+0.5451** (z = +11.22) |
+
+Better on only 31.2% of clips. **The layer-importance measurement stands; the inference drawn
+from it does not.** A layer being cheap to *repair* in a trained model does not make it cheap
+to *starve* during training: down-weighting layers 0–11 by 100× plausibly degrades the
+representations layers 12–35 are built from, so the cache those later layers emit gets worse
+even though they kept full weight. Marginal importance measured post-hoc is not the same
+object as gradient value during optimisation.
+
+This also closes band-weighting `L_block`, which had been the obvious follow-up.
+
+### More epochs of `L_block`, and sampling the timestep
+
+| arm | e1 | e2 | e3 |
+|---|---|---|---|
+| `blockonly` (t = 0) | 2.0293 | **1.7006** | **1.6576** |
+| `blockrandt` (t ~ Beta) | **1.9518** | running | running |
+| `kvonly` (uniform L_KV) | 2.6313 | — | 2.4098 |
+
+`blockonly` reaches **2.87× teacher** at 3 epochs and beats `kvonly` at matched budget by
+−0.7522 (z = −11.53). It has converged: e2−e1 = −0.3287 (z = −14.24) but **e3−e2 = −0.0430**
+(z = −2.89, better on only 51.7% of clips), and Lane Keeping Curve actually regresses
+3.491 → 3.644. More epochs is a spent lever.
+
+`ARM=blockrandt` samples `t` from the TEACHER'S OWN training schedule — `Beta(1.5,1.0)`
+rescaled by 0.999, verbatim from `flow_matching.py:148` — instead of pinning `t = 0`, with
+`x_t = t·x_GT + (1−t)·ε` built from the ground-truth trajectory. Same cost per step, so the
+only variable is WHERE on the flow the cache is supervised. It buys **−0.0775 (z = −3.89)**
+on min_ade and **−0.1819 (z = −4.93) on ADE** — over twice the effect on the single-draw
+metric, i.e. it improves the typical sample more than the best-of-6.
+
+Worth noting the `ade/min_ade` ratio: teacher **2.26**, block arms 1.74–1.82, `kvonly`
+1.56–1.58. The students are not just less accurate, they are less DIVERSE, which is why
+best-of-6 flatters them less than it flatters the teacher.
+
+### ⚠️ Pruning the expert: three refutations of layer statistics
+
+Bypassing 8 of 36 expert layers (identity stand-ins, indices preserved so layer *l* still
+reads cache *l*), teacher VLM, n=1000:
+
+| set | chosen by | min_ade | vs teacher |
+|---|---|---|---|
+| none | — | 0.5776 | — |
+| **C** `{4,10,13,15,19,25,27,34}` | depth-aligned, scattered, deepstack-protected | **0.7893** | **+37%** |
+| B `{18,19,24,25,27,32,33,34}` | CKA | 0.9306 | +61% |
+| A `{18,19,24,25,32,33,34,35}` | CKA | 0.9323 | +61% |
+
+**No similarity metric survived a causal test.** CKA picked A/B (+61%). Set C — chosen from
+STRUCTURAL constraints rather than a metric — beat them by −0.143 (z = −5.97) but is still
++37%. A and B are statistically indistinguishable (z = −0.07), so the last layer is not
+special either.
+
+The structural constraints that mattered, none of them visible to a similarity metric:
+
+* **Depth alignment.** Expert layer *j* reads cache layer *j*; removing 8 uniformly keeps
+  `(i−k)/28 = i/36`, so every survivor reads a cache at its original relative depth. A
+  contiguous cut shifts everything above it by 8.
+* **Deepstack.** `modeling_qwen3_vl.py` injects the 3 multi-level ViT features into LLM
+  layers **0,1,2** (`layer_idx in range(len(deepstack_visual_embeds))`). Expert layers 0–2
+  read those caches; C leaves them alone.
+* **Spans are super-additive.** Removing L2–L6 costs 1.94× the sum of its per-block BIs, so
+  scattered removals beat contiguous runs.
+
+Metrics computed and their verdicts (`scripts/expert_cka.py`, reps saved so all of this is
+re-derivable with no GPU): CKA says L18–L35 are near-identity — REFUTED. Cosine, Block
+Influence (`1 − cos`) and angular distance (`arccos(cos)/π`) are monotone transforms of each
+other, so they are ONE metric in three forms, and they all point at the early blocks —
+untested. CKA disagrees with the rest because it is invariant to rotation, and a layer that
+rotates the representation scores ~1 while still moving the vectors the next layer reads.
+
+⚠️ These ablations bypass layers **without retraining**, and keep original cache indices. The
++0.212 for set C is the pre-training bar, not a ceiling; `configs/sft_prunedexpert_10b_lcdrive.yaml`
+trains the pruned expert against the teacher's own cache to find out how much comes back.
+
+### Layer CKA on the action expert (`scripts/expert_cka.py`)
+
+An independent, *representational* view — linear CKA (Kornblith et al.) between the frozen
+expert's own layers, with the reference implementation vendored from CLP_VLA and self-tested
+against a faster Gram-space path (agreement 1e-15; `CKA(X,X) = 1`).
+
+Measured at 11 points along the flow, building `x_t = t·x_GT + (1−t)·ε` with
+`build_noisy_action` so every `(x_t, t)` is on-distribution and one noise draw is shared
+across the grid:
+
+* **Layers 6–14 do nearly all the representational work** (most active transitions L8, L7,
+  L11, L9, L6); **L17–L35 are near-identity** at every timestep.
+* Transformation **peaks at t ≈ 0.2–0.4**, not at either endpoint (corner CKA 0.181 at
+  t=0.2 vs 0.572 at t=1) — so `t=0`, the only point `L_block` supervises, is already off the
+  peak. This is the argument for a random-`t` variant.
+* **Train and val are indistinguishable** (n=64 each, zero overlap, seeded samples): C-matrix
+  correlation **0.9870**, mean |diff| 0.0005, same five most-active transitions in the same
+  order. The structure is architectural, not memorised.
+
+⚠️ CKA is representational, NOT causal, and it points the OPPOSITE way to the cache-swap
+sweep: the layers that transform the representation are 6–14, while the layers where the
+cache causally mattered were 24–35. Given the `kvband` result above, "prune L17–35 because
+they are near-identity" is a hypothesis awaiting a causal test, not a finding.
+
+**More epochs help, but cannot close the gap.** Extra epochs of `kvonly` keep paying, and
+the per-epoch gain decays only slowly:
+
+| | min_ade | paired Δ vs previous epoch |
+|---|---|---|
+| epoch 1 | 2.6313 | — |
+| epoch 2 | 2.5061 | −0.1251 (z = −9.12) |
+| epoch 3 | 2.4098 | −0.0964 (z = −11.63) |
+
+Both steps are unambiguous, and the gain decayed only ~23% between them — so this is
+*diminishing*, not plateaued. But extrapolating that decay geometrically, every remaining
+epoch together is worth roughly −0.4 more, landing near 2.0 and still ~3.4× the teacher.
+Three epochs cost ~35 GPU-hours for −0.22 total. The residual **+1.83** is therefore a
+property of the objective or the student's capacity, not of undertraining, and the lever is
+the objective (see `models/block_losses.py`) or `kv_weight`, not more compute.
+
+The teacher scores 0.5776 here against 0.6413 on its own token head — two different heads
+agreeing to within 10% is what says the harness is sound rather than flattering one arm.
+
+### ⚠️ The arm ordering INVERTS between the two heads
+
+The same six checkpoints, scored on the student's **own trajectory-token head**
+(`slurm_eval_kd.sh`), rank in essentially the opposite order:
+
+| arm | EXPERT ade | EXPERT min_ade | TOKEN ade | TOKEN min_ade |
+|---|---|---|---|---|
+| teacher | 1.3039 | 0.5776 | 1.2111 | 0.6413 |
+| kvonly, 3 epochs | 3.8176 | **2.4098** *(best)* | not scored | not scored |
+| kvonly, 2 epochs | 3.8633 | 2.5061 | not scored | not scored |
+| kvonly | 4.1085 | 2.6313 | 37.5239 | **37.5239** *(worst)* |
+| cekv | 4.9100 | 2.7601 | 3.6427 | 2.9080 |
+| kv | 5.9970 | 2.9554 | 4.7516 | 3.1045 |
+| ce | 12.5500 | 6.9948 | 3.4749 | 2.4697 |
+| kd | 17.4294 | **11.3750** *(worst)* | 4.5953 | **1.9007** *(best)* |
+
+**Each objective helps only the head it targets.** Logit-KD matches output logits and gives
+the best token head while producing the *worst* expert head; KV alignment does the exact
+mirror image. Measure the wrong head and you get the opposite conclusion — which happened
+here, and the token-head reading was reported before the error was caught.
+
+`kvonly` is the extreme case and the clearest evidence: its `ade` and `min_ade` are
+**identical on all 1000 clips**, because every one of its 6 samples is malformed and
+zero-filled (6250 warnings over 6000 sequences). Its own trajectory head is completely
+destroyed — and that same checkpoint is the **best of all six** when the teacher's expert
+reads its cache. *The student VLM does not need to be a working driving model. It only
+needs to produce a cache the expert can read.*
+
+Consistent with this, `kvonly` also reaches the lowest training KV loss of any arm (0.5249
+overall, **0.4924** on the trajectory region vs 0.5769 for `kv`) while its CE barely moves
+(31.65 → 27.76, against `cekv`'s 31.61 → 2.35).
+
+Two token-head signals did **not** survive the change of endpoint:
+
+* *"KV alignment causes mode collapse."*  40.8% of clips produced 6 identical samples on the
+  token head, against 26.0% for the control. On the expert head the arms are equal
+  (15.2–18.0%). A token-sampling artifact, not a property of the representation.
+* *"Malformed generations contaminate the result."*  Real on the token head (7.6–9.6% of
+  clips, against the teacher's 0.4%) but not causal — excluding them moved every metric by
+  <0.06. On the expert head the counter does not apply at all: the trajectory comes from the
+  diffusion head, so `extract_traj_tokens` never runs.
+
+### Caveats
+
+* The residual gap is large and highly significant: `blockonly − teacher = +1.45`. Closing 77%
+  is a real effect, not parity — the student is still ~4.6× the teacher's error.
+* This student is a **generic Qwen3-VL-4B trained for one epoch, not warm-started** from an
+  Alpamayo checkpoint. The relative arm ordering is what is established; whether KV
+  alignment still buys 68% once the student is already competent is a different regime.
+* A `kvonly` student is **useless standalone** — it cannot emit a trajectory. It is only a
+  cache producer for the teacher's expert, and must never be scored with
+  `slurm_eval_kd.sh` as a quality metric.
+* Weights were set by measurement, not guessed — `scripts/calibrate_kd_weights.py` put KD at
+  14.1% and KV at **0.22%** of the CE gradient at weight 1.0, so the shipped `kv_weight` is
+  45.409. The obvious default of 1.0 would have left `L_KV` inert with a healthy loss curve.
+* An 8-step smoke suggested KV alignment might teach trajectory prediction as a side effect
+  (`ce_loss` 31.4 → 20.6 with CE off). **It does not** — over the full run `kvonly` ends at
+  27.76. That was an early transient.
+
+---
+
 ## Background: how Alpamayo works
 
 ### Two models joined by a KV cache
@@ -897,15 +1164,30 @@ projector, T=1, 21 h 46 m on one H100:
 ce_loss        2.89 -> 2.06     (improved — trajectory quality not sacrificed)
 latent_loss   59.7  -> 0.150
 kv_loss        2.16 -> 0.193
-gradshare_kv    89% ->  21% of CE   (falls as it is learned, rises as CE's own shrinks)
 ```
 
-`L_KV` never went inert — which is the failure the first `lambda_2` would have produced
-(0.0% of the backbone gradient) while the loss curve looked perfectly healthy.
+⚠️ **Do not summarise `gradshare_kv` as "89% → 21%".** Two endpoints hide a collapse;
+the full series is what matters:
 
-**K6. The dead-slot gate.** After training, zero the slots at inference. If quality
-does not drop, the slots are decorative and `L_KV` achieved nothing, whatever the loss
-curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-splice.
+```
+step        0    latent 111%   kv 89%
+steps 300-600    latent   7%   kv 10%
+steps  >6000     latent   3%   kv 17%
+```
+
+Both terms collapse within ~300 of 7,191 steps and spend the bulk of training at 5–11%.
+The late rise in `kv%` is CE's own gradient shrinking (2.17 → 0.63), not `L_KV`
+strengthening. So this run was effectively ~300 steps of KAVA followed by ~6,900 steps
+of plain CE continuation — which is why the 1-epoch configs below replaced it, and why
+over-training was a live explanation for its regression that had nothing to do with the
+distillation terms. An earlier version of this README claimed "`L_KV` never went inert"
+from the endpoint alone; that was cherry-picking and is retracted.
+
+**K6. The dead-slot gate — RUN, and it is the most informative result here.** Zero the
+slots at inference: if quality does not drop, the slots are decorative and `L_KV`
+achieved nothing, whatever the loss curve said (`reasoning-setup-2b.md` §7a). See
+[Trained and evaluated](#trained-and-evaluated-lcdrive-val-n500-paired) — at `T=1` the
+slots are decorative, and at `T=2` they are not.
 
 ## Status — verified end-to-end (real H100, real PAI data)
 
@@ -1010,7 +1292,6 @@ curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-s
   The pilot's one substantive finding is the **13-token CoT** and what it does to the
   `M` guidance; see the boxed note above. It also corrected this README's latency
   saving from ~420 ms to ~143 ms.
-- **Not yet run:** training itself, and therefore no quality numbers.
 - **`importance_source="expert"` built and verified against the real 10B**
   (`teacher_ar1_5_10b_expert`, expert loaded, 22.7 GiB peak):
 
@@ -1032,6 +1313,353 @@ curve said (`reasoning-setup-2b.md` §7a) — and run the validated §7d cross-s
   `dtype: auto`). Second, at `M >= N_C` eviction is a no-op and *every* scoring method
   agrees perfectly — so a short-CoT sample cannot demonstrate that the score works.
   Compare methods at `M < N_C`.
+
+### Trained and evaluated (LCDrive val, n=500, paired)
+
+Four arms trained, all warm-started from Stage-1 `checkpoint-3597`, `M=8`,
+`kv_align: projector`, `kv_loss_type: l1`, `latent_loss_weight: 0.0` (so `CE + L_KV`
+only — the logged `latent_loss` is raw and unweighted). Evaluated against the Stage-1
+baseline's own per-clip file on a **bit-identical 500-clip set** (verified: union ==
+intersection == 500, every id present in the 23,331-clip baseline dump).
+
+| arm | eff. batch | `min_ade` | `ade` | slots load-bearing? |
+|---|---|---|---|---|
+| Stage-1 baseline, no KD | 48 | **4.094** | **4.949** | — |
+| CE-only control, `T=1` | 16 | 4.297 | 5.127 | — |
+| KAVA `T=1` | 16 | 4.021 | 5.764 | **no** (−0.024 ± 0.053, n.s.) |
+| KAVA `T=2` | 48 | 4.165 | 9.570 | **yes** (−3.78 ± 0.59, 6.4σ) |
+
+Three findings, and the second corrects a reading of the first table column:
+
+1. **`T=1` slots are decorative.** Zeroing them changes nothing at any horizon
+   (−0.0008 to +0.0037, all |z| < 0.5). `T=1` is PCCoT with one iteration ≡ pause
+   tokens, so the slots add width but never re-read their own output. `L_KV` still
+   *helped* — it recovered the CE-only control's +0.203 regression — but as a
+   regulariser on the weights, not through the slots. That is not the mechanism KAVA
+   claims.
+2. **`T=2` makes the slots load-bearing, and this survives scrutiny.** Zeroing costs
+   −0.221 at 0.5 s and −1.850 at 3 s (5.0–6.4σ), and it holds on the 247 clips where
+   neither arm is degenerate (−0.021 to −0.327, 3.2–4.0σ) — so it is not a tail
+   artifact. **But quality did not improve.** Full-horizon `min_ade` is +0.071 ± 0.046
+   (1.5σ) vs baseline, which reads as parity and is *underpowered*; the
+   horizon-resolved columns are unambiguous and all significant: +0.010 (3.3σ) at
+   0.5 s, +0.034 (3.9σ) at 1 s, +0.157 (5.4σ) at 3 s. Prefer the per-horizon numbers —
+   the full-horizon column is dominated by long-horizon variance.
+3. **`T=2` destabilised the trajectory *distribution*.** `ade` mean 4.95 → 9.57, with
+   48/500 clips above 20 versus 8 for the baseline — and 37 of those 48 are clips the
+   baseline handles fine (< 10). On the worst, `ade` ≈ 102 while `min_ade` ≈ 0.9: a
+   near-perfect mode still exists but a typical draw is 100× off. This is real, not a
+   metric artifact — [`metric_api.py:225`](../../src/alpamayo/metrics/metric_api.py#L225)
+   sets `logprob = torch.zeros_like(...)` ("dummy logprob for now"), so `argmax` always
+   returns 0 and **`ade` is sample 0's error, not the best or the mean over modes**.
+   `min_ade` is best-of-K. Deployment gets one trajectory, so `ade` is arguably the
+   number that matters more.
+
+**`L_KV` has a floor at ~0.60.** It falls 3.13 → 0.62 by epoch 0.30 and then moves
+0.02 over the remaining 70% of the epoch. Doubling Jacobi depth does not move it either
+(`T=2`: 0.589 vs `T=1`: 0.574). So the limit is not compute or steps — it is alignment
+or capacity. The two untested hypotheses are the 59 M-param per-layer projector
+absorbing the loss instead of forcing the backbone to match (`kv_align: direct` tests
+this with zero params) and an intrinsic 2B-vs-10B basis gap.
+
+⚠️ **Per-clip metric dumps are per-rank, not gathered.** A multi-GPU eval prints a
+correct aggregate to the log but writes only rank 0's shard to the JSON. A 2-rank,
+1000-clip eval left a 500-row file strided `0, 2, 4, …, 998`, which silently pairs
+against nothing. Run each eval arm as an independent single-rank job.
+
+### ⛔ RETRACTED — the two CoT findings below were a prompt-format artifact
+
+Both sections that follow are **wrong** and are kept only for the record.
+
+The runs behind them used `include_camera_ids: false` / `include_frame_nums: false`
+(the repo's `default` processor). Alpamayo-1.5's `config.json` declares **both true**,
+and the reference `create_message()` prefixes every image with `Front left camera:
+frame 0 ...` explicitly "to match the training format". So the 10B was evaluated outside
+the format it was trained on. Alpamayo-1's config requests neither, so *its* numbers were
+unaffected — which is exactly what manufactured a fake gap between the two.
+
+Re-run through the repo's own `evaluate_hf` with the annotations ON
+(`vla_processor=eval_cot_camids` / `eval_nocot_camids`, 1000 clips of
+`lcdrive_val_mysubset_1k`, VLM token head):
+
+| metric | CoT | no CoT | Δ | σ |
+|---|---|---|---|---|
+| min_ade | 0.6259 | 0.6413 | +0.0154 | 0.86 |
+| ade | 1.2417 | 1.2111 | −0.0307 | −0.84 |
+| corner_distance | 0.6736 | 0.6909 | +0.0173 | 0.99 |
+
+**Every metric is null (|z| < 1).** And `min_ade` moves 1.116 → 0.626 — a 44% gain from
+the prompt format alone, the same size as the "Alpamayo-1 wins by 45%" gap that was
+therefore also an artifact. With the correct format the two generations are level
+(1.5: 0.626, AR-1: 0.612).
+
+Retracted specifically:
+* "the teacher's CoT makes its own driving ~11% worse (6–7σ)" — **not reproduced, null**
+* "Alpamayo-1 outperforms Alpamayo-1.5 by ~45%" — **prompt-format artifact**
+
+⚠️ Not fully isolated: the corrected run changed *two* variables — annotations off→on
+**and** expert head→VLM token head. The format is strongly implicated but the clean test
+is the expert path with annotations on, which needs a 10B-with-expert config in
+`alpamayo1_5_sft`.
+
+**Lesson.** A model's own `config.json` states the prompt format it was trained with.
+The repo's `default` processor turns those flags off deliberately, to keep the 10B
+comparable with the 2B (see `sft_eval_10b_token_lcdrive`'s comment) — correct for that
+purpose, wrong for asking whether the 10B's own reasoning helps it. Check the model's
+declared format before reading anything into a cross-model or ablation result.
+
+### 🛑 [RETRACTED] Alpamayo-1's CoT is neutral; Alpamayo-1.5's CoT is harmful
+
+Same harness, same 1000 held-out clips, same processor, both models verified to emit
+real reasoning:
+
+```
+1.5 : 'Stop for the red traffic light since the signal is red'
+1   : 'Stop at the stop line because the straight traffic light is red.'
+```
+
+| metric | **AR-1** with CoT | AR-1 Δ | z | **AR-1.5** with CoT | AR-1.5 Δ | z |
+|---|---|---|---|---|---|---|
+| min_ade | **0.6120** | −0.003 | −0.28 | 1.1159 | **−0.128** | **−6.80** |
+| ade | **1.5414** | **+0.045** | **+3.43** | 2.2063 | **−0.185** | **−6.38** |
+| corner_distance | **0.6280** | −0.007 | −0.80 | 1.1040 | **−0.131** | **−7.21** |
+| min_ade @5 s | **0.4056** | −0.004 | −0.64 | 0.7058 | **−0.068** | **−6.00** |
+
+(Δ is `nocot − cot`: positive means the CoT helps.)
+
+**Alpamayo-1's Chain-of-Causation is roughly neutral** — a small real gain on `ade`
+(+0.045, 3.4σ), nothing on min_ade, corner distance, or any horizon.
+**Alpamayo-1.5's CoT is clearly harmful**, 6–7σ on every aggregate metric.
+
+**This doubles as the positive control for the harness.** The same code yields a
+significant CoT *benefit* on one checkpoint and a significant *penalty* on another, so it
+is not biased toward "removal helps". It also undermines the out-of-distribution worry
+about the `nocot` arm: the identical no-CoT path costs Alpamayo-1 accuracy while gaining
+1.5 accuracy, which a systematically broken path could not do.
+
+⚠️ **Alpamayo-1 also outperforms Alpamayo-1.5 by ~45% on min_ade** (0.612 vs 1.116) on
+this subset. Treat that more cautiously than the ablations: the within-model contrasts
+are paired and exactly controlled, whereas a cross-model absolute comparison runs both
+through one recipe's processor rather than each model's own eval path.
+
+**Checked and cleared:** our 1.5 teacher loads from `Alpamayo-1.5-10B-A1-format`, which
+is a 32 KB directory of symlinks into the native `Alpamayo-1.5-10B` blobs. Same weights,
+identical 1159-entry weight map; the only config differences are module renames
+(`alpamayo_r1.*` ↔ `alpamayo1_5.*`) with identical hyperparameters. It is a faithful
+repackaging, so the 1.5 result is not a mis-load.
+
+**Implication.** The recipe distils from **1.5**, i.e. from the generation whose reasoning
+hurts its own driving, not the one where it helps.
+
+### 🛑 [RETRACTED — see the banner above] The teacher's CoT makes its own driving ~11% worse
+
+`scripts/eval_cot_vs_nocot.py`. The cleanest instrument in this recipe, and the one that
+should be read first: **no surgery**. The same 10B is run twice over
+`lcdrive_val_mysubset_1k_clip_uuids.txt`, changing only the processor.
+
+| arm | `components_order` |
+|---|---|
+| `cot` | `[image, traj_history, prompt, cot]` — reasons, then acts |
+| `nocot` | `[image, traj_history, prompt, traj_future]` — no `cot` component exists |
+
+Stock rollout on both sides: stochastic sampling, 6 trajectories, 10 Euler steps.
+Diffusion noise pinned *at the sampler* so the arms share it (see the trap below). Two
+independent 500-clip shards agree.
+
+| metric | with CoT | without CoT | Δ | σ | no-CoT better on |
+|---|---|---|---|---|---|
+| **min_ade** | 1.1159 | **0.9882** | −0.1277 | **−6.80** | 59% |
+| **ade** | 2.2063 | **2.0218** | −0.1845 | **−6.38** | 58% |
+| **corner_distance** | 1.1040 | **0.9726** | −0.1313 | **−7.21** | 59% |
+| min_ade @0.5 s | 0.0135 | 0.0132 | −0.0003 | −1.47 | n.s. |
+| min_ade @1 s | 0.0433 | 0.0422 | −0.0011 | −1.49 | n.s. |
+| min_ade @3 s | 0.2978 | 0.2868 | −0.0109 | −2.38 | sig |
+| min_ade @5 s | 0.7058 | **0.6379** | −0.0679 | **−6.00** | sig |
+
+**Removing the chain-of-thought improves the teacher's own driving by ~11% relative.**
+All 1000 clips differ between arms, so the contrast is real.
+
+The horizon profile is the informative part: **nothing at 0.5–1 s, growing to −6σ at
+5 s.** The CoT does not perturb immediate control; it degrades *long-horizon*
+prediction — consistent with a lossy intermediate whose errors propagate into high-level
+intent, where reading the scene directly does not.
+
+This **supersedes the cache-surgery section below**. Same direction (removal helps), but
+at 6–7σ on held-out data through the real inference path, without per-head gathers,
+sequence edits or rope compensation, and without perturbing only 0.36% of the cache —
+four to seven times below the expert's measured detection threshold.
+
+⚠️ Open question, stated rather than buried: the `nocot` arm uses the `default`
+processor, which could be out-of-distribution for a model trained to always reason.
+Against that reading — an OOD mode should be *worse*, not 11% better; `default` is a
+standard SFT processor; and it is the mode the 2B student runs in. Settling it needs the
+checkpoint's training provenance, not another measurement.
+
+⚠️ **Seeding before the rollout does NOT pair the arms.** The rollout calls
+`vlm.generate` first, which consumes RNG sampling tokens, and `cot` emits ~13 tokens
+where `nocot` emits 1–2 — so the arms reach `diffusion.sample` with different generator
+states and different noise. `diffusion.sample` is wrapped to re-seed at the call itself;
+two identical runs are then bit-identical.
+
+**Implication.** KAVA distils this CoT into the student, and this CoT measurably degrades
+the teacher's own driving. Combined with `L_KV`'s benefit being attributable to
+regularisation rather than transfer through the slots, the case for the KV-cache target
+in this architecture is weak.
+
+### ⚠️ The ceiling: the teacher's expert barely uses the CoT in its cache
+
+`scripts/eval_evicted_expert.py` runs the **teacher's own** action expert on the
+**teacher's own** cache, evicted with the exact `sel_idx` we distil against. No student
+is involved, so this measures the compression alone — and it upper-bounds the recipe,
+since reproducing that object *is* the student's objective.
+
+First, the geometry that motivates it. The expert reads the whole prefix cache
+(`kv_cache.crop(tfs_idx + 1)`), roughly **3142 entries**:
+
+| | entries | share |
+|---|---|---|
+| vision tokens | ~2880 | **91.7%** |
+| prompt + special | ~249 | 7.9% |
+| **CoT** | **13** (median over 38,336 clips) | **0.41%** |
+
+So evicting 13 → 8 perturbs **0.16%** of the expert's input. n=120 clips × 3 seeds,
+diffusion noise paired across arms:
+
+| | Δ `min_ade` vs `full` | σ |
+|---|---|---|
+| `identity` (gather everything, remove nothing) | **+0.0000 ± 0.0000** | — |
+| `rkv` (drop 5 of 13, R-KV λ=0.1) | −0.048 ± 0.026 | −1.85 |
+| `crop` (drop 5, keep the first 8) | −0.051 ± 0.027 | −1.89 |
+| `random` (drop 5 at random) | −0.052 ± 0.030 | −1.71 |
+| `none` (**drop all 13**) | −0.075 ± 0.052 | −1.45 |
+
+Two conclusions, both null in the direction that matters:
+
+1. **Which tokens survive is irrelevant.** `rkv` − `random` is +0.0038 ± 0.0062 with a
+   median of **exactly 0.0000** — on most clips the trajectory is bit-identical however
+   the 8 survivors are chosen. Same for `rkv` − `crop` and `crop` − `random`.
+2. **Whether any survive is nearly irrelevant.** `none` − `rkv` is −0.027 ± 0.035
+   (z = −0.77): deleting the entire chain-of-thought is indistinguishable from keeping
+   the 8 entries R-KV picked.
+
+`identity` is the control that makes this trustworthy — it exercises the per-head gather
+and the rope compensation but removes nothing, and comes out bit-identical to `full`, so
+the shared ~−0.05 offset is a property of removing CoT content rather than of the
+surgery. Numbers reproduce to four decimals across independent runs.
+
+**What this does and does not say.** It says the teacher's expert is insensitive to CoT
+content *in aggregate min_ade on 120 LCDrive train clips*. It does **not** say reasoning
+is useless: the CoT may matter on rare or hard scenarios this sample under-represents
+(the ~1,740 OOD-reasoning clips are the obvious place to look), and aggregate ADE is a
+coarse instrument for semantic correctness. It also does not contradict the T=2 slot
+ablation — a student *trained* to route through slots becoming dependent on them is a
+different phenomenon from the teacher's expert not needing the CoT.
+
+But it does bound the premise. "Compile the teacher's reasoning into the cache the expert
+reads" has limited headroom here, because the expert does not appear to use the reasoning
+that is already in that cache. Any future KAVA work should establish a scenario set where
+the CoT demonstrably moves the teacher's own trajectory *before* optimising how faithfully
+a student reproduces it.
+
+**On OOD-reasoning clips, with the shortening control.** The above is LCDrive *train*.
+Repeated on 100 clips from `reasoning/ood_reasoning.parquet` (construction zones,
+one-way traffic control — scenarios curated as *needing* reasoning), ordered so the
+1,170 clips outside lcdrive-train come first. Only the `rkv` arm needs a cached
+`sel_idx`, so dropping it is what allows running on never-cached clips at all.
+
+| | Δ `min_ade` vs `full` | σ |
+|---|---|---|
+| `identity` (remove nothing) | +0.0000 ± 0.0000 | — |
+| `none` (drop all ~14 CoT entries) | −0.095 ± 0.058 | −1.64 |
+| **`pre`** (drop ~14 **prompt/vision** entries, CoT intact) | −0.068 ± 0.057 | −1.19 |
+| **`none` − `pre`** | **−0.028 ± 0.036** | **−0.76** |
+
+`pre` is the control that matters: same count removed, same machinery, different
+content. It improves *as much as* removing the CoT, so **the CoT slice is not
+distinguishable from an arbitrary equal-size slice of the prefix.** Any apparent gain
+from deleting the reasoning is a generic effect of shortening the cache, not a property
+of the reasoning.
+
+**The sensitivity floor — what makes the null meaningful.** A null is worthless without
+evidence the instrument can detect anything, so `preN` sweeps the number of removed
+entries. n=100 OOD clips × 2 seeds:
+
+| entries removed | Δ `min_ade` vs `full` | σ | |
+|---|---|---|---|
+| **~14 — the CoT** | −0.108 ± 0.068 | −1.58 | n.s. |
+| ~14 — prefix (`pre`) | −0.095 ± 0.057 | −1.67 | n.s. |
+| 25 | −0.131 ± 0.100 | −1.32 | n.s. |
+| 50 | +0.254 ± 0.196 | +1.30 | n.s. |
+| 100 | +0.756 ± 0.244 | **+3.10** | **SIG** |
+| 200 | +0.938 ± 0.247 | **+3.80** | **SIG** |
+
+**The expert's detection threshold is ~50–100 cache entries out of ~3019. The CoT is 14 —
+four to seven times below it.** So the result is not "no effect was found"; it is "this
+measurement resolves removals at the 100-entry scale, and the CoT is far too small to
+reach that scale." That bounds how much any CoT-cache objective can possibly buy here,
+independent of how faithfully a student reproduces the target.
+
+⚠️ An earlier version of this section reported `random`/`crop`/`none` beating `full` at
+2.3–3.1σ on these clips and read it as "removing the CoT *helps*". That was measured
+against `full` only, before `pre` existed, and is retracted: an unrelated removal
+produces a comparable effect. Note also that two OOD runs are **not** comparable
+clip-for-clip — differing `cot_mismatch` skip counts change the clip set and the seed
+sequence — so only within-run paired contrasts mean anything here.
+
+⚠️ **The diffusion sampler is unseeded by default, and it will fool you.** Two runs of
+the identical `full` arm once differed by −0.2475 ± 0.1308 (1.89σ on a true-zero effect),
+which is larger than every effect above. That artifact produced a confident,
+wrong "R-KV is worse than random" result before it was caught. The script now seeds
+`torch.manual_seed`/`cuda.manual_seed_all` identically per arm and repeats over `--reps`
+seeds; keep a duplicate arm in any variant of this experiment as a live noise floor.
+
+### The λ₂ control settles the attribution
+
+A CE-only arm at `T=2` and effective batch 48, differing from the KAVA `T=2` arm in
+**exactly one variable** (λ₂ 1.0 → 0.0) — same warm start, data, schedule, Jacobi depth
+and slots. This is the only single-variable comparison in the study, and it resolves all
+three open questions.
+
+| arm | `min_ade` | `ade` mean / median | `corner` | clips `ade`>20 |
+|---|---|---|---|---|
+| baseline, no KD | 4.094 | 4.949 / 3.470 | 4.103 | 8 |
+| control, λ₂=0 | 4.319 | 4.838 / 3.297 | 4.321 | 3 |
+| control, slots zeroed | 4.254 | 4.663 / 3.191 | 4.269 | 0 |
+| KAVA, λ₂=1 | 4.165 | 9.570 / 4.144 | 4.079 | **48** |
+| KAVA, slots zeroed | 7.940 | 27.119 / 19.284 | 7.810 | 245 |
+
+1. **`L_KV` alone does the KV matching.** On identical data and schedule the control's
+   `kv_loss` *rises* 3.165 → 3.387 while KAVA's falls 3.129 → 0.591. CE does not
+   incidentally align the caches — it drifts the other way. The 5.3× match is the
+   objective's work.
+2. **`L_KV` alone makes the slots load-bearing.** Zeroing them costs KAVA −3.776 ± 0.589
+   `min_ade` (6.4σ); in the control it *helps* by +0.065 ± 0.027. Jacobi refinement by
+   itself leaves the slots decorative, so the `T=1`-vs-`T=2` difference reported above is
+   **not** Jacobi depth per se — it is `L_KV` having something to attach to once the
+   slots are re-read.
+3. **`L_KV` improves quality against the matched control**, −0.154 ± 0.039 `min_ade`
+   (4.0σ) and −0.242 ± 0.044 `corner_distance` (5.5σ), recovering ~⅔ of the control's
+   own +0.225 continuation cost. The gain sits **beyond 5 s**: by horizon KAVA is
+   slightly worse at 0.5/1/3 s (+0.006/+0.020/+0.064) and better at 5 s (−0.037, n.s.),
+   yet better over the full horizon — consistent with a reasoning cache informing
+   long-term intent rather than near-term kinematics.
+4. **`L_KV` also caused the `ade` tail.** 48/500 clips above `ade` 20 versus **3** for
+   the control and 8 for the baseline — the control is *cleaner* than the baseline, so
+   the blowup is not continuation damage. It is a tail, not a shift: median `ade` differs
+   by only +0.074.
+
+**So `L_KV` works and hurts at the same time.** It is solely responsible for the cache
+match, for making the latent slots functional, and for a real long-horizon gain over a
+matched control — while inducing catastrophic failure on ~10% of clips. The open problem
+is no longer "does KAVA transfer here" but "keep the gain, kill the tail." Net against
+the no-KD baseline it remains slightly behind (+0.071, n.s.) only because the
+continuation cost exceeds the recovery.
+
+⚠️ **Compare against the control, not the baseline.** The baseline never saw these 799
+extra steps, so any arm trained on top of Stage-1 pays a +0.225 `min_ade` continuation
+cost before `L_KV` does anything. Reading KAVA against the baseline attributes that cost
+to the method.
+
 
 ## Scope & follow-ups
 

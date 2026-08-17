@@ -190,6 +190,7 @@ def main() -> None:
                     imp=sample.imp,
                     red=sample.red,
                     tfs_hidden=sample.tfs_hidden,
+                    tfs_hidden_all=sample.tfs_hidden_all,
                     metadata=provenance,
                 )
 
@@ -212,6 +213,7 @@ def main() -> None:
                 sel_idx=sel_idx,
                 n_valid=k_sel.shape[-2],
                 tfs_hidden=sample.tfs_hidden,
+                tfs_hidden_all=sample.tfs_hidden_all,
                 metadata={**provenance, "format": kv_cache_io.FORMAT_COMPRESSED},
             )
 

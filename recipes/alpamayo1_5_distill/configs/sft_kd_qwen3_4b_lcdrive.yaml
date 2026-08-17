@@ -1,0 +1,122 @@
+# Qwen3-VL-4B student <- Alpamayo-1.5-10B teacher, on the official LCDrive train split.
+#
+#   L = CE(gt traj) + lambda_kd * KD(traj logits) + lambda_kv * KV_align(all tok, all layers)
+#
+# Both distillation weights default to 0, so out of the box this is the CE-ONLY CONTROL --
+# the arm every later result is measured against. Turn terms on from the CLI:
+#   ++model.kd.kd_weight=... ++model.kd.kv_weight=...
+#
+# Launch (from the alpamayo1_5_sft venv, PYTHONPATH includes recipes/). Use train_kd, not
+# train_hf: it swaps in KaVaTrainer, which logs the terms separately -- "total went down"
+# cannot tell you which objective did the work.
+#   torchrun --nproc_per_node 4 -m alpamayo1_5_distill.train_kd \
+#     --config-path pkg://alpamayo1_5_distill/configs \
+#     --config-name sft_kd_qwen3_4b_lcdrive
+defaults:
+  - sft_base
+  - /models/qwen3_vl_4b_kd@model
+  # ⚠️ The group ships `team: ???` and `project: ???`, and train_hf does
+  # `init_wandb(**cfg.wandb)` -- the `**` expansion resolves EVERY key, so leaving either
+  # unset raises MissingMandatoryValue during hydra resolution, before wandb is even
+  # reached. `WANDB_MODE=disabled` does not help: that is a wandb runtime setting and this
+  # fails earlier. Both are given real values in the `wandb:` block below; do not remove it.
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+data:
+  # ⚠️ The teacher's config.json declares include_camera_ids / include_frame_nums TRUE and
+  # the reference create_message() prefixes each image with "Front left camera: frame 0 ".
+  # The repo's `default` processor sets both FALSE -- deliberately, to keep the 10B
+  # comparable with our 2B -- and evaluating the 10B in that format moved min_ade
+  # 1.116 -> 0.626, a 44% swing that produced two retracted findings. Student and teacher
+  # must both use the annotated format, or the sequences differ and every position-wise
+  # KV target is misaligned.
+  train_dataset:
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  val_dataset:
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: true
+  # Set on the collator too. It only re-tokenizes the already-built text, so this is
+  # belt-and-braces -- but the flags live in three independent places and a mismatch is
+  # exactly the class of error that cost two findings.
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  lr_multiplier:
+    vlm.model.visual: 0.1
+  ddp_find_unused_parameters: false
+
+  # ABSOLUTE path. sft_base sets `configs/deepspeed/zero2.json`, which only resolves when
+  # cwd is the *sft* recipe dir. Left relative, accelerate tries to json.loads() the path
+  # string and dies with "Expecting value: line 1 column 1".
+  deepspeed: /home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/configs/deepspeed/zero2.json
+
+  # ✅ ON, unlike the KAVA recipe. KaVaReasoningVLA must forbid checkpointing because its
+  # forward hooks capture DETACHED K/V under it. This student recomputes K/V from
+  # output_hidden_states instead (verified rel-L2 0.000e+00 against the hook path on all
+  # 36 layers), which survives checkpointing and still carries grad_fn.
+  # Measured on a real clip: peak 69.6 GB without, 38.6 GB with -- and the losses agree to
+  # five decimals. That 31 GB is exactly what makes the co-resident teacher fit.
+  gradient_checkpointing: true
+
+  # bs=1 x 4 GPUs. Measured at bs=1: 38.6 GB forward+backward including the frozen teacher
+  # and student params, plus ~15.5 GB of ZeRO-2 optimizer shard at 4 ranks = ~54 GB.
+  # bs=2 projects to ~66 GB; raise only after confirming on the target node.
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 12
+  learning_rate: 1e-5
+  # ~21% of one epoch, the fraction the Stage-1 LCDrive baseline used. MEASURED from the
+  # finished ce arm (job 392) rather than estimated from the filter: the filter lists
+  # 39,072 UUIDs but only 38,340 clips are actually present, so one epoch at
+  # 2 GPUs x 1 x 12 = 24 is 1,598 steps, and 340 = 21.3%. Rederive if GPUS/BS/ACCUM change
+  # -- the shipped 500 would have been 31% here, and warmup fraction is one of the few
+  # schedule knobs the KAVA arms proved sensitive to.
+  # All three arms (ce / kd / kv) share this, so schedule is never a confound between them.
+  warmup_steps: 340
+  num_train_epochs: 1
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_qwen3_4b_lcdrive
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_kd_qwen3_4b_lcdrive
+run_name: kd_4b_${now:%m%d-%H%M}
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-kd-qwen3-4b
+  # ONE group for all three arms, overriding the default group's `${run_name}`. The whole
+  # point of ce / kd / kv is that they are read against each other, and a per-run group
+  # puts each on its own chart. slurm_train_kd.sh still gives each arm a distinct
+  # `run_name`, so they stay separate runs inside this group.
+  group: kd_4b_lcdrive_arms
