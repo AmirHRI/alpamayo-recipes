@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_kava_compress
 #SBATCH --partition=debug
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/compress_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/compress_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/compress_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/compress_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=0
@@ -28,7 +28,7 @@ set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 PYTHON=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/a1_5_sft/bin/python
-OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 
 CACHE_ROOT="${CACHE_ROOT:-$OUT_DIR/teacher_kv_lcdrive}"
 M="${M:-8}"

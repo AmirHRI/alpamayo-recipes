@@ -7,11 +7,11 @@
 # CODI-style loss destabilising on long traces and uses lambda_1 = 0 on its hardest
 # dataset), leaving L_KV as the only distillation signal.
 _target_: alpamayo1_5_distill.models.kava_model.KaVaReasoningVLA.from_pretrained_vlm
-vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
-alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+vlm_name_or_path: /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 # Warm start from the trained Stage-1 LCDrive VLM rather than the base 2B. Loaded
 # BEFORE init_kava runs, so the slots' vocab-init reads the fine-tuned embeddings.
-checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_stage1_cosmos2b_lcdrive/checkpoint-3597
+checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_stage1_cosmos2b_lcdrive/checkpoint-3597
 
 # lambda_1: the endpoint hidden match (KAVA's L_CODI analogue), inherited.
 teacher_hidden_dim: 4096

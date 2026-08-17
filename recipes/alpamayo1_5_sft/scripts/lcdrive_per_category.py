@@ -11,7 +11,7 @@ mean of every metric per ``scenario_category_paper`` plus an overall row.
 Example:
     python scripts/lcdrive_per_category.py \
         --per-clip /data/.../output_stage1_cosmos2b_lcdrive/lcdrive_val_per_clip_metrics.json \
-        --category-csv /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_primary_scenario_for_table2.csv \
+        --category-csv /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_primary_scenario_for_table2.csv \
         --out-csv /data/.../output_stage1_cosmos2b_lcdrive/lcdrive_val_by_category.csv
 """
 

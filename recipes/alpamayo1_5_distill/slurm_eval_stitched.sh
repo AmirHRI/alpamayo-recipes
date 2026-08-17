@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_stitch_eval
 #SBATCH --partition=debug
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stitcheval_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stitcheval_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stitcheval_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stitcheval_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -33,9 +33,9 @@ set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
-TEACHER=/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-COSMOS=/data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+TEACHER=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+COSMOS=/temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
 
 ARM="${ARM:?set ARM=teacher|ce|kd|kv|cekv|kvonly|<arm>_eN}"
 CKPT="${CKPT:-}"   # e.g. checkpoint-3196; default is the newest

@@ -1016,7 +1016,7 @@ $VENV/python -m pytest tests/test_kava.py -q     # 35 GPU-free tests
 is what decides the disk bill and it cannot be predicted from configs:
 
 ```bash
-ROOT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive
+ROOT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive
 CUDA_VISIBLE_DEVICES=0 $VENV/python -m alpamayo1_5_distill.scripts.generate_teacher_kv \
     config=cache_teacher_kv_lcdrive teacher=teacher_ar1_5_10b \
     cache_root=$ROOT m=16 lam=0.1 eviction=rkv mode=generate limit=200

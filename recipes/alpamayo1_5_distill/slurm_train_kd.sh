@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_kd_train
 #SBATCH --partition=debug
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=2
@@ -49,7 +49,7 @@ set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 GPUS="${GPUS:-2}"
 # PIN_GPUS=1,2 -> run on those PHYSICAL devices while still under slurm.
 # ⚠️ Needs `--gpus=4` on the sbatch line (or `sbatch --gpus=4`): slurm sets

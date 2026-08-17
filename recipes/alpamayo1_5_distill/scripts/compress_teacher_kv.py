@@ -23,7 +23,7 @@ re-run of the 10B.
 Usage::
 
     python -m alpamayo1_5_distill.scripts.compress_teacher_kv \
-        cache_root=/data/achahe/.../teacher_kv_lcdrive m=32 lam=0.1 eviction=rkv
+        cache_root=/temp/achahe/.../teacher_kv_lcdrive m=32 lam=0.1 eviction=rkv
 
     # the paper's eviction ablations, all from one cache:
     ... m=16 eviction=cosine     # diversity only  (lambda = 0)

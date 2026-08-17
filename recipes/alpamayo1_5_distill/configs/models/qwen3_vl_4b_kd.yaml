@@ -14,15 +14,15 @@
 # the 4000 <i0>..<i3999> trajectory tokens plus the specials, and attaches the pretrained
 # trajectory tokenizer. Without it the student has no trajectory vocabulary at all.
 _target_: alpamayo1_5_distill.models.kd_model.KDReasoningVLA.from_pretrained_vlm
-vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
-alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+vlm_name_or_path: /temp/achahe/hf_cache/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
+alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 checkpoint_path: null
 
 # The frozen teacher. `from_alpamayo_checkpoint` filters to the `vlm.` prefix, so the
 # action expert and diffusion tensors are never materialised -- ~16 GB, not ~21 GB. Set
 # `kd` to null below to drop the teacher entirely and get the CE-only control arm.
-teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-teacher_vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+teacher_checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+teacher_vlm_name_or_path: /temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
 
 kd:
   # MEASURED, not guessed -- scripts/calibrate_kd_weights.py, 4 batches, step 0, at

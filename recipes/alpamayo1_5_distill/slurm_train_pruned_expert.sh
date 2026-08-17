@@ -10,8 +10,8 @@
 # the blockrandt continuation. 120G matches slurm_train_kd.sh, which coexists fine.
 #SBATCH --mem=120G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/prunedexp_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/prunedexp_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/prunedexp_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/prunedexp_%j.err
 #
 # Train the PRUNED action expert, teacher VLM frozen. See
 # configs/sft_prunedexpert_10b_lcdrive.yaml for what this measures and why.
@@ -24,7 +24,7 @@ export PRUNE_EXPERT_LAYERS
 SMOKE="${SMOKE:-0}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 cd "$RECIPE_DIR"
 export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

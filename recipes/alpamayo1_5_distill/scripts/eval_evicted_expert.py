@@ -70,7 +70,7 @@ class _SkipClip(RuntimeError):
     """This clip cannot be scored coherently; skip it rather than record a number."""
 
 
-CACHE_ROOT = "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive"
+CACHE_ROOT = "/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive"
 TIER = "compressed_M8_rkv0.1"
 
 
@@ -410,7 +410,7 @@ def main() -> None:
             se = st.stdev(d) / math.sqrt(len(d)) if len(d) > 1 else float("nan")
             line += f"{st.mean(d):+8.4f} +- {se:.4f}"
         print(line)
-    out = args.out or f"/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/evict_expert_{args.tier}.json"
+    out = args.out or f"/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/evict_expert_{args.tier}.json"
     Path(out).write_text(json.dumps(rows, indent=1))
     print(f"\n  per-clip -> {out}")
 

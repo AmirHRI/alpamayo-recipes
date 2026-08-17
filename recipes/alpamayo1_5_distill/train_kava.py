@@ -29,7 +29,7 @@ Usage::
     torchrun --nproc_per_node 8 -m alpamayo1_5_distill.train_kava \
         --config-path pkg://alpamayo1_5_distill/configs \
         --config-name sft_stage1_kava_cosmos2b_lcdrive \
-        data.train_dataset.kv_cache_root=/data/achahe/.../teacher_kv_lcdrive
+        data.train_dataset.kv_cache_root=/temp/achahe/.../teacher_kv_lcdrive
 """
 
 import alpamayo1_5_sft.train_hf as base

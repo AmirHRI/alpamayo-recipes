@@ -9,7 +9,7 @@
 # AlpamayoR1.sample_trajectories_from_data_with_vlm_rollout, which is all the ablation
 # needs.
 _target_: alpamayo1_sft.models.sft_alpamayo_r1.TrainableAlpamayoR1.from_pretrained
-pretrained_model_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-R1-10B/snapshots/d72c6a2757b10cacb69b688ca66ccfad3dafbf37
+pretrained_model_name_or_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-R1-10B/snapshots/d72c6a2757b10cacb69b688ca66ccfad3dafbf37
 dtype: auto
 cotrain_vlm: false
 stage1_vlm_checkpoint_path: null

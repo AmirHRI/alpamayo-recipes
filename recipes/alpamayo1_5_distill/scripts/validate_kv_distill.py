@@ -67,7 +67,7 @@ from alpamayo1_5_distill.models.kv_distill import (
     select_top_m,
 )
 
-MODEL = "/data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B"
+MODEL = "/temp/achahe/hf_cache/hub/Cosmos-Reason2-2B"
 K = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 DTYPE = getattr(torch, sys.argv[2]) if len(sys.argv) > 2 else torch.float32
 dev = torch.device("cuda")

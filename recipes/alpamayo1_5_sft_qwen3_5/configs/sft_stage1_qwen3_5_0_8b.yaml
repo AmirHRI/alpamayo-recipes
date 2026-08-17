@@ -17,16 +17,16 @@ data:
   train_dataset:
     _target_: alpamayo.data.pai_nav.PAIDatasetWithNav
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
-    annotations_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
+    local_dir: /temp/achahe/physical_ai_av/
+    annotations_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
     chunk_ids: [1519, 1657, 1984, 2368]   # demo chunks present on disk (widen with real LCDrive nav data)
     vla_preprocess_args:
       generation_mode: false
   val_dataset:
     _target_: alpamayo.data.pai_nav.PAIDatasetWithNav
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
-    annotations_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
+    local_dir: /temp/achahe/physical_ai_av/
+    annotations_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
     chunk_ids: [1519, 1657, 1984, 2368]   # demo chunks present on disk (widen with real LCDrive nav data)
     vla_preprocess_args:
       generation_mode: true
@@ -42,7 +42,7 @@ trainer:
   num_train_epochs: 3
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft_qwen3_5/training/output_stage1_qwen3_5_0_8b
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft_qwen3_5/training/output_stage1_qwen3_5_0_8b
 
 evaluate:
   eval_ckpt: null

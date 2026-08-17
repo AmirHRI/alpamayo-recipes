@@ -31,8 +31,8 @@ data:
   train_dataset:
     _target_: alpamayo1_5_distill.data.distill_dataset.DistillNavDataset
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
-    annotations_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
+    local_dir: /temp/achahe/physical_ai_av/
+    annotations_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
     chunk_ids: [1519, 1657, 1984, 2368]
     teacher_cache_path: ???   # set to the generated teacher_features.safetensors
     inject_cot: false         # student is text-silent (no CoT in context)
@@ -41,8 +41,8 @@ data:
   val_dataset:
     _target_: alpamayo1_5_distill.data.distill_dataset.DistillNavDataset
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
-    annotations_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
+    local_dir: /temp/achahe/physical_ai_av/
+    annotations_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/nav_demo_samples.json
     chunk_ids: [1519, 1657, 1984, 2368]
     teacher_cache_path: null  # eval uses generation; no teacher feature needed
     inject_cot: false
@@ -64,7 +64,7 @@ trainer:
   num_train_epochs: 3
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_distill_cosmos2b
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_distill_cosmos2b
 
 evaluate:
   eval_ckpt: null

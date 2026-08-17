@@ -26,7 +26,7 @@ model:
   # stage1_vlm_checkpoint_path is redundant here (the Stage-2 ckpt already contains
   # the frozen VLM), so null it out to avoid a wasted second VLM load.
   stage1_vlm_checkpoint_path: null
-  stage2_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_stage2_cosmos2b_lcdrive/checkpoint-11502
+  stage2_checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_stage2_cosmos2b_lcdrive/checkpoint-11502
 
 trainer:
   report_to: none
@@ -35,7 +35,7 @@ trainer:
   per_device_eval_batch_size: 10
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_eval_stage2_cosmos2b_lcdrive
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/output_eval_stage2_cosmos2b_lcdrive
 
 evaluate:
   eval_ckpt: null

@@ -12,15 +12,15 @@ defaults:
 
 model:
   # Use the VLM fine-tuned on the LCDrive split (update the checkpoint id once Stage 1 finishes)
-  stage1_vlm_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage1_cosmos2b_lcdrive/checkpoint-3000
+  stage1_vlm_checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage1_cosmos2b_lcdrive/checkpoint-3000
 
 data:
   train_dataset:
     chunk_ids: "0-3146"     # scan all present chunks; UUID filter does the selection
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
   val_dataset:
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
 
 trainer:
   report_to: wandb
@@ -35,7 +35,7 @@ trainer:
   num_train_epochs: 3
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage2_cosmos2b_lcdrive
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage2_cosmos2b_lcdrive
 
 evaluate:
   eval_ckpt: null

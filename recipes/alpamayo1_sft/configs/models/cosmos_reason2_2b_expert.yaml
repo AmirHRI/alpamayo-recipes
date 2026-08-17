@@ -1,7 +1,7 @@
 _target_: alpamayo1_sft.models.sft_alpamayo_r1.TrainableAlpamayoR1.from_pretrained_vlm
-vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
-alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-R1-10B
-stage1_vlm_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage1_cosmos2b/checkpoint-3000
+vlm_name_or_path: /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-R1-10B
+stage1_vlm_checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage1_cosmos2b/checkpoint-3000
 stage2_checkpoint_path: null   # set by evaluate_hf.py at eval time
 cotrain_vlm: false
 stop_grad_from_vlm: true

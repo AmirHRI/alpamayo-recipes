@@ -1,6 +1,6 @@
 _target_: alpamayo1_5_sft_qwen3_5.models.sft_alpamayo_r1.TrainableAlpamayoR1.from_pretrained_vlm
-vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
-alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+vlm_name_or_path: /temp/achahe/hf_cache/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc
+alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 stage1_vlm_checkpoint_path: null
 stage2_checkpoint_path: null   # set by evaluate_hf.py at eval time
 cotrain_vlm: false

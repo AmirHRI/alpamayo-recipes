@@ -37,7 +37,7 @@ import numpy as np
 import torch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-MODEL = "/data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B"
+MODEL = "/temp/achahe/hf_cache/hub/Cosmos-Reason2-2B"
 K = 8
 dev = torch.device("cuda")
 torch.manual_seed(0)

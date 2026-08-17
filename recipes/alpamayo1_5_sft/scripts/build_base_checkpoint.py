@@ -10,7 +10,7 @@ the SFT recipe environment (where ``alpamayo1_5_sft`` is importable):
     cd /home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft
     uv run --active python scripts/build_base_checkpoint.py \
       --model-config configs/models/cosmos_reason2_2b.yaml \
-      --output /data/achahe/checkpoints/alpamayo-2b_base_released
+      --output /temp/achahe/checkpoints/alpamayo-2b_base_released
 """
 
 from __future__ import annotations
@@ -51,8 +51,8 @@ def main() -> None:
     print("  uv run --no-sync --package alpagym-alpamayo-r1 python \\")
     print("    packages/policies/alpamayo_r1/scripts/convert_release_to_alpagym_checkpoint.py \\")
     print(f"    --input {output_dir} \\")
-    print("    --output /data/achahe/checkpoints/alpamayo-2b_alpagym_ckpt \\")
-    print("    --vlm-name-or-path /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B \\")
+    print("    --output /temp/achahe/checkpoints/alpamayo-2b_alpagym_ckpt \\")
+    print("    --vlm-name-or-path /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B \\")
     print("    --overwrite")
 
 

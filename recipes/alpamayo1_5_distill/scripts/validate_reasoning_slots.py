@@ -43,7 +43,7 @@ import numpy as np
 import torch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-MODEL = "/data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B"
+MODEL = "/temp/achahe/hf_cache/hub/Cosmos-Reason2-2B"
 K = int(sys.argv[1]) if len(sys.argv) > 1 else 8
 DTYPE = getattr(torch, sys.argv[2]) if len(sys.argv) > 2 else torch.float32
 

@@ -67,10 +67,10 @@ from torch.utils.data import DataLoader  # noqa: E402
 from alpamayo1_5_distill.models.expert_teacher import build_noisy_action  # noqa: E402
 from alpamayo1_5_distill.models.stitched_model import StitchedAlpamayoR1  # noqa: E402
 
-TRAIN = "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training"
-TEACHER_CKPT = "/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format"
+TRAIN = "/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training"
+TEACHER_CKPT = "/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format"
 COSMOS = (
-    "/data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/"
+    "/temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/"
     "snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9"
 )
 

@@ -26,7 +26,7 @@
 #   torchrun --nproc_per_node 8 -m alpamayo1_5_distill.train_kava \
 #     --config-path pkg://alpamayo1_5_distill/configs \
 #     --config-name sft_stage1_kava_cosmos2b_lcdrive \
-#     data.train_dataset.kv_cache_root=/data/achahe/.../teacher_kv_lcdrive
+#     data.train_dataset.kv_cache_root=/temp/achahe/.../teacher_kv_lcdrive
 defaults:
   - sft_base
   - /models/cosmos_reason2_2b_kava@model
@@ -62,9 +62,9 @@ data:
   train_dataset:
     _target_: alpamayo1_5_distill.data.kava_dataset.KaVaPAIDataset
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"     # scan all present chunks; UUID filter does the selection
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
     use_default_keyframe: true
     teacher_cache_path: null   # the tfs hidden rides in the KV cache instead
     kv_cache_root: ???         # set to generate_teacher_kv.py's cache_root
@@ -85,9 +85,9 @@ data:
   val_dataset:
     _target_: alpamayo1_5_distill.data.kava_dataset.KaVaPAIDataset
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
     use_default_keyframe: true
     teacher_cache_path: null
     kv_cache_root: null       # eval needs no teacher target; slots still run
@@ -149,7 +149,7 @@ trainer:
   num_train_epochs: 1
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_kava_cosmos2b_lcdrive
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_kava_cosmos2b_lcdrive
 
 evaluate:
   eval_ckpt: null

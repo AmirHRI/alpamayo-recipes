@@ -60,7 +60,7 @@ from typing import Any
 import torch
 
 SUBSET_1K = (
-    "/data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/"
+    "/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/"
     "lcdrive_val_mysubset_1k_clip_uuids.txt"
 )
 
@@ -340,7 +340,7 @@ def main() -> None:
         print(f"  {name:22s}{st.mean(c):10.4f}{st.mean(nc):10.4f}   {m:+8.4f} +- {se:.4f} ({z:+5.2f}s) {tag}")
     print("\n  positive `nocot - cot` => the CoT HELPS (removing it costs that much)")
 
-    out = args.out or f"/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cot_vs_nocot_sh{args.shard}.json"
+    out = args.out or f"/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cot_vs_nocot_sh{args.shard}.json"
     Path(out).write_text(json.dumps(rows, indent=1))
     print(f"\n  per-clip -> {out}")
 

@@ -7,7 +7,7 @@ description: >
 
 # ── PAI-specific data config (used by autovla_pai/train.py) ──────────────────
 pai:
-  pai_dir:          /data/datasets/physical_ai_av
+  pai_dir:          /temp/achahe/physical_ai_av
   train_chunk_ids:  "0-185"     # ~17 670 clips
   val_chunk_ids:    "186-205"   #  ~1 896 clips
 
@@ -100,7 +100,7 @@ structured_rft:
 # ── Training config ───────────────────────────────────────────────────────────
 training:
   devices: [0, 1, 2, 3]
-  checkpoint_dir: /data/achahe/alpamayo-recipes/recipes/autovla_pai/training/output_sft_stage1
+  checkpoint_dir: /temp/achahe/alpamayo-recipes/recipes/autovla_pai/training/output_sft_stage1
 
   # Load Stage 1 VLM + proposal head weights from the nuPlan ablation ckpt.
   # This ckpt has no control_head keys, so there are no unexpected keys.

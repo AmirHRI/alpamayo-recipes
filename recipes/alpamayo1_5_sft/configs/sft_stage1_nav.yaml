@@ -9,7 +9,7 @@ data:
   train_dataset:
     _target_: alpamayo.data.pai_nav.PAIDatasetWithNav
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     annotations_path: ???
     chunk_ids: [214, 224, 276, 317, 420, 727, 728, 968, 982,
                 1519, 1657, 1984, 2277, 2368, 2372, 2447, 2599, 2634, 2868]

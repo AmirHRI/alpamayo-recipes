@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_kava_train
 #SBATCH --partition=debug
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kavatrain_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kavatrain_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kavatrain_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kavatrain_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -34,8 +34,8 @@ set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/a1_5_sft/bin
-OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
-CACHE_ROOT="${CACHE_ROOT:-/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive}"
+OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+CACHE_ROOT="${CACHE_ROOT:-/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive}"
 GPUS="${GPUS:-1}"
 SMOKE="${SMOKE:-0}"
 # Sweep knobs. Defaults reproduce the committed config; any override also gets its own

@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_stage1_2b
 #SBATCH --partition=debug
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/slurm_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/slurm_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/slurm_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training/slurm_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft
-OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training
+OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/training
 mkdir -p "$OUT_DIR"
 
 cd "$RECIPE_DIR"

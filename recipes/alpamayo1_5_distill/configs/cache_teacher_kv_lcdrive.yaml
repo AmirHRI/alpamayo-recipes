@@ -20,7 +20,7 @@
 #   for s in 0 1 2 3 4 5 6 7; do CUDA_VISIBLE_DEVICES=$s python -m \
 #     alpamayo1_5_distill.scripts.generate_teacher_kv \
 #     config=cache_teacher_kv_lcdrive teacher=teacher_ar1_5_10b \
-#     cache_root=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive \
+#     cache_root=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_kv_lcdrive \
 #     m=16 lam=0.1 eviction=rkv num_shards=8 shard=$s & done
 defaults:
   - sft_base
@@ -36,14 +36,14 @@ data:
   cache_dataset:
     _target_: alpamayo1_5_distill.data.distill_dataset.DistillPAIDataset
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"     # scan all present chunks; the UUID filter selects LCDrive train
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
     use_default_keyframe: true
     teacher_cache_path: null   # building the cache, not reading it
     vla_preprocess_args:
       generation_mode: true
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 task_name: alpamayo_1_5_kava_cache_lcdrive

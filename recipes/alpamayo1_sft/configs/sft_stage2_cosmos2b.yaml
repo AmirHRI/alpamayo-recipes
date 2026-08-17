@@ -23,7 +23,7 @@ trainer:
   num_train_epochs: 3
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage2_cosmos2b
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_sft/training/output_stage2_cosmos2b
 
 evaluate:
   eval_ckpt: null

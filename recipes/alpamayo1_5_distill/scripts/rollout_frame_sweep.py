@@ -44,10 +44,10 @@ from typing import Any
 import pandas as pd
 import torch
 
-PAI = "/data/datasets/physical_ai_av/"
+PAI = "/temp/achahe/physical_ai_av/"
 MANIFEST_DIR = PAI + "lcdrive_physicalai_av_manifests/"
 SCENARIO_CSV = MANIFEST_DIR + "lcdrive_val_primary_scenario_for_table2.csv"
-TEACHER = "/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format"
+TEACHER = "/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format"
 
 T0_MIN, T0_MAX, T0_STEP = 1_700_000, 13_600_000, 100_000   # 10 Hz, inside the safe margins
 

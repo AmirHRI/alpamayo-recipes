@@ -21,7 +21,7 @@ import torch
 
 sys.path.insert(0, "/home/achahe/alpamayo-recipes/recipes")
 
-MODEL = "/data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B"
+MODEL = "/temp/achahe/hf_cache/hub/Cosmos-Reason2-2B"
 K = 8  # num_slots, matching the trained config
 PREFIX = 64  # a short synthetic prefix; the question is about masking, not content
 

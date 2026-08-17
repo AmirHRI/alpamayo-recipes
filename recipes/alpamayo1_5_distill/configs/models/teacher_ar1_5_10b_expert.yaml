@@ -14,7 +14,7 @@
 #
 # cotrain_vlm=false keeps the VLM frozen (this is a pure inference job anyway).
 _target_: alpamayo1_5_distill.models.expert_teacher.KaVaExpertTeacher.from_pretrained
-pretrained_model_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+pretrained_model_name_or_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 dtype: auto
 cotrain_vlm: false
 stage1_vlm_checkpoint_path: null

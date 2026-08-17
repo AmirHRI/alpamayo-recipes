@@ -37,7 +37,7 @@ hydra:
 
 model:
   # The finished KAVA run — this is what actually loads the weights.
-  kava_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_kava_cosmos2b_lcdrive/checkpoint-7191
+  kava_checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_stage1_kava_cosmos2b_lcdrive/checkpoint-7191
   # Do NOT warm-start as well: kava_checkpoint_path carries the VLM weights too, so
   # loading checkpoint-3597 first would only be overwritten.
   checkpoint_path: null
@@ -59,9 +59,9 @@ data:
   val_dataset:
     _target_: alpamayo1_5_distill.data.kava_dataset.KaVaPAIDataset
     _recursive_: false
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
     use_default_keyframe: true
     teacher_cache_path: null
     kv_cache_root: null       # no teacher targets needed at eval
@@ -87,6 +87,6 @@ evaluate:
   max_eval_steps: -1
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kava_eval
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kava_eval
 task_name: alpamayo_1_5_kava_eval_cosmos2b_lcdrive
 run_name: kavaeval_M${model.kava.num_slots}_zero-${model.zero_slots}_${now:%m%d-%H%M}

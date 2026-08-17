@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_layerimp
 #SBATCH --partition=debug
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/layerimp_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/layerimp_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/layerimp_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/layerimp_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -14,7 +14,7 @@
 # Causal per-layer K/V swap: which VLM layers does the action expert actually depend on?
 # See scripts/layer_importance.py. ~74 expert rollouts per clip, reusing one VLM forward.
 set -euo pipefail
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 CKPT="${CKPT:-$OUT/output_kd_4b_kvonly_e3_lcdrive/checkpoint-3196}"
 N="${N:-100}"
 # fix-only by default: fix_gain is the quantity you weight L_KV/L_block by; break_cost was

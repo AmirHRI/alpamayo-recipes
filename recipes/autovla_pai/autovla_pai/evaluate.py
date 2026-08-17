@@ -15,7 +15,7 @@ Usage (single-GPU)
     python -m autovla_pai.evaluate \
         --config  /data/sungyeonpark/autovla/ckpts/paper/nuplan/config.yaml \
         --ckpt    /data/sungyeonpark/autovla/ckpts/paper/nuplan/final.ckpt \
-        --pai_dir /data/datasets/physical_ai_av \
+        --pai_dir /temp/achahe/physical_ai_av \
         --chunk_ids 186-205
 
 Multi-GPU (4 GPUs) via torchrun
@@ -24,7 +24,7 @@ Multi-GPU (4 GPUs) via torchrun
         -m autovla_pai.evaluate \
         --config  /data/sungyeonpark/autovla/ckpts/paper/nuplan/config.yaml \
         --ckpt    /data/sungyeonpark/autovla/ckpts/paper/nuplan/final.ckpt \
-        --pai_dir /data/datasets/physical_ai_av \
+        --pai_dir /temp/achahe/physical_ai_av \
         --chunk_ids 186-205
 
 Interpreter: use the shared a1_sft venv from alpamayo1_sft

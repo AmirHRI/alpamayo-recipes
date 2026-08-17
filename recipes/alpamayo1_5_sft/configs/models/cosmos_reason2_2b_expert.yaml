@@ -1,6 +1,6 @@
 _target_: alpamayo1_5_sft.models.sft_alpamayo_r1.TrainableAlpamayoR1.from_pretrained_vlm
-vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
-alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+vlm_name_or_path: /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 # null → use the base 2B VLM (built from vlm_name_or_path) instead of a Stage-1
 # fine-tuned checkpoint. Point this at output_stage1_cosmos2b/checkpoint-N once
 # Stage 1 has been trained.

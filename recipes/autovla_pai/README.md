@@ -136,7 +136,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node 4 \
     -m autovla_pai.evaluate \
     --config  /data/sungyeonpark/autovla/ckpts/paper/nuplan/config.yaml \
     --ckpt    /data/sungyeonpark/autovla/ckpts/paper/nuplan/final.ckpt \
-    --pai_dir /data/datasets/physical_ai_av \
+    --pai_dir /temp/achahe/physical_ai_av \
     --chunk_ids 186-205 \
     --batch_size 4
 # ~8 min on 4 × H100
@@ -148,7 +148,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node 4 \
 python -m autovla_pai.evaluate \
     --config  /data/sungyeonpark/autovla/ckpts/paper/nuplan/config.yaml \
     --ckpt    /data/sungyeonpark/autovla/ckpts/paper/nuplan/final.ckpt \
-    --pai_dir /data/datasets/physical_ai_av \
+    --pai_dir /temp/achahe/physical_ai_av \
     --chunk_ids 186-205 \
     --batch_size 4
 ```
@@ -160,7 +160,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node 4 \
     -m autovla_pai.evaluate \
     --config  /data/sungyeonpark/autovla/ckpts/paper/plan_token/plan-0-config.yaml \
     --ckpt    /data/sungyeonpark/autovla/ckpts/paper/plan_token/plan-0.ckpt \
-    --pai_dir /data/datasets/physical_ai_av \
+    --pai_dir /temp/achahe/physical_ai_av \
     --chunk_ids 186-205
 ```
 

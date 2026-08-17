@@ -46,7 +46,7 @@ Usage::
 
     python -m alpamayo1_5_distill.scripts.generate_teacher_kv \
         config=cache_teacher_kv_lcdrive teacher=teacher_ar1_5_10b \
-        cache_root=/data/achahe/.../teacher_kv_lcdrive \
+        cache_root=/temp/achahe/.../teacher_kv_lcdrive \
         m=16 lam=0.1 eviction=rkv mode=generate \
         num_shards=8 shard=0
 """
