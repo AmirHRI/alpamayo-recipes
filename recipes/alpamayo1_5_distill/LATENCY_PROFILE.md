@@ -194,29 +194,25 @@ Harness check: 4cam lands at 0.7950 against the established 0.7893 for this abla
 
 ## Accuracy vs camera count — 4B student + its tuned 36-layer expert, n=1000
 
-`output_expert_on_student_lcdrive/checkpoint-1598`.
+`output_expert_on_student_lcdrive/checkpoint-1598` — harness check 1.4066 vs established 1.4044.
 
-| setting | cameras | min_ade | ade | mean_ade | max_ade | vs 4cam (min_ade) | z | worse on |
-|---|---|---|---|---|---|---|---|---|
-| **4cam** | L, wide, R, tele | **1.4066** | 2.5667 | 2.5337 | 4.0813 | — | — | — |
-| **3cam** | L, wide, R | **2.0997** | 3.5659 | 3.5263 | 5.5996 | +0.6930 | 11.5 | 64.9% |
-| **2cam** | wide, tele | **1.6512** | 3.2990 | 3.3933 | 5.9904 | +0.2445 | 5.2 | 59.4% |
-| **1cam** | wide | **2.5844** | 4.7588 | 4.7977 | 8.4451 | +1.1778 | 17.2 | 77.0% |
-
-Harness check: 4cam lands at 1.4066 against the established 1.4044.
+| setting | min_ade | ade | mean_ade | max_ade | vs 4cam | z |
+|---|---|---|---|---|---|---|
+| 4cam | 1.4066 | 2.5667 | 2.5337 | 4.0813 | — | — |
+| 3cam | 2.0997 | 3.5659 | 3.5263 | 5.5996 | +0.6930 | 11.5 |
+| 2cam | 1.6512 | 3.2990 | 3.3933 | 5.9904 | +0.2445 | 5.2 |
+| 1cam | 2.5844 | 4.7588 | 4.7977 | 8.4451 | +1.1778 | 17.2 |
 
 ## Accuracy vs camera count — 2B student + its tuned 28-layer expert, n=1000
 
-`output_eos_2b_lcdrive/checkpoint-1598`.
+`output_eos_2b_lcdrive/checkpoint-1598` — harness check 2.3611 vs established 2.3668.
 
-| setting | cameras | min_ade | ade | mean_ade | max_ade | vs 4cam (min_ade) | z | worse on |
-|---|---|---|---|---|---|---|---|---|
-| **4cam** | L, wide, R, tele | **2.3611** | 3.7980 | 3.8578 | 6.1085 | — | — | — |
-| **3cam** | L, wide, R | **2.4470** | 4.1863 | 4.2215 | 7.1395 | +0.0859 | 2.2 | 55.1% |
-| **2cam** | wide, tele | **2.7861** | 4.8798 | 4.7743 | 8.2385 | +0.4250 | 7.6 | 66.8% |
-| **1cam** | wide | **4.9886** | 9.6678 | 9.7865 | 16.0566 | +2.6275 | 17.4 | 83.2% |
-
-Harness check: 4cam lands at 2.3611 against the established 2.3668.
+| setting | min_ade | ade | mean_ade | max_ade | vs 4cam | z |
+|---|---|---|---|---|---|---|
+| 4cam | 2.3611 | 3.7980 | 3.8578 | 6.1085 | — | — |
+| 3cam | 2.4470 | 4.1863 | 4.2215 | 7.1395 | +0.0859 | 2.2 |
+| 2cam | 2.7861 | 4.8798 | 4.7743 | 8.2385 | +0.4250 | 7.6 |
+| 1cam | 4.9886 | 9.6678 | 9.7865 | 16.0566 | +2.6275 | 17.4 |
 
 ## Where the results are saved
 
