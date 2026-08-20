@@ -47,6 +47,7 @@ AUX_LOSS_KEYS = (
     "kv_loss_traj",
     "block_loss",
     "freerun_loss",
+    "field_loss",
 )
 
 #: Parameters excluded from weight decay on top of HF's own bias/norm exclusions.

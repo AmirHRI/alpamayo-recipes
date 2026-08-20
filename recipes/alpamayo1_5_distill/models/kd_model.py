@@ -54,6 +54,8 @@ at 4 GPUs x bs=2.
 
 from __future__ import annotations
 
+import contextlib
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,13 +69,58 @@ from transformers.utils import ModelOutput
 from alpamayo_r1.models.base_model import IGNORE_INDEX
 from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA
 from alpamayo1_5_distill.models.kd_losses import assert_kd_compatible, logit_kd_loss
-from alpamayo1_5_distill.models.block_losses import block_output_loss, rotate_keys
+from alpamayo1_5_distill.models.block_losses import (
+    block_output_loss,
+    block_span_output,
+    rotate_keys,
+)
 from alpamayo1_5_distill.models.expert_holder import FrozenExpert
 from alpamayo1_5_distill.models.kv_distill import (
     KVProjectorBank,
     build_layer_map,
     kv_matching_loss,
 )
+
+
+
+class _Phase:
+    """CUDA-synced wall-clock per forward phase, opt-in via KD_TIMERS=1.
+
+    ⚠️ Synchronises, so it is a DIAGNOSTIC and must stay off in real runs: without the sync
+    every phase but the last would report near-zero, since the kernels are still queued.
+    Reports the mean over a window, because per-step numbers swing with sequence length.
+    """
+
+    on = os.environ.get("KD_TIMERS") == "1"
+    acc: dict = {}
+    n = 0
+
+    @staticmethod
+    @contextlib.contextmanager
+    def t(name):
+        if not _Phase.on:
+            yield
+            return
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            torch.cuda.synchronize()
+            _Phase.acc[name] = _Phase.acc.get(name, 0.0) + (time.perf_counter() - t0)
+
+    @staticmethod
+    def report(every=24):
+        if not _Phase.on:
+            return
+        _Phase.n += 1
+        if _Phase.n % every:
+            return
+        tot = sum(_Phase.acc.values())
+        parts = " ".join(f"{k} {v / _Phase.n:.3f}s ({100 * v / max(tot, 1e-9):.0f}%)"
+                         for k, v in sorted(_Phase.acc.items(), key=lambda kv: -kv[1]))
+        print(f"[timers] per micro-batch over {_Phase.n}: total {tot / _Phase.n:.3f}s | {parts}",
+              flush=True)
 
 
 @dataclass
@@ -92,6 +139,7 @@ class KDVLAOutput(ModelOutput):
     kv_loss: torch.FloatTensor | None = None
     block_loss: torch.FloatTensor | None = None
     freerun_loss: torch.FloatTensor | None = None
+    field_loss: torch.FloatTensor | None = None
     kv_loss_vision: torch.FloatTensor | None = None
     kv_loss_text: torch.FloatTensor | None = None
     kv_loss_traj: torch.FloatTensor | None = None
@@ -166,6 +214,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
     block_timestep: str = "zero"
     block_freerun_weight: float = 0.0
     block_freerun_layers: int = 0
+    field_weight: float = 0.0
     kd_weight: float = 0.0
     kd_temperature: float = 1.0
     kv_weight: float = 0.0
@@ -194,6 +243,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
         block_timestep: str = "zero",
         block_freerun_weight: float = 0.0,
         block_freerun_layers: int = 0,
+        field_weight: float = 0.0,
         kd_weight: float = 0.0,
         kd_temperature: float = 1.0,
         kv_weight: float = 0.0,
@@ -243,6 +293,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # L_block still supervises all 36 layers, though at ~4% of the gradient when
         # block_freerun_weight=1.0.
         self.block_freerun_layers = int(block_freerun_layers)
+        self.field_weight = float(field_weight)
         self._beta_dist = (
             torch.distributions.beta.Beta(torch.tensor(1.5), torch.tensor(1.0))
             if block_timestep == "beta" else None
@@ -650,6 +701,147 @@ class KDReasoningVLA(TrainableReasoningVLA):
                       f"fr_last {fr[-1]:.4e} ratio {fr[-1] / max(sum(tf) / len(tf), 1e-12):.1f}",
                       flush=True)
 
+        # ⚠️ DIAGNOSTIC, opt-in via BLOCK_SPAN=n. Does an objective that teacher-forces only
+        # every n-th layer SEE the compounding that L_block (n=1) is blind to?
+        # For each disjoint span [l, l+n): drive block l with the teacher's h^T_l, chain the
+        # next n-1 blocks on the STUDENT's cache, and compare to the teacher's h^T_{l+n}.
+        # Read it against two references, both printed:
+        #   sum1  = the n single-layer terms L_block already pays over the same layers.
+        #           span >> sum1 means the chain amplifies -- error the objective cannot see.
+        #   span == sum1 means errors merely add, and spans buy nothing over n=1.
+        # ⚠️ self-test built in: BLOCK_SPAN=1 must reproduce the n=1 numbers exactly, since
+        # block_span_output with one block IS block_output_loss.
+        # BLOCK_SPAN takes a LIST ("1,2,4,7,14"): one model load, the whole curve. A single
+        # span length cannot distinguish "errors add" from "errors amplify" -- only the trend
+        # in n can, and loading the 10B teacher costs ~5 min per run.
+        span_ns = [int(x) for x in os.environ.get("BLOCK_SPAN", "").split(",") if x.strip()]
+        if span_ns:
+            with torch.no_grad():
+                rel = lambda a, b: float((a.float() - b.float()).pow(2).mean()
+                                         / b.float().pow(2).mean().clamp_min(1e-9))
+                singles = [float(block_output_loss(
+                    expert.expert.layers[l], captured[l]["h_in"], captured[l]["y_out"],
+                    s_k[l], s_v[l], dict(captured[l]["kwargs"]))) for l in range(n_layers)]
+                for span_n in span_ns:
+                    print(f"[span{span_n}] start  span_err     sum1        span/sum1", flush=True)
+                    tot_s = tot_1 = 0.0
+                    for l0 in range(0, n_layers - span_n + 1, span_n):
+                        idx = list(range(l0, l0 + span_n))
+                        y = block_span_output(
+                            [expert.expert.layers[i] for i in idx],
+                            captured[l0]["h_in"],
+                            [s_k[i] for i in idx], [s_v[i] for i in idx],
+                            [dict(captured[i]["kwargs"]) for i in idx])
+                        e_span = rel(y, captured[idx[-1]]["y_out"])
+                        e_sum1 = sum(singles[i] for i in idx)
+                        tot_s += e_span; tot_1 += e_sum1
+                        print(f"[span{span_n}] {l0:>4}  {e_span:.4e}  {e_sum1:.4e}  "
+                              f"{e_span / max(e_sum1, 1e-12):>8.2f}", flush=True)
+                    print(f"[span{span_n}] TOTAL span {tot_s:.4e}  sum1 {tot_1:.4e}  "
+                          f"amplification {tot_s / max(tot_1, 1e-12):.2f}", flush=True)
+
+        # ⚠️ DIAGNOSTIC, opt-in via BLOCK_COSINE=1. Is the teacher-forced MSE dominated by a
+        # SCALE error or a DIRECTION error? Exactly, not by intuition:
+        #     ||a-b||^2/||b||^2 = 1 + r^2 - 2 r cos      with r = ||a||/||b||
+        # so cos ~ 1 with r != 1 means the student's block output points the right way and is
+        # mis-scaled (an MSE objective is then fighting a gain, and a cosine term adds
+        # nothing); cos < 1 means the direction itself is wrong, which is what a cosine or
+        # angular objective would target and relative MSE under-weights when r is small.
+        # `pred` re-derives the MSE from (r, cos): it must match `mse` to ~1e-3, and if it
+        # does not, one of the three is being computed on a different tensor than assumed.
+        # Built-in control: the TEACHER's own cache must give cos = 1.000, r = 1.000, mse ~ 0.
+        if os.environ.get("BLOCK_COSINE") == "1":
+            with torch.no_grad():
+                def stats(y_s, y_t):
+                    a = y_s.float().flatten(0, -2)      # [B*T, hidden], per-token rows
+                    b = y_t.float().flatten(0, -2)
+                    cos = torch.nn.functional.cosine_similarity(a, b, dim=-1).mean()
+                    r = (a.norm(dim=-1) / b.norm(dim=-1).clamp_min(1e-9)).mean()
+                    mse = (a - b).pow(2).mean() / b.pow(2).mean().clamp_min(1e-9)
+                    return float(mse), float(cos), float(r)
+
+                def run(l, k_list, v_list):
+                    return block_span_output(
+                        [expert.expert.layers[l]], captured[l]["h_in"],
+                        [k_list[l]], [v_list[l]], [dict(captured[l]["kwargs"])])
+
+                print("[cos] layer      mse     cos      r    pred_mse", flush=True)
+                acc = []
+                for l in range(n_layers):
+                    m, c, r = stats(run(l, s_k, s_v), captured[l]["y_out"])
+                    acc.append((m, c, r))
+                    if l % 4 == 0:
+                        print(f"[cos] {l:>5} {m:.3e} {c:.5f} {r:.5f}  "
+                              f"{1 + r * r - 2 * r * c:.3e}", flush=True)
+                mm = sum(a[0] for a in acc) / len(acc)
+                mc = sum(a[1] for a in acc) / len(acc)
+                mr = sum(a[2] for a in acc) / len(acc)
+                im, ic, ir = stats(run(0, t_k, t_v), captured[0]["y_out"])
+                print(f"[cos] MEAN mse {mm:.4e} cos {mc:.5f} r {mr:.5f}", flush=True)
+                print(f"[cos] CONTROL teacher-cache layer0: mse {im:.3e} cos {ic:.5f} "
+                      f"r {ir:.5f}   (must be ~0 / 1 / 1)", flush=True)
+
+        # ⚠️ DIAGNOSTIC, opt-in via BLOCK_ODE=1. The span probe asked whether error compounds
+        # along LAYERS (answer: barely -- ~1.2x, and the deep half contracts). This asks the
+        # same question along the DENOISING axis, where the mechanism is different: all 10
+        # Euler steps read the SAME student cache, so a biased field error accumulates
+        # coherently instead of cancelling.
+        #   e_step[k] = field error at the TEACHER's x_k  (teacher-forced along the ODE)
+        #   e_final   = ||x^S_final - x^T_final||^2 / ||x^T_final||^2  (student integrates itself)
+        #   amplification = e_final / sum_k e_step
+        # `bias` is the mean cosine between consecutive steps' error vectors: ~1 means the
+        # error points the same way every step (integrates coherently, rollout training would
+        # help), ~0 means it is step-to-step noise (it partly cancels, rollout buys little).
+        if os.environ.get("BLOCK_ODE") == "1":
+            with torch.no_grad():
+                dif = expert.diffusion
+                n_act = expert.n_action_tokens
+
+                def field(x, t, k_list, v_list):
+                    c = DynamicCache()
+                    for i in range(n_layers):
+                        c.update(k_list[i], v_list[i], i, {})
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        emb = expert.action_in_proj(x, t)
+                    emb = emb.to(embeds.dtype)
+                    if emb.dim() == 2:
+                        emb = emb.view(x.shape[0], n_act, -1)
+                    out = expert.expert(inputs_embeds=emb, attention_mask=e_mask,
+                                        position_ids=pos, past_key_values=c, use_cache=True)
+                    h = out.last_hidden_state[:, -n_act:]
+                    with torch.autocast("cuda", dtype=torch.bfloat16):
+                        return expert.action_out_proj(h).view(-1, *expert.x_dims)
+
+                errs, e_step = [], []
+
+                def teacher_step(x, t):
+                    f_t = field(x, t, t_k, t_v)
+                    f_s = field(x, t, s_k, s_v)
+                    e_step.append(float((f_s.float() - f_t.float()).pow(2).mean()
+                                        / f_t.float().pow(2).mean().clamp_min(1e-9)))
+                    errs.append((f_s.float() - f_t.float()).flatten())
+                    return f_t                       # integrate along the TEACHER's path
+
+                b = embeds.shape[0]
+                dev = embeds.device
+                torch.manual_seed(1234)              # identical initial noise for both runs
+                x_t = dif.sample(batch_size=b, step_fn=teacher_step, device=dev,
+                                 return_all_steps=False)
+                torch.manual_seed(1234)
+                x_s = dif.sample(batch_size=b, step_fn=lambda x, t: field(x, t, s_k, s_v),
+                                 device=dev, return_all_steps=False)
+                e_final = float((x_s.float() - x_t.float()).pow(2).mean()
+                                / x_t.float().pow(2).mean().clamp_min(1e-9))
+                tot = sum(e_step)
+                cs = [float(torch.nn.functional.cosine_similarity(a, b_, dim=0))
+                      for a, b_ in zip(errs, errs[1:])]
+                print(f"[ode] steps {len(e_step)}  per-step " +
+                      " ".join(f"{e:.2e}" for e in e_step[:5]) + " ...", flush=True)
+                print(f"[ode] sum_steps {tot:.4e}  e_final {e_final:.4e}  "
+                      f"amplification {e_final / max(tot, 1e-12):.2f}  "
+                      f"bias(cos between consecutive step errors) {sum(cs) / max(len(cs), 1):.3f}",
+                      flush=True)
+
         # ⚠️ SELF-TEST, opt-in via BLOCK_SELFTEST=1. A finite, falling loss is NOT evidence
         # that it measures cache fidelity -- that gap has produced retractions here. Feeding
         # the TEACHER's own cache must give ~0; a layer-shuffled cache must be clearly worse
@@ -723,7 +915,80 @@ class KDReasoningVLA(TrainableReasoningVLA):
             tgt = captured[n_layers - 1]["y_out"]
             fr_term = ((h_s.float() - tgt.float()).pow(2).mean()
                        / tgt.float().pow(2).mean().clamp_min(1e-6))
-        return _sweep(s_k, s_v), fr_term
+
+        # ---- L_field: match the VELOCITY, not just the hidden states --------------------
+        # ⚠️ MEASURED motivation, not a hunch. The hidden states agree to 3.2% RMS per layer
+        # while the velocity the trajectory actually integrates is 30% off (BLOCK_ODE probe),
+        # because `action_out_proj` reads one narrow projection of the residual stream and
+        # L_block spends its capacity uniformly over directions the head discards.
+        # Same chained forward as the freerun arm -- checkpointed per layer, gradient reaching
+        # the VLM only through the student's cache -- but scored after norm + out_proj.
+        # ⚠️ Deep layers get this gradient directly while shallow ones receive it through the
+        # CONTRACTIVE deep half (measured 0.79 across layers 14-27), so this is meant to run
+        # ALONGSIDE L_block, which supplies the dense per-layer signal, not to replace it.
+        field_term = None
+        if self.field_weight > 0:
+            fcache = [None] * n_layers
+
+            def _field_layer(h, l_idx):
+                l = int(l_idx)
+                cache = DynamicCache()
+                cache.update(s_k[l], s_v[l], 0, {})
+                blk = expert.expert.layers[l]
+                orig = blk.self_attn.layer_idx
+                blk.self_attn.layer_idx = 0
+                try:
+                    o = blk(h, past_key_values=cache, use_cache=True,
+                            **dict(captured[l]["kwargs"]))
+                finally:
+                    blk.self_attn.layer_idx = orig
+                return o[0] if isinstance(o, tuple) else o
+
+            h_f = embeds
+            with torch.autocast("cuda", enabled=True):
+                for _l in range(n_layers):
+                    h_f = torch.utils.checkpoint.checkpoint(
+                        _field_layer, h_f, torch.tensor(_l), use_reentrant=False)
+                v_s = expert.velocity(h_f)
+                with torch.no_grad():
+                    # ⚠️ FREE: the teacher's final block output is already captured, so the
+                    # target costs one norm + one head call, not a second expert forward.
+                    v_t = expert.velocity(captured[n_layers - 1]["y_out"])
+            # ⚠️ PLAIN MSE, not the relative form the other block terms use, and not by
+            # analogy -- `FlowMatching.compute_loss_from_pred` is
+            # `mse_loss(x - noise, pred)`, so this is the scale the expert was actually
+            # trained in, and the velocity target is O(1) by construction (x normalised,
+            # noise ~ N(0,1)) so it needs no per-batch rescaling.
+            # MEASURED reason to avoid the relative form: dividing by ||v_T||^2 exploded to
+            # 10.75 on a batch where the teacher's velocity was near zero -- a stopped or
+            # slow ego, i.e. precisely the clips where the trajectory is trivial and this
+            # term should count for LEAST. Relative normalisation inverts that weighting.
+            field_term = torch.nn.functional.mse_loss(
+                v_s.float(), v_t.float().detach())
+
+            # ⚠️ SELF-TEST: the same chain driven by the TEACHER's cache must give ~0. This is
+            # what catches a norm/head convention error, which otherwise yields a finite,
+            # falling loss that measures nothing -- exactly how freerun_loss sat at 0.999.
+            if os.environ.get("BLOCK_SELFTEST") == "1":
+                with torch.no_grad():
+                    h_i = embeds
+                    for _l in range(n_layers):
+                        c = DynamicCache(); c.update(t_k[_l], t_v[_l], 0, {})
+                        blk = expert.expert.layers[_l]
+                        orig = blk.self_attn.layer_idx
+                        blk.self_attn.layer_idx = 0
+                        try:
+                            o = blk(h_i, past_key_values=c, use_cache=True,
+                                    **dict(captured[_l]["kwargs"]))
+                        finally:
+                            blk.self_attn.layer_idx = orig
+                        h_i = o[0] if isinstance(o, tuple) else o
+                    v_i = expert.velocity(h_i)
+                    ident = float(torch.nn.functional.mse_loss(v_i.float(), v_t.float()))
+                print(f"[field-selftest] identity(teacher cache) {ident:.3e} "
+                      f"student {float(field_term):.4f}   (identity must be ~0)", flush=True)
+
+        return _sweep(s_k, s_v), fr_term, field_term
 
     def forward(
         self,
@@ -766,7 +1031,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
             # output shape stays valid. Passing `labels` additionally makes HF compute its
             # OWN cross-entropy internally, which this forward then recomputes and discards.
             want_logits = self.ce_weight > 0 or self.kd_weight > 0
-            outputs = self.vlm(
+            with _Phase.t("student_prefill"):
+              outputs = self.vlm(
                 input_ids=input_ids,
                 labels=labels if self.ce_weight > 0 else None,
                 output_hidden_states=want_hidden,
@@ -778,7 +1044,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 use_cache=False,
                 **({} if want_logits else {"logits_to_keep": 1}),
                 **tokenized_data,
-            )
+              )
         finally:
             if rope_handle is not None:
                 rope_handle.remove()
@@ -821,12 +1087,12 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # gradient probe can weight each one as it enters the total.
         attached: dict[str, torch.Tensor] = {} if ce_loss is None else {"ce": ce_loss}
 
-        kd_loss = kv_loss = block_loss = fr_loss = None
+        kd_loss = kv_loss = block_loss = fr_loss = field_loss = None
         region_losses: dict[str, torch.Tensor] = {}
 
         if need_teacher:
             self._place_teacher(input_ids.device, next(self.vlm.parameters()).dtype)
-            with torch.no_grad():
+            with torch.no_grad(), _Phase.t("teacher_prefill"):
                 t_out = self.teacher.vlm(
                     input_ids=input_ids,
                     output_hidden_states=want_hidden,
@@ -858,7 +1124,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 self._ensure_expert(
                     self._block_ckpt, input_ids.device, next(self.vlm.parameters()).dtype
                 )
-                s_kv = recompute_kv(self._text_model(), outputs.hidden_states, h, d)
+                with _Phase.t('recompute_kv'):
+                    s_kv = recompute_kv(self._text_model(), outputs.hidden_states, h, d)
                 with torch.no_grad():
                     t_kv_b = recompute_kv(self._teacher_text_model(), t_out.hidden_states, h, d)
                 # ⚠️ Depth mismatch is EXPECTED with a shallow student: the expert's layer
@@ -913,14 +1180,18 @@ class KDReasoningVLA(TrainableReasoningVLA):
                              "ego_history_rot": ego_history_rot,
                              "ego_future_xyz": ego_future_xyz,
                              "ego_future_rot": ego_future_rot}
-                block_loss, fr_loss = self._block_loss(
-                    s_kv, t_kv_b, rope, traj_mask,
-                    tokenized_data.get("attention_mask"), _traj)
+                with _Phase.t("block+field"):
+                    block_loss, fr_loss, field_loss = self._block_loss(
+                        s_kv, t_kv_b, rope, traj_mask,
+                        tokenized_data.get("attention_mask"), _traj)
                 total_loss = total_loss + self.block_weight * block_loss
                 attached["block"] = block_loss
                 if fr_loss is not None:
                     total_loss = total_loss + self.block_freerun_weight * fr_loss
                     attached["freerun"] = fr_loss
+                if field_loss is not None:
+                    total_loss = total_loss + self.field_weight * field_loss
+                    attached["field"] = field_loss
                 del s_kv, t_kv_b
 
             # ---- lambda_kv: match the LLM's K/V at every position -------------
@@ -956,6 +1227,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
 
         self.last_loss_terms = attached if self.keep_loss_terms else None
 
+        _Phase.report()
         return KDVLAOutput(
             loss=total_loss,
             logits=outputs.logits,
@@ -964,6 +1236,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
             kv_loss=None if kv_loss is None else kv_loss.detach(),
             block_loss=None if block_loss is None else block_loss.detach(),
             freerun_loss=None if fr_loss is None else fr_loss.detach(),
+            field_loss=None if field_loss is None else field_loss.detach(),
             kv_loss_vision=region_losses.get("vision"),
             kv_loss_text=region_losses.get("text"),
             kv_loss_traj=region_losses.get("traj"),

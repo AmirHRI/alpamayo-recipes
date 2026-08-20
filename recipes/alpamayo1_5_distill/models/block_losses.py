@@ -132,3 +132,35 @@ def block_output_loss(
         scale = y_teacher.float().detach().pow(2).mean().clamp_min(1e-6)
         diff = diff / scale
     return diff
+
+
+def block_span_output(
+    blocks: list[torch.nn.Module],
+    h_in: torch.Tensor,
+    student_k: list[torch.Tensor],
+    student_v: list[torch.Tensor],
+    layer_kwargs: list[dict],
+) -> torch.Tensor:
+    """Chain ``len(blocks)`` expert blocks on the STUDENT's cache from one teacher-forced entry.
+
+    The span generalisation of :func:`block_output_loss`: teacher-force only ``h_in`` (the
+    span ENTRY) and let each block feed the next, so an error injected at the first layer is
+    carried -- and possibly amplified -- by the rest of the span. At ``len(blocks) == 1`` this
+    is exactly what ``block_output_loss`` evaluates, which is the self-test worth running.
+
+    ⚠️ Each block gets its OWN fresh single-layer cache seeded with that layer's prefix, and
+    its OWN captured kwargs. Reusing one DynamicCache across the span would let layer l+1
+    attend to the action K/V that layer l appended -- the expert's layers do not share a cache
+    slot, and that would silently change what is being measured.
+
+    Returns:
+        The span's output, ``B_{l+n-1}(...B_l(h_in)...)``.
+    """
+    h = h_in
+    for blk, k, v, kw in zip(blocks, student_k, student_v, layer_kwargs):
+        cache = DynamicCache()
+        cache.update(k, v, 0, {})
+        with _as_layer0(blk):
+            out = blk(h, past_key_values=cache, use_cache=True, **kw)
+        h = out[0] if isinstance(out, tuple) else out
+    return h

@@ -37,7 +37,30 @@ OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 TEACHER=/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 COSMOS=/data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
 
-ARM="${ARM:?set ARM=teacher|ce|kd|kv|cekv|kvonly|<arm>_eN}"
+ARM="${ARM:?set ARM=teacher|ce|kd|kv|cekv|kvonly|block2b|<arm>_eN}"
+# ARM=block2b is the 2B student on the 28-layer PRUNED expert: a different student tower, a
+# different eval config, and a different output_dir prefix. Its expert is built 28 deep (depth
+# follows the VLM's text config) and initialised by the load-time remap in
+# _load_teacher_non_vlm, which REQUIRES PRUNE_EXPERT_LAYERS -- exported here rather than left
+# to the caller, because a missing pin would raise mid-load after ~5 min of weight loading.
+MODEL_TAG=4b
+CONFIG_NAME=sft_eval_stitched_4b_lcdrive
+if [[ "$ARM" == block2b* ]]; then
+    MODEL_TAG=2b
+    CONFIG_NAME=sft_eval_stitched_2b_prunedexpert_lcdrive
+    export PRUNE_EXPERT_LAYERS="${PRUNE_EXPERT_LAYERS:-4,10,13,15,19,25,27,34}"
+fi
+# PIN_GPU=3 -> run on that PHYSICAL card. ⚠️ Must NOT go through srun: slurm re-derives
+# CUDA_VISIBLE_DEVICES from the step's GPU binding after --export is processed, so the pin is
+# discarded and the job silently takes cuda:0 (this cost a co-tenant's card once -- see
+# slurm_train_kd.sh). Launching torchrun directly keeps the allocation and the pin.
+LAUNCH=(srun)
+if [[ -n "${PIN_GPU:-}" ]]; then
+    export CUDA_DEVICE_ORDER=PCI_BUS_ID
+    export CUDA_VISIBLE_DEVICES="$PIN_GPU"
+    LAUNCH=()
+    echo "[slurm] PIN_GPU=$PIN_GPU -> CUDA_VISIBLE_DEVICES=$PIN_GPU, no srun"
+fi
 CKPT="${CKPT:-}"   # e.g. checkpoint-3196; default is the newest
 MAX_EVAL_STEPS="${MAX_EVAL_STEPS:--1}"
 BS="${BS:-4}"
@@ -45,7 +68,10 @@ BS="${BS:-4}"
 cd "$RECIPE_DIR"
 export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-MASTER_PORT=$((29840 + SLURM_JOB_ID % 20000))
+# ${SLURM_JOB_ID:-$$}: this script is also run OUTSIDE slurm (with PIN_GPU) whenever a
+# long training job holds the whole node and a fresh sbatch would only pend. Under `set -u`
+# the bare SLURM_JOB_ID would abort immediately there.
+MASTER_PORT=$((29840 + ${SLURM_JOB_ID:-$$} % 20000))
 
 EXTRA=()
 if [[ "$ARM" == "teacher" ]]; then
@@ -61,20 +87,20 @@ else
         # Explicit checkpoint. Needed whenever a run is STILL TRAINING: the newest-checkpoint
         # default would silently pick up a later epoch mid-sweep, so two "epoch 2" numbers
         # could come from different weights.
-        CKPT="$OUT_DIR/output_kd_4b_${ARM}_lcdrive/$CKPT"
+        CKPT="$OUT_DIR/output_kd_${MODEL_TAG}_${ARM}_lcdrive/$CKPT"
         [[ -d "$CKPT" ]] || { echo "[slurm] no such checkpoint: $CKPT" >&2; exit 1; }
     else
-        CKPT=$(ls -d "$OUT_DIR/output_kd_4b_${ARM}_lcdrive"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
+        CKPT=$(ls -d "$OUT_DIR/output_kd_${MODEL_TAG}_${ARM}_lcdrive"/checkpoint-* 2>/dev/null | sort -t- -k2 -n | tail -1)
         [[ -z "$CKPT" ]] && { echo "[slurm] no checkpoint for ARM=$ARM" >&2; exit 1; }
     fi
 fi
-TAG="stitch_4b_${ARM}_$(basename "$CKPT")"
+TAG="stitch_${MODEL_TAG}_${ARM}_$(basename "$CKPT")"
 echo "[slurm] ARM=$ARM ckpt=$CKPT -> $OUT_DIR/$TAG.json"
 
-srun "$VENV/torchrun" --nproc_per_node 1 --master_port "$MASTER_PORT" \
+"${LAUNCH[@]}" "$VENV/torchrun" --nproc_per_node 1 --master_port "$MASTER_PORT" \
     -m alpamayo1_5_sft.evaluate_hf \
     --config-path pkg://alpamayo1_5_distill/configs \
-    --config-name sft_eval_stitched_4b_lcdrive \
+    --config-name "$CONFIG_NAME" \
     ++model.attn_implementation=sdpa \
     ++evaluate.eval_ckpt="$CKPT" \
     ++evaluate.max_eval_steps="$MAX_EVAL_STEPS" \

@@ -144,6 +144,21 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    blockfield)
+        # L_block + L_field on the 2B/pruned-expert stack. L_field matches the VELOCITY
+        # (action_out_proj output), which the BLOCK_ODE probe measured at 30% RMS error while
+        # the hidden states L_block matches are only 3.2% off per layer -- the head reads one
+        # narrow projection that the uniform hidden-state loss under-weights.
+        # ⚠️ Runs ALONGSIDE L_block, not instead of it: L_field's gradient reaches shallow
+        # layers only through the deep half, which is contractive (0.79 across layers 14-27),
+        # so on its own it would under-train exactly where L_block is strongest.
+        # FIELD_W calibrates the mix; 1.0 is a starting point, not a measured optimum.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.field_weight="${FIELD_W:-1.0}") ;;
     blockfr)
         # L_block + L_freerun: keep the teacher-forced per-layer term AND add a term on the
         # student's OWN chain at the final layer, which is the only place compounding shows.
