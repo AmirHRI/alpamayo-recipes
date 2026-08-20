@@ -104,11 +104,12 @@ class FrozenExpert(nn.Module):
             in_features=expert_config.hidden_size,
             out_features=self.action_space.get_action_space_dims()[-1],
         )
+        # The sampler holds NO parameters and is needed by both the ODE probe and the rollout
+        # objective (for its t grid and step count), so it is always built.
+        self.diffusion = instantiate(
+            cfg["diffusion_cfg"], x_dims=self.action_space.get_action_space_dims()
+        )
         self._ode = os.environ.get("BLOCK_ODE") == "1"
-        if self._ode:      # sampler: probe-only, holds no parameters
-            self.diffusion = instantiate(
-                cfg["diffusion_cfg"], x_dims=self.action_space.get_action_space_dims()
-            )
 
         self._load(checkpoint_path)
         self.eval()
@@ -186,6 +187,25 @@ class FrozenExpert(nn.Module):
         """
         h = self.expert.norm(h_last)
         return self.action_out_proj(h).view(-1, *self.x_dims)
+
+    def noisy_x(self, traj_data: dict, t: torch.Tensor, device):
+        """The raw noisy ACTION at ``t`` -- the sampler's state, before ``action_in_proj``.
+
+        ``noisy_action_embeds`` returns the projected embeddings; a rollout needs the state
+        itself so it can be advanced by ``x + dt * v``. Same interpolation, same convention:
+        ``noisy_x = t * x + (1 - t) * noise``.
+        """
+        action = self.action_space.traj_to_action(
+            traj_history_xyz=traj_data["ego_history_xyz"],
+            traj_history_rot=traj_data["ego_history_rot"],
+            traj_future_xyz=traj_data["ego_future_xyz"],
+            traj_future_rot=traj_data["ego_future_rot"],
+        ).reshape(-1, *self.x_dims).to(device=device, dtype=torch.float32)
+        noise = torch.randn(action.shape, device=device, dtype=torch.float32)
+        tt = t.to(device=device, dtype=torch.float32)
+        while tt.dim() < action.dim():
+            tt = tt.unsqueeze(-1)
+        return tt * action + (1.0 - tt) * noise
 
     def noisy_action_embeds(self, traj_data: dict, t: torch.Tensor, device, dtype):
         """Action embeddings at a SAMPLED point on the flow, built from the GT trajectory.

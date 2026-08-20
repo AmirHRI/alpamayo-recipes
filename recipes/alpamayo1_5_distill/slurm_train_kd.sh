@@ -144,6 +144,15 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    block2b2cam)
+        # 2B student + pruned expert, L_block with sampled t, but TWO cameras (front-wide +
+        # telephoto, ~1577 tokens instead of 3073) and the ViT at the FULL learning rate.
+        # See configs/sft_kd_cosmos2b_2cam_lcdrive.yaml for why both.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
     blockfield)
         # L_block + L_field on the 2B/pruned-expert stack. L_field matches the VELOCITY
         # (action_out_proj output), which the BLOCK_ODE probe measured at 30% RMS error while

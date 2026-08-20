@@ -140,6 +140,7 @@ class KDVLAOutput(ModelOutput):
     block_loss: torch.FloatTensor | None = None
     freerun_loss: torch.FloatTensor | None = None
     field_loss: torch.FloatTensor | None = None
+    roll_loss: torch.FloatTensor | None = None
     kv_loss_vision: torch.FloatTensor | None = None
     kv_loss_text: torch.FloatTensor | None = None
     kv_loss_traj: torch.FloatTensor | None = None
@@ -215,6 +216,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
     block_freerun_weight: float = 0.0
     block_freerun_layers: int = 0
     field_weight: float = 0.0
+    roll_weight: float = 0.0
+    roll_steps: int = 2
     kd_weight: float = 0.0
     kd_temperature: float = 1.0
     kv_weight: float = 0.0
@@ -244,6 +247,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
         block_freerun_weight: float = 0.0,
         block_freerun_layers: int = 0,
         field_weight: float = 0.0,
+        roll_weight: float = 0.0,
+        roll_steps: int = 2,
         kd_weight: float = 0.0,
         kd_temperature: float = 1.0,
         kv_weight: float = 0.0,
@@ -294,6 +299,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # block_freerun_weight=1.0.
         self.block_freerun_layers = int(block_freerun_layers)
         self.field_weight = float(field_weight)
+        self.roll_weight = float(roll_weight)
+        self.roll_steps = int(roll_steps)
         self._beta_dist = (
             torch.distributions.beta.Beta(torch.tensor(1.5), torch.tensor(1.0))
             if block_timestep == "beta" else None
@@ -701,6 +708,69 @@ class KDReasoningVLA(TrainableReasoningVLA):
                       f"fr_last {fr[-1]:.4e} ratio {fr[-1] / max(sum(tf) / len(tf), 1e-12):.1f}",
                       flush=True)
 
+        # ⚠️ DIAGNOSTIC, opt-in via BLOCK_TSWEEP=1. Is the objective BLIND TO PART OF THE
+        # DENOISING TRAJECTORY? Training draws one t per step from the teacher's Beta(1.5,1)
+        # schedule (t = 0.999 - b*0.999, mass concentrated at low-to-mid t), while inference
+        # walks t on a UNIFORM grid, linspace(0,1,n_steps+1). If the per-layer error is largest
+        # where the training density is lowest -- near t -> 1, the final steps that actually set
+        # the trajectory -- the loss is systematically under-weighting the steps that matter and
+        # no amount of training on it will fix them.
+        # Reports, at each t the sampler visits: the block loss, the ZERO-cache floor at that t
+        # (the level below which the loss carries no information), and the training density.
+        # ⚠️ Everything is recomputed per t: the teacher's h^T_l depend on t through the noisy
+        # action embeds, so reusing the captured states from one t would compare against the
+        # wrong target -- silently, since the shapes match.
+        if os.environ.get("BLOCK_TSWEEP") == "1" and traj_data is not None:
+            with torch.no_grad():
+                n_steps = 10
+                grid = [i / n_steps for i in range(n_steps + 1)]
+                # Beta(1.5,1) density of the MAPPED t, for the same grid: b = 1 - t/0.999,
+                # p(b) = 1.5 * b^0.5, and |db/dt| = 1/0.999 is constant so it cancels in a
+                # ratio -- reported normalised to its own max, which is what "under-weighted"
+                # has to be read against.
+                dens = [1.5 * max(1.0 - t / 0.999, 0.0) ** 0.5 for t in grid]
+                dmax = max(dens) or 1.0
+                print("[tsweep]     t   block_loss   zero-cache   train_density", flush=True)
+                for t_v_, dn in zip(grid, dens):
+                    tt = torch.full((b,), float(t_v_), device=device)
+                    emb_t = expert.noisy_action_embeds(traj_data, tt, device, dtype)
+                    cap_t: dict[int, dict] = {}
+
+                    def mk(idx):
+                        def h(_m, a, kw, out):
+                            cap_t[idx] = {
+                                "h_in": (a[0] if a else kw["hidden_states"]).detach(),
+                                "y_out": (out[0] if isinstance(out, tuple) else out).detach(),
+                                "kwargs": {k: v for k, v in kw.items()
+                                           if k != "past_key_values"}}
+                        return h
+
+                    c_t = DynamicCache()
+                    for i in range(n_layers):
+                        c_t.update(t_k[i], t_v[i], i, {})
+                    hs = [expert.expert.layers[i].register_forward_hook(mk(i), with_kwargs=True)
+                          for i in range(n_layers)]
+                    try:
+                        expert.expert(inputs_embeds=emb_t, attention_mask=e_mask,
+                                      position_ids=pos, past_key_values=c_t, use_cache=True)
+                    finally:
+                        for h_ in hs:
+                            h_.remove()
+
+                    def sweep_t(k_list, v_list):
+                        acc = 0.0
+                        for l in range(n_layers):
+                            acc += float(block_output_loss(
+                                expert.expert.layers[l], cap_t[l]["h_in"], cap_t[l]["y_out"],
+                                k_list[l], v_list[l], dict(cap_t[l]["kwargs"])))
+                        return acc / n_layers
+
+                    real_t = sweep_t(s_k, s_v)
+                    zero_t = sweep_t([torch.zeros_like(k) for k in s_k],
+                                     [torch.zeros_like(v) for v in s_v])
+                    print(f"[tsweep] {t_v_:5.2f}   {real_t:.4e}   {zero_t:.4e}   "
+                          f"{dn / dmax:.3f}", flush=True)
+
         # ⚠️ DIAGNOSTIC, opt-in via BLOCK_SPAN=n. Does an objective that teacher-forces only
         # every n-th layer SEE the compounding that L_block (n=1) is blind to?
         # For each disjoint span [l, l+n): drive block l with the teacher's h^T_l, chain the
@@ -798,6 +868,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 n_act = expert.n_action_tokens
 
                 def field(x, t, k_list, v_list):
+                    while torch.is_tensor(t) and t.dim() < x.dim():   # see field_at's note
+                        t = t.unsqueeze(-1)
                     c = DynamicCache()
                     for i in range(n_layers):
                         c.update(k_list[i], v_list[i], i, {})
@@ -824,14 +896,26 @@ class KDReasoningVLA(TrainableReasoningVLA):
 
                 b = embeds.shape[0]
                 dev = embeds.device
+                # ⚠️ return_all_steps=True on BOTH runs: the quantity asked for is the
+                # per-step DIVERGENCE of the student's own trajectory from the teacher's, not
+                # just the endpoint. Same seed before each call, so x_0 is identical and every
+                # later difference is attributable to the cache alone.
                 torch.manual_seed(1234)              # identical initial noise for both runs
-                x_t = dif.sample(batch_size=b, step_fn=teacher_step, device=dev,
-                                 return_all_steps=False)
+                xs_t, ts = dif.sample(batch_size=b, step_fn=teacher_step, device=dev,
+                                      return_all_steps=True)
                 torch.manual_seed(1234)
-                x_s = dif.sample(batch_size=b, step_fn=lambda x, t: field(x, t, s_k, s_v),
-                                 device=dev, return_all_steps=False)
-                e_final = float((x_s.float() - x_t.float()).pow(2).mean()
-                                / x_t.float().pow(2).mean().clamp_min(1e-9))
+                xs_s, _ = dif.sample(batch_size=b, step_fn=lambda x, t: field(x, t, s_k, s_v),
+                                     device=dev, return_all_steps=True)
+                rel_x = lambda a, c: float((a.float() - c.float()).pow(2).mean()
+                                           / c.float().pow(2).mean().clamp_min(1e-9))
+                print("[ode-freerun] step      t   field_err(tf)   x_divergence(fr)", flush=True)
+                for k in range(xs_t.shape[1]):
+                    tv = float(ts[k]) if k < len(ts) else float("nan")
+                    fe = e_step[k] if k < len(e_step) else float("nan")
+                    print(f"[ode-freerun] {k:>4} {tv:>6.2f}   {fe:>13.4e}   "
+                          f"{rel_x(xs_s[:, k], xs_t[:, k]):>16.4e}", flush=True)
+                x_t, x_s = xs_t[:, -1], xs_s[:, -1]
+                e_final = rel_x(x_s, x_t)
                 tot = sum(e_step)
                 cs = [float(torch.nn.functional.cosine_similarity(a, b_, dim=0))
                       for a, b_ in zip(errs, errs[1:])]
@@ -853,11 +937,33 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 shuf = list(range(n_layers))[::-1]
                 shuffled = float(_sweep([s_k[i] for i in shuf], [s_v[i] for i in shuf]))
                 real = float(_sweep(s_k, s_v))
+                # ⚠️ THE COLLAPSE CONTROL. If the student learns to drive its cache to ~0, the
+                # expert's attention over the prefix vanishes and every block output falls back
+                # to whatever the action tokens alone produce -- a FLOOR that depends only on
+                # the teacher, not on cache fidelity. Then a zero cache scores the same as the
+                # student's, the loss has stopped measuring anything, and a flat curve is the
+                # expected outcome rather than convergence.
+                zeros = float(_sweep([torch.zeros_like(k) for k in s_k],
+                                     [torch.zeros_like(v) for v in s_v]))
+                # Norm ratios per layer: monotone decay toward 0 through the loss drop is the
+                # signature of the same collapse, visible before the scores converge.
+                nk = [float(s_k[i].float().norm() / t_k[i].float().norm().clamp_min(1e-9))
+                      for i in range(n_layers)]
+                nv = [float(s_v[i].float().norm() / t_v[i].float().norm().clamp_min(1e-9))
+                      for i in range(n_layers)]
             print(
                 f"[block-selftest] identity(teacher cache)={ident:.6e}  student={real:.4f}  "
-                f"layer-shuffled={shuffled:.4f}  | identity ~0 and student < shuffled",
+                f"layer-shuffled={shuffled:.4f}  ZERO-cache={zeros:.4f}\n"
+                f"[block-selftest]   healthy: identity ~0, student < shuffled, "
+                f"student << ZERO   |   collapsed: student ~ shuffled ~ ZERO",
                 flush=True,
             )
+            print(f"[kvnorm] ||K_s||/||K_t|| mean {sum(nk) / len(nk):.4f} "
+                  f"min {min(nk):.4f} max {max(nk):.4f} | per-layer "
+                  + " ".join(f"{v:.3f}" for v in nk[::4]), flush=True)
+            print(f"[kvnorm] ||V_s||/||V_t|| mean {sum(nv) / len(nv):.4f} "
+                  f"min {min(nv):.4f} max {max(nv):.4f} | per-layer "
+                  + " ".join(f"{v:.3f}" for v in nv[::4]), flush=True)
 
         fr_term = None
         if self.block_freerun_weight > 0:
@@ -915,6 +1021,120 @@ class KDReasoningVLA(TrainableReasoningVLA):
             tgt = captured[n_layers - 1]["y_out"]
             fr_term = ((h_s.float() - tgt.float()).pow(2).mean()
                        / tgt.float().pow(2).mean().clamp_min(1e-6))
+
+        # ---- L_roll: UNROLL the sampler and match the teacher's velocity on each path ----
+        # ⚠️ This is the only term that sees what `ade` actually measures. Every other loss here
+        # is teacher-forced in x: the student is scored at a state the TEACHER produced, so the
+        # divergence of its own trajectory is invisible. Measured with BLOCK_ODE on this arm,
+        # that divergence grows x5.62 then x3.20 over the first steps and reaches 0.76 relative
+        # (~87% RMS) by the end -- while the per-step field error stays ~0.1-0.28 and the block
+        # loss reports 1.7e-3. `ade` 6.29 against min_ade 2.73 is the same story at the metric.
+        #
+        #   x_0 = GT-conditioned noisy state at a random grid point t_k  (scheduled sampling:
+        #         the START is on the teacher's path, the REST is each model's own)
+        #   for j in range(roll_steps):
+        #       v_S = v(x^S_j, t_{k+j} ; K^S)      v_T = v(x^T_j, t_{k+j} ; K^T)   [no grad]
+        #       loss += mse(v_S, sg v_T)
+        #       x^S_{j+1} = x^S_j + dt * v_S       x^T_{j+1} = x^T_j + dt * v_T
+        #
+        # ⚠️ Each side advances with ITS OWN velocity, which is the whole point -- teacher-forcing
+        # the second step would collapse this back into the per-step field loss.
+        # ⚠️ Plain MSE, matching `FlowMatching.compute_loss_from_pred`; the relative form blew up
+        # to 10.75 on a near-zero-velocity clip and inverts the weighting toward trivial clips.
+        roll_term = None
+        if self.roll_weight > 0 and traj_data is not None:
+            dif = expert.diffusion
+            n_inf = int(getattr(dif, "num_inference_steps", 10))
+            dt = 1.0 / n_inf
+            n_roll = max(1, min(self.roll_steps, n_inf))
+            # a random start on the sampler's OWN grid, leaving room for n_roll steps
+            k0 = int(torch.randint(0, max(1, n_inf - n_roll + 1), (1,)).item())
+
+            def field_at(x, t_scalar, k_list, v_list):
+                # ⚠️ t must be shaped LIKE x ([B,1,1]), not [B]. `action_in_proj` does
+                # `timesteps[..., -1]` then `.repeat(1, T, 1)`, so a [B] timestep collapses to a
+                # 0-dim scalar and the timestep features come out batch-1 -- which broadcasts
+                # silently at B=1 and dies with "Expected size 8 but got size 1" at B=8. That is
+                # why every bs=1 smoke passed. `noisy_action_embeds` unsqueezes for this reason.
+                tt = torch.full((x.shape[0],), t_scalar, device=device, dtype=torch.float32)
+                while tt.dim() < x.dim():
+                    tt = tt.unsqueeze(-1)
+                cache = DynamicCache()
+                for i in range(n_layers):
+                    cache.update(k_list[i], v_list[i], i, {})
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    emb = expert.action_in_proj(x, tt)
+                emb = emb.to(dtype)
+                if emb.dim() == 2:
+                    emb = emb.view(x.shape[0], expert.n_action_tokens, -1)
+                out = expert.expert(inputs_embeds=emb, attention_mask=e_mask, position_ids=pos,
+                                    past_key_values=cache, use_cache=True)
+                h = out.last_hidden_state[:, -expert.n_action_tokens:]
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    return expert.velocity(h)
+
+            # ⚠️ TRUNCATED unroll: the first n_roll-1 steps advance under no_grad and only the
+            # LAST step is differentiated. Backpropagating through the whole chain of frozen
+            # bf16 expert blocks produces NON-FINITE gradients -- measured twice now: the
+            # L_freerun arm reported deepspeed's grad_norm sentinel then NaN at the next step,
+            # and so did this term with a perfectly healthy grad_norm of 10.56 at lambda=2e-3.
+            # The property that matters survives: the student is still evaluated at ITS OWN
+            # state, reached by its own velocity, so the divergence `ade` punishes is in the
+            # loss. What is given up is the gradient path THROUGH the earlier steps.
+            with torch.no_grad():
+                x_t0 = expert.noisy_x(traj_data, torch.full((b,), k0 * dt), device)
+                x_s, x_tt = x_t0, x_t0
+                for j in range(n_roll - 1):          # advance both, no graph
+                    t_j = (k0 + j) * dt
+                    x_s = x_s + dt * field_at(x_s, t_j, s_k, s_v).float()
+                    x_tt = x_tt + dt * field_at(x_tt, t_j, t_k, t_v).float()
+            t_last = (k0 + n_roll - 1) * dt
+            v_s = torch.utils.checkpoint.checkpoint(
+                field_at, x_s.detach(), t_last, s_k, s_v, use_reentrant=False)
+            with torch.no_grad():
+                v_t = field_at(x_tt, t_last, t_k, t_v)
+            # ⚠️ STATE matching, not velocity matching. Matching v_S(x^S) to v_T(x^T) compares
+            # two DIFFERENT points once the paths diverge, and the correct velocity at the
+            # student's state is not the teacher's velocity at the teacher's state -- so that
+            # form only stops the gap growing, it never closes the gap already there. Writing
+            # d = x^S - x^T (detached under truncation),
+            #     ||x^S_{k+1} - x^T_{k+1}||^2 = ||d + dt (v_S - v_T)||^2
+            # is minimised at v_S = v_T - d/dt: the teacher's velocity PLUS a correction that
+            # cancels the offset, i.e. steer back onto the teacher's trajectory. At n=1 the two
+            # forms coincide (d=0, so state = dt^2 x velocity); they differ only for n>=2, which
+            # is the whole point of rolling out. And x IS the action, so this is the trajectory
+            # error in action space -- one action_to_traj away from `ade` itself.
+            # ⚠️ HUBER, not MSE. The self-test showed this term at 0.62 when the rollout starts
+            # at step 5 but 8.19 at step 8 -- a 13x spread, because a free step late in the
+            # trajectory can land far off-manifold where the velocity is extreme. Squared error
+            # turns those batches into a gradient spike; every MSE variant tried NaN'd on the
+            # step after one (lambda 1 -> grad 5327, lambda 2e-3 -> 10.6, lambda 1e-2 -> 55,
+            # all NaN next step). Huber keeps the same minimum with a bounded gradient.
+            x_s_next = x_s.detach().float() + dt * v_s.float()
+            x_t_next = (x_tt.float() + dt * v_t.float()).detach()
+            roll_term = torch.nn.functional.huber_loss(x_s_next, x_t_next, delta=1.0)
+            # ⚠️ and a finiteness guard: one bad batch must not kill a multi-hour run. Dropped
+            # terms are counted so a silently-inert loss cannot masquerade as a healthy one.
+            if not torch.isfinite(roll_term):
+                self._roll_dropped = getattr(self, "_roll_dropped", 0) + 1
+                print(f"[roll] NON-FINITE term dropped (total {self._roll_dropped}) at "
+                      f"start step {k0}", flush=True)
+                roll_term = v_s.float().sum() * 0.0
+            if os.environ.get("BLOCK_SELFTEST") == "1":
+                with torch.no_grad():
+                    xi = x_t0
+                    ident = []
+                    for j in range(n_roll):
+                        t_j = (k0 + j) * dt
+                        vi = field_at(xi, t_j, t_k, t_v)
+                        vt = field_at(x_t0 if j == 0 else xi, t_j, t_k, t_v)
+                        ident.append(float(torch.nn.functional.huber_loss(
+                            (xi.float() + dt * vi.float()),
+                            (xi.float() + dt * vt.float()), delta=1.0)))
+                        xi = xi + dt * vi.float()
+                print(f"[roll-selftest] start step {k0}, {n_roll} steps | identity(teacher "
+                      f"cache both sides) {sum(ident) / len(ident):.3e}  student "
+                      f"{float(roll_term):.4f}   (identity must be ~0)", flush=True)
 
         # ---- L_field: match the VELOCITY, not just the hidden states --------------------
         # ⚠️ MEASURED motivation, not a hunch. The hidden states agree to 3.2% RMS per layer
@@ -988,7 +1208,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 print(f"[field-selftest] identity(teacher cache) {ident:.3e} "
                       f"student {float(field_term):.4f}   (identity must be ~0)", flush=True)
 
-        return _sweep(s_k, s_v), fr_term, field_term
+        return _sweep(s_k, s_v), fr_term, field_term, roll_term
 
     def forward(
         self,
@@ -1000,10 +1220,18 @@ class KDReasoningVLA(TrainableReasoningVLA):
         labels_mask: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> KDVLAOutput:
+        # ⚠️ These two gates must list EVERY term that needs the teacher, and they were the
+        # last place block_weight stood in for "the block path is active". With block_weight=0
+        # and roll_weight>0 the teacher never ran and hidden states were never requested, so
+        # the block path produced nothing and the total came out a scalar with NO grad_fn --
+        # which DeepSpeed reports as "loss must be a scalar tensor", naming the wrong half of
+        # its own check (`numel()==1 and grad_fn is not None`).
+        _block_family = (self.block_weight > 0 or self.field_weight > 0
+                         or self.roll_weight > 0 or self.block_freerun_weight > 0)
         need_teacher = (
-            self.kd_weight > 0 or self.kv_weight > 0 or self.block_weight > 0
+            self.kd_weight > 0 or self.kv_weight > 0 or _block_family
         ) and self.teacher is not None
-        want_hidden = (self.kv_weight > 0 or self.block_weight > 0) and self.teacher is not None
+        want_hidden = (self.kv_weight > 0 or _block_family) and self.teacher is not None
 
         tokenized_data = dict(tokenized_data)
         input_ids = tokenized_data.pop("input_ids")
@@ -1021,7 +1249,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
 
         # Hook the rotary embedding so L_block reuses the EXACT rotation the cached keys
         # carry, rather than reconstructing mrope positions. Registered only when needed.
-        rope, rope_handle = self._capture_rope() if self.block_weight > 0 else ({}, None)
+        _need_block = _block_family
+        rope, rope_handle = self._capture_rope() if _need_block else ({}, None)
         try:
             # ⚠️ Only materialise logits when something actually reads them. CE needs them
             # (ce_weight>0) and logit-KD needs them (kd_weight>0); the pure cache arms
@@ -1087,7 +1316,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # gradient probe can weight each one as it enters the total.
         attached: dict[str, torch.Tensor] = {} if ce_loss is None else {"ce": ce_loss}
 
-        kd_loss = kv_loss = block_loss = fr_loss = field_loss = None
+        kd_loss = kv_loss = block_loss = fr_loss = field_loss = roll_loss = None
         region_losses: dict[str, torch.Tensor] = {}
 
         if need_teacher:
@@ -1116,7 +1345,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 attached["kd"] = kd_loss
 
             # ---- lambda_block: does the student cache drive the same block update? --
-            if self.block_weight > 0:
+            if _need_block:
                 # ⚠️ Both towers consumed the SAME input_ids and the same tokenized_data, so
                 # positions, prompt and image tokens are identical by construction -- asserted
                 # rather than assumed, because the whole objective is meaningless otherwise.
@@ -1181,17 +1410,21 @@ class KDReasoningVLA(TrainableReasoningVLA):
                              "ego_future_xyz": ego_future_xyz,
                              "ego_future_rot": ego_future_rot}
                 with _Phase.t("block+field"):
-                    block_loss, fr_loss, field_loss = self._block_loss(
+                    block_loss, fr_loss, field_loss, roll_loss = self._block_loss(
                         s_kv, t_kv_b, rope, traj_mask,
                         tokenized_data.get("attention_mask"), _traj)
-                total_loss = total_loss + self.block_weight * block_loss
-                attached["block"] = block_loss
+                if self.block_weight > 0:
+                    total_loss = total_loss + self.block_weight * block_loss
+                attached["block"] = block_loss      # logged either way, as a free diagnostic
                 if fr_loss is not None:
                     total_loss = total_loss + self.block_freerun_weight * fr_loss
                     attached["freerun"] = fr_loss
                 if field_loss is not None:
                     total_loss = total_loss + self.field_weight * field_loss
                     attached["field"] = field_loss
+                if roll_loss is not None:
+                    total_loss = total_loss + self.roll_weight * roll_loss
+                    attached["roll"] = roll_loss
                 del s_kv, t_kv_b
 
             # ---- lambda_kv: match the LLM's K/V at every position -------------
@@ -1237,6 +1470,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
             block_loss=None if block_loss is None else block_loss.detach(),
             freerun_loss=None if fr_loss is None else fr_loss.detach(),
             field_loss=None if field_loss is None else field_loss.detach(),
+            roll_loss=None if roll_loss is None else roll_loss.detach(),
             kv_loss_vision=region_losses.get("vision"),
             kv_loss_text=region_losses.get("text"),
             kv_loss_traj=region_losses.get("traj"),
