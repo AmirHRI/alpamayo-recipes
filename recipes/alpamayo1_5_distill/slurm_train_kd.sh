@@ -144,6 +144,20 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    block2bspan)
+        # The SPAN CURRICULUM: same 2-camera stack as block2b2cam, but its own output_dir.
+        # ⚠️ That separation is not cosmetic. Reusing block2b2cam's dir meant (a) save_total_limit
+        # would have pruned job 470's checkpoints -- including the 3597 that was already
+        # evaluated -- and (b) wandb_utils found the previous run's state in the dir and RESUMED
+        # run evdhdhs1, appending a from-scratch curriculum onto a finished 3-epoch run's curves.
+        # A new ARM gives a clean checkpoint namespace and a fresh wandb run.
+        # block_span is passed per stage via EXTRA_ARGS: 1 -> 7 -> 14 -> 28, one epoch each.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher) ;;
     block2b2cam)
         # 2B student + pruned expert, L_block with sampled t, but TWO cameras (front-wide +
         # telephoto, ~1577 tokens instead of 3073) and the ViT at the FULL learning rate.

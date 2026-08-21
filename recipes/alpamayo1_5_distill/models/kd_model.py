@@ -71,6 +71,7 @@ from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA
 from alpamayo1_5_distill.models.kd_losses import assert_kd_compatible, logit_kd_loss
 from alpamayo1_5_distill.models.block_losses import (
     block_output_loss,
+    block_output_only,
     block_span_output,
     rotate_keys,
 )
@@ -141,6 +142,8 @@ class KDVLAOutput(ModelOutput):
     freerun_loss: torch.FloatTensor | None = None
     field_loss: torch.FloatTensor | None = None
     roll_loss: torch.FloatTensor | None = None
+    kv_ratio_k: torch.FloatTensor | None = None
+    kv_ratio_v: torch.FloatTensor | None = None
     kv_loss_vision: torch.FloatTensor | None = None
     kv_loss_text: torch.FloatTensor | None = None
     kv_loss_traj: torch.FloatTensor | None = None
@@ -218,6 +221,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
     field_weight: float = 0.0
     roll_weight: float = 0.0
     roll_steps: int = 2
+    block_norm: str = "teacher"   # 'teacher' | 'cache'
+    block_span: int = 1
     kd_weight: float = 0.0
     kd_temperature: float = 1.0
     kv_weight: float = 0.0
@@ -249,6 +254,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
         field_weight: float = 0.0,
         roll_weight: float = 0.0,
         roll_steps: int = 2,
+        block_norm: str = "teacher",
+        block_span: int = 1,
         kd_weight: float = 0.0,
         kd_temperature: float = 1.0,
         kv_weight: float = 0.0,
@@ -301,6 +308,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
         self.field_weight = float(field_weight)
         self.roll_weight = float(roll_weight)
         self.roll_steps = int(roll_steps)
+        self.block_norm = str(block_norm)
+        self.block_span = int(block_span)
         self._beta_dist = (
             torch.distributions.beta.Beta(torch.tensor(1.5), torch.tensor(1.0))
             if block_timestep == "beta" else None
@@ -647,6 +656,106 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # bypassed). With a remapped shallow expert every slot is real, so this is empty.
         skip = set(range(n_layers)) - set(self._surviving_expert_layers() or range(n_layers))
 
+        # ⚠️ COLLAPSE MONITOR, always on. ||K_s||/||K_t|| and ||V_s||/||V_t|| averaged over
+        # layers, logged every step alongside the losses. The failure this watches for is the
+        # student driving its cache toward zero so the expert's prefix attention vanishes and
+        # the loss sits at a floor set by the teacher's own activations -- at which point a
+        # falling curve means nothing. Measured trajectory on the 4-camera arm: K 3.25 -> 2.42
+        # -> 2.32 and V 7.16 -> 2.87 -> 2.63 over 0/500/1000 steps, i.e. shrinking toward 1
+        # (the teacher's scale) from ABOVE, which is convergence, not collapse. Ratios heading
+        # for 0 -- especially with the loss still falling -- are the signature to stop on.
+        with torch.no_grad():
+            self._kv_ratio_k = float(sum(
+                s_k[i].float().norm() / t_k[i].float().norm().clamp_min(1e-9)
+                for i in range(n_layers)) / n_layers)
+            self._kv_ratio_v = float(sum(
+                s_v[i].float().norm() / t_v[i].float().norm().clamp_min(1e-9)
+                for i in range(n_layers)) / n_layers)
+
+        # ⚠️ block_norm='cache': the per-layer normaliser becomes the CACHE-ATTRIBUTABLE part of
+        # the output, ||y_teacher - y_zero||^2, instead of ||y_teacher||^2. y_zero is the layer
+        # driven by a ZERO cache -- measured at 0.0104 against a trained student's 0.0012, i.e.
+        # 99% of the old normaliser is cache-independent. Computed ONCE per batch under no_grad
+        # (n_layers extra single-block forwards, the same cost as one _sweep) and reused by every
+        # _sweep call, including the self-test's identity/shuffled/zero controls.
+        y_zero: dict[int, torch.Tensor] = {}
+        if self.block_norm == "cache":
+            with torch.no_grad():
+                for l in range(n_layers):
+                    if l in skip:
+                        continue
+                    c = captured[l]
+                    z = torch.zeros_like(s_k[l])
+                    y_zero[l] = block_output_only(
+                        expert.expert.layers[l], c["h_in"], z, torch.zeros_like(s_v[l]),
+                        dict(c["kwargs"]))
+
+        def _span_sweep(k_list, v_list, m: int):
+            """L_span(m): teacher-force the span ENTRY, chain m blocks on the student's cache,
+            compare at the span EXIT.
+
+                h^S_{l+1} = B_l(h^T_l ; K^S_l,V^S_l)
+                h^S_{l+j+1} = B_{l+j}(h^S_{l+j} ; K^S_{l+j},V^S_{l+j})     j = 1..m-1
+                L = D(h^S_{l+m}, h^T_{l+m})
+
+            ⚠️ DISJOINT spans (stride m), so the total number of block forwards is n_layers
+            regardless of m -- the schedule costs the same at m=1 and m=28. Overlapping spans
+            would be m x the compute for the same coverage.
+            ⚠️ m=1 must reduce EXACTLY to block_output_loss: same fresh single-layer cache, same
+            captured kwargs, same normaliser. That equivalence is the self-test.
+            ⚠️ CHECKPOINTED per layer. The m=28 stage IS the full free-run, and retaining
+            activations for a 28-deep chain OOMed the L_freerun arm (75 -> >79 GB); its backward
+            also produced non-finite gradients in bf16, which is why the finiteness guard below
+            is not optional at the long-span stages.
+            """
+            acc = None
+            n_span = 0
+            for l0 in range(0, n_layers - m + 1, m):
+                idx = [l for l in range(l0, l0 + m) if l not in skip]
+                if not idx:
+                    continue
+
+                def _one(h, li):
+                    l = int(li)
+                    c = DynamicCache()
+                    c.update(k_list[l], v_list[l], 0, {})
+                    blk = expert.expert.layers[l]
+                    orig = blk.self_attn.layer_idx
+                    blk.self_attn.layer_idx = 0
+                    try:
+                        o = blk(h, past_key_values=c, use_cache=True,
+                                **dict(captured[l]["kwargs"]))
+                    finally:
+                        blk.self_attn.layer_idx = orig
+                    return o[0] if isinstance(o, tuple) else o
+
+                h = captured[idx[0]]["h_in"]
+                for l in idx:
+                    h = (torch.utils.checkpoint.checkpoint(
+                            _one, h, torch.tensor(l), use_reentrant=False)
+                         if m > 1 else _one(h, torch.tensor(l)))
+                tgt = captured[idx[-1]]["y_out"].float().detach()
+                num = (h.float() - tgt).pow(2).mean()
+                if self.block_norm == "cache" and y_zero.get(idx[-1]) is not None:
+                    den = (tgt - y_zero[idx[-1]].float()).pow(2).mean()
+                else:
+                    den = tgt.pow(2).mean()
+                term = num / den.clamp_min(1e-6)
+                if not torch.isfinite(term):
+                    self._span_dropped = getattr(self, "_span_dropped", 0) + 1
+                    print(f"[span] NON-FINITE span at l0={l0} m={m} "
+                          f"(dropped {self._span_dropped})", flush=True)
+                    continue
+                acc = term if acc is None else acc + term
+                n_span += 1
+            # ⚠️ divide by m as well as by the span count, so the value is PER-LAYER
+            # equivalent and the four curriculum stages arrive at the same magnitude. Measured
+            # without it: m=1 1.21e-3, m=7 9.0x, m=14 15.4x, m=28 34.9x -- because the loss is
+            # roughly the SUM of the m per-layer errors (times the ~1.1-1.3x amplification the
+            # span probes measured), while the span count falls as 1/m. Feeding a 35x larger
+            # gradient into a shared LR schedule at stage 4 is how L_roll at lambda=1 NaN'd.
+            return acc / max(n_span, 1) / m if acc is not None else None
+
         def _sweep(k_list, v_list):
             acc = None
             n_used = 0
@@ -658,6 +767,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 term = block_output_loss(
                     expert.expert.layers[l], c["h_in"], c["y_out"],
                     k_list[l], v_list[l], dict(c["kwargs"]),
+                    y_zero=y_zero.get(l),
                 )
                 acc = term if acc is None else acc + term
             return acc / max(n_used, 1)
@@ -694,16 +804,101 @@ class KDReasoningVLA(TrainableReasoningVLA):
                         h_.remove()
                 rel = lambda a, b: float((a.float() - b.float()).pow(2).mean()
                                          / b.float().pow(2).mean().clamp_min(1e-9))
+                # ⚠️ A THIRD chain, on a ZERO cache, so the FREE-RUNNING curve can be normalised
+                # the same way the reconditioned block loss is: by the CACHE-ATTRIBUTABLE part of
+                # the teacher's hidden state at that depth, ||h^T_l - h^0_l||^2, rather than by
+                # ||h^T_l||^2 (which the residual stream dominates -- measured: a zero cache
+                # perturbs block outputs by only ~1%). On this scale a layer reads 0 when the
+                # student's own chain matches the teacher's and 1 when it is no better than
+                # supplying no cache at all, so teacher-forced and free-running are directly
+                # comparable per layer instead of differing by ~100x of normalisation.
+                z_h: dict[int, torch.Tensor] = {}
+                if self.block_norm == "cache":
+                    z_cache = DynamicCache()
+                    for i in range(n_layers):
+                        z_cache.update(torch.zeros_like(s_k[i]), torch.zeros_like(s_v[i]), i, {})
+                    zh_store: dict[int, torch.Tensor] = {}
+
+                    def _z_hook(idx):
+                        def f(_m, args, kw, out):
+                            zh_store[idx] = (args[0] if args else kw["hidden_states"]).detach()
+                            if idx == n_layers - 1:
+                                zh_store[n_layers] = (
+                                    out[0] if isinstance(out, tuple) else out).detach()
+                        return f
+
+                    zhs = [expert.expert.layers[i].register_forward_hook(_z_hook(i),
+                                                                        with_kwargs=True)
+                           for i in range(n_layers)]
+                    try:
+                        expert.expert(inputs_embeds=embeds, attention_mask=e_mask,
+                                      position_ids=pos, past_key_values=z_cache, use_cache=True)
+                    finally:
+                        for h_ in zhs:
+                            h_.remove()
+                    z_h = zh_store
+                    y_zero_fr = {l: block_output_only(
+                        expert.expert.layers[l], captured[l]["h_in"],
+                        torch.zeros_like(s_k[l]), torch.zeros_like(s_v[l]),
+                        dict(captured[l]["kwargs"])) for l in range(n_layers)}
+                else:
+                    y_zero_fr = {}
+
                 tf = [float(block_output_loss(expert.expert.layers[l], captured[l]["h_in"],
                                               captured[l]["y_out"], s_k[l], s_v[l],
-                                              dict(captured[l]["kwargs"])))
+                                              dict(captured[l]["kwargs"]),
+                                              y_zero=y_zero_fr.get(l)))
                       for l in range(n_layers)]
-                fr = [rel(fr_h[l], captured[l]["h_in"]) for l in range(n_layers)]
+                if z_h:
+                    # cache-attributable: ||h^S_l - h^T_l||^2 / ||h^T_l - h^0_l||^2
+                    fr = [float((fr_h[l].float() - captured[l]["h_in"].float()).pow(2).mean()
+                                / (captured[l]["h_in"].float()
+                                   - z_h[l].float()).pow(2).mean().clamp_min(1e-9))
+                          for l in range(n_layers)]
+                else:
+                    fr = [rel(fr_h[l], captured[l]["h_in"]) for l in range(n_layers)]
                 fr.append(rel(fr_h[n_layers], captured[n_layers - 1]["y_out"]))
+                # ⚠️ RAW magnitudes, not just the ratio. A large normalised value is ambiguous:
+                # it can mean the student's error is big, or that the cache-attributable
+                # DENOMINATOR at that layer is small (the cache barely matters there). Those
+                # imply different fixes -- fix the student vs ignore the layer -- so print both
+                # the numerator ||y_S - y_T||^2 and the span ||y_T - y_0||^2, plus the teacher
+                # output's own magnitude for scale.
+                if y_zero_fr:
+                    print("[fr-raw] layer   ||y_S-y_T||^2   ||y_T-y_0||^2     ||y_T||^2"
+                          "   span/||y_T||", flush=True)
+                    for l in range(0, n_layers, 4):
+                        c = captured[l]
+                        yt = c["y_out"].float()
+                        ys = block_output_only(expert.expert.layers[l], c["h_in"],
+                                               s_k[l], s_v[l], dict(c["kwargs"])).float()
+                        y0 = y_zero_fr[l].float()
+                        num = float((ys - yt).pow(2).mean())
+                        span = float((yt - y0).pow(2).mean())
+                        mag = float(yt.pow(2).mean())
+                        print(f"[fr-raw] {l:>5}   {num:>13.4e}   {span:>13.4e}   {mag:>11.4e}"
+                              f"   {span / max(mag, 1e-12):>11.4e}", flush=True)
                 print("[freerun] layer teacher_forced free_running", flush=True)
                 for l in range(0, n_layers, 4):
                     print(f"[freerun] {l:>3} {tf[l]:.4e} {fr[l]:.4e} "
                           f"ratio {fr[l] / max(tf[l], 1e-12):.1f}", flush=True)
+                # ⚠️ Same decomposition for the FREE-RUNNING chain -- the state that actually
+                # reaches action_out_proj. Teacher-forced numbers describe one block in
+                # isolation; these describe what the head is handed. Both normalisers are shown
+                # because they weight depth differently and neither is obviously right:
+                #   norm=teacher  ||h^S-h^T||^2 / ||h^T||^2
+                #   norm=cache    ||h^S-h^T||^2 / ||h^T-h^0||^2
+                if z_h:
+                    print("[fr-state] layer   ||h_S-h_T||^2   ||h_T-h_0||^2      ||h_T||^2"
+                          "   norm=teach    norm=cache", flush=True)
+                    for l in range(0, n_layers, 4):
+                        ht = captured[l]["h_in"].float()
+                        num = float((fr_h[l].float() - ht).pow(2).mean())
+                        span = float((ht - z_h[l].float()).pow(2).mean())
+                        mag = float(ht.pow(2).mean())
+                        print(f"[fr-state] {l:>5}   {num:>13.4e}   {span:>13.4e}   {mag:>12.4e}"
+                              f"   {num / max(mag, 1e-12):>10.4e}   {num / max(span, 1e-12):>11.4e}",
+                              flush=True)
                 print(f"[freerun] FINAL tf_mean {sum(tf) / len(tf):.4e} "
                       f"fr_last {fr[-1]:.4e} ratio {fr[-1] / max(sum(tf) / len(tf), 1e-12):.1f}",
                       flush=True)
@@ -925,6 +1120,29 @@ class KDReasoningVLA(TrainableReasoningVLA):
                       f"amplification {e_final / max(tot, 1e-12):.2f}  "
                       f"bias(cos between consecutive step errors) {sum(cs) / max(len(cs), 1):.3f}",
                       flush=True)
+
+        # ⚠️ SELF-TEST for the span schedule, opt-in via SPAN_SELFTEST=1. Two claims:
+        #   (a) _span_sweep(m=1) == _sweep  -- the curriculum's first stage is EXACTLY the
+        #       existing block loss, so every prior number stays the baseline. Compared here
+        #       rather than argued: the two take different code paths (checkpointing off vs on,
+        #       loop vs chain) and only agree if the driving is identical.
+        #   (b) every m in the schedule yields a FINITE loss. m=28 is the full free-run, whose
+        #       bf16 backward went non-finite in the L_freerun arm, so this is the go/no-go for
+        #       the last stage before committing an epoch to it.
+        if os.environ.get("SPAN_SELFTEST") == "1":
+            with torch.no_grad():
+                base = float(_sweep(s_k, s_v))
+                one = float(_span_sweep(s_k, s_v, 1))
+                print(f"[span-selftest] m=1 via _span_sweep {one:.6e} vs _sweep {base:.6e}  "
+                      f"rel diff {abs(one - base) / max(base, 1e-12):.2e}   (must be ~0)",
+                      flush=True)
+                for m in (7, 14, 28):
+                    if m > n_layers:
+                        continue
+                    v = _span_sweep(s_k, s_v, m)
+                    print(f"[span-selftest] m={m:<3} loss {float(v):.6e}  "
+                          f"spans {len(range(0, n_layers - m + 1, m))}  "
+                          f"x m=1 {float(v) / max(one, 1e-12):.2f}", flush=True)
 
         # ⚠️ SELF-TEST, opt-in via BLOCK_SELFTEST=1. A finite, falling loss is NOT evidence
         # that it measures cache fidelity -- that gap has produced retractions here. Feeding
@@ -1208,7 +1426,12 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 print(f"[field-selftest] identity(teacher cache) {ident:.3e} "
                       f"student {float(field_term):.4f}   (identity must be ~0)", flush=True)
 
-        return _sweep(s_k, s_v), fr_term, field_term, roll_term
+        # ⚠️ m=1 routes to _sweep (the original per-layer path) rather than _span_sweep, so
+        # the m=1 stage of the schedule is bit-identical to every block-loss number already in
+        # this tree -- the curriculum's first epoch is not a new objective.
+        block_term = (_sweep(s_k, s_v) if self.block_span <= 1
+                      else _span_sweep(s_k, s_v, self.block_span))
+        return block_term, fr_term, field_term, roll_term
 
     def forward(
         self,
@@ -1471,6 +1694,10 @@ class KDReasoningVLA(TrainableReasoningVLA):
             freerun_loss=None if fr_loss is None else fr_loss.detach(),
             field_loss=None if field_loss is None else field_loss.detach(),
             roll_loss=None if roll_loss is None else roll_loss.detach(),
+            kv_ratio_k=(torch.tensor(self._kv_ratio_k)
+                        if getattr(self, "_kv_ratio_k", None) is not None else None),
+            kv_ratio_v=(torch.tensor(self._kv_ratio_v)
+                        if getattr(self, "_kv_ratio_v", None) is not None else None),
             kv_loss_vision=region_losses.get("vision"),
             kv_loss_text=region_losses.get("text"),
             kv_loss_traj=region_losses.get("traj"),

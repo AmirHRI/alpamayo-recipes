@@ -457,6 +457,7 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         num_traj_samples: int = 6,
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
+        return_action: bool = False,
         **kwargs: Any,
     ):
         """Prefill the VLM once, hand that cache to the expert. No generation.
@@ -584,6 +585,15 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
                                     ns=num_traj_sets, nj=num_traj_samples)
         pred_rot = einops.rearrange(pred_rot, "(b ns nj) ... -> b ns nj ...",
                                     ns=num_traj_sets, nj=num_traj_samples)
+        if return_action:
+            # ⚠️ The action the SAMPLER produced, not one recovered from the trajectory.
+            # Inverting `action_to_traj` via `traj_to_action` is NOT a way to get this back:
+            # that path runs `theta_smooth` plus three ridge-regularised solves
+            # (`unicycle_accel_curvature.py:269-283`), so it returns a SMOOTHED fit and a
+            # bounds check applied to it can pass on a trajectory that is not feasible.
+            return pred_xyz, pred_rot, einops.rearrange(
+                sampled_action, "(b ns nj) ... -> b ns nj ...",
+                ns=num_traj_sets, nj=num_traj_samples)
         return pred_xyz, pred_rot
 
     def sample_trajectories_from_data(self, data: dict[str, Any], **kwargs: Any):  # type: ignore[override]

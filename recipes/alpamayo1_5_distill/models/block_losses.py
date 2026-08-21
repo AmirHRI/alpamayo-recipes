@@ -94,6 +94,7 @@ def block_output_loss(
     student_v: torch.Tensor,
     layer_kwargs: dict,
     normalize: bool = True,
+    y_zero: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One layer's ``|| B(h; K_s,V_s) - sg B(h; K_t,V_t) ||^2``.
 
@@ -110,9 +111,12 @@ def block_output_loss(
             form and computes mrope embeddings, and a hand-built substitute attends
             differently. ``past_key_values`` is supplied here and must be absent from this
             dict.
-        normalize: divide by the teacher output's mean square so per-layer terms are
-            commensurable. Expert activations span orders of magnitude across depth, so
-            without this the largest layers own the gradient.
+        normalize: divide so per-layer terms are commensurable. Expert activations span
+            orders of magnitude across depth, so without this the largest layers own the
+            gradient.
+        y_zero: this layer's output driven by a ZERO cache, detached. When given, the
+            normaliser becomes ``||y_teacher - y_zero||^2`` -- the cache-attributable part of
+            the output -- instead of ``||y_teacher||^2``. See the note at the division.
 
     Returns:
         Scalar.
@@ -127,10 +131,29 @@ def block_output_loss(
 
     diff = (y_student.float() - y_teacher.float().detach()).pow(2).mean()
     if normalize:
-        # Guarded: a layer whose teacher output is ~0 would divide by ~0 and produce an inf
-        # that poisons the whole sum.
-        scale = y_teacher.float().detach().pow(2).mean().clamp_min(1e-6)
-        diff = diff / scale
+        if y_zero is not None:
+            # ⚠️ CACHE-ATTRIBUTABLE normalisation. Dividing by ||y_teacher||^2 (the old default)
+            # normalises by the WHOLE block output, which is dominated by the residual stream --
+            # a component the student cannot get wrong. MEASURED: driving the block with a ZERO
+            # cache scores only 0.0104, so 99% of ||y_teacher||^2 is cache-independent and the
+            # entire informative band is 0..0.0104 while a trained student sits at 0.0012. It has
+            # already captured 88% of the band, and the whole remaining gap to the teacher lives
+            # in the last 12% -- which is why 500 steps moved this loss within noise while `ade`
+            # moved -13% at z=-3.44.
+            # Dividing by ||y_teacher - y_zero||^2 -- what the cache actually contributes at this
+            # layer -- makes zero-cache score exactly 1.0, puts the model at ~0.115, and weights
+            # layers by how much the cache controls them rather than by residual magnitude.
+            # ⚠️ Adam is per-parameter scale-invariant, so this changes the CROSS-LAYER weighting
+            # and the readability of the curve, NOT the gradient direction within a layer. Do not
+            # expect it to close a capacity gap: the same loss reaches 1.85e-4 on a single clip,
+            # 5x below the training floor, so the floor is aggregate capacity, not conditioning.
+            scale = (y_teacher.float().detach() - y_zero.float().detach()).pow(2).mean()
+        else:
+            scale = y_teacher.float().detach().pow(2).mean()
+        # Guarded: a layer whose normaliser is ~0 would divide by ~0 and produce an inf that
+        # poisons the whole sum. For the cache-attributable form that means a layer the cache
+        # genuinely does not affect -- correctly contributing ~nothing rather than exploding.
+        diff = diff / scale.clamp_min(1e-6)
     return diff
 
 
@@ -164,3 +187,17 @@ def block_span_output(
             out = blk(h, past_key_values=cache, use_cache=True, **kw)
         h = out[0] if isinstance(out, tuple) else out
     return h
+
+
+def block_output_only(block, h_in, k, v, layer_kwargs) -> torch.Tensor:
+    """One block's output for a given cache -- the loss's building block, without the loss.
+
+    Used for the ZERO-cache baseline that ``block_output_loss(y_zero=...)`` normalises by.
+    Identical driving to :func:`block_output_loss` (fresh single-layer cache, borrowed
+    ``layer_idx``, captured kwargs) so the baseline is comparable term by term.
+    """
+    cache = DynamicCache()
+    cache.update(k, v, 0, {})
+    with _as_layer0(block):
+        out = block(h_in, past_key_values=cache, use_cache=True, **layer_kwargs)
+    return (out[0] if isinstance(out, tuple) else out).detach()
