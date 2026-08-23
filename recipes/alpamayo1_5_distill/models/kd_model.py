@@ -144,6 +144,11 @@ class KDVLAOutput(ModelOutput):
     roll_loss: torch.FloatTensor | None = None
     kv_ratio_k: torch.FloatTensor | None = None
     kv_ratio_v: torch.FloatTensor | None = None
+    block_loss_tf: torch.FloatTensor | None = None
+    block_loss_span: torch.FloatTensor | None = None
+    block_loss_early: torch.FloatTensor | None = None
+    block_loss_mid: torch.FloatTensor | None = None
+    block_loss_deep: torch.FloatTensor | None = None
     kv_loss_vision: torch.FloatTensor | None = None
     kv_loss_text: torch.FloatTensor | None = None
     kv_loss_traj: torch.FloatTensor | None = None
@@ -223,6 +228,14 @@ class KDReasoningVLA(TrainableReasoningVLA):
     roll_steps: int = 2
     block_norm: str = "teacher"   # 'teacher' | 'cache'
     block_span: int = 1
+    #: Per-layer weighting of the block loss: 'uniform' (every layer equal, the historical
+    #: behaviour), 'ladder' (the MEASURED expert sensitivity profile), 'deep_only' (layers
+    #: 19-27 only), or an explicit comma list of n_layers floats.
+    block_layer_weights: str = "uniform"
+    #: Combine BOTH block objectives: the teacher-forced per-layer loss (m=1) AND the span
+    #: loss at this m. 0/1 disables the mix and `block_span` alone decides the path.
+    block_span_mix: int = 0
+    block_span_mix_weight: float = 1.0
     kd_weight: float = 0.0
     kd_temperature: float = 1.0
     kv_weight: float = 0.0
@@ -256,6 +269,9 @@ class KDReasoningVLA(TrainableReasoningVLA):
         roll_steps: int = 2,
         block_norm: str = "teacher",
         block_span: int = 1,
+        block_layer_weights: str = "uniform",
+        block_span_mix: int = 0,
+        block_span_mix_weight: float = 1.0,
         kd_weight: float = 0.0,
         kd_temperature: float = 1.0,
         kv_weight: float = 0.0,
@@ -310,6 +326,11 @@ class KDReasoningVLA(TrainableReasoningVLA):
         self.roll_steps = int(roll_steps)
         self.block_norm = str(block_norm)
         self.block_span = int(block_span)
+        self.block_layer_weights = str(block_layer_weights)
+        self._blw_logged = False
+        self.block_span_mix = int(block_span_mix)
+        self.block_span_mix_weight = float(block_span_mix_weight)
+        self._mix_logged = False
         self._beta_dist = (
             torch.distributions.beta.Beta(torch.tensor(1.5), torch.tensor(1.0))
             if block_timestep == "beta" else None
@@ -565,6 +586,62 @@ class KDReasoningVLA(TrainableReasoningVLA):
         t = self._beta_dist.sample((b,)).to(device)
         return 0.999 - t * 0.999          # flow_matching.py:148-149, verbatim
 
+    def _layer_weights(self, n_layers: int) -> list[float]:
+        """Per-layer weight for the block loss, from the CACHE LADDER's measured sensitivity.
+
+        The uniform mean the loss has always used implicitly claims every layer of the cache
+        matters equally to the expert. Measured (cacheladder, n=300, noise floor 0.034, total
+        recoverable gap -1.3452 min_ade): substituting the teacher's K/V into
+
+            layers 0-9    ->  +0.0120   (INSIDE the noise floor: ten layers, worth nothing)
+            layers 10-18  ->  -0.8946   (0.099 / layer)
+            layers 19-27  ->  -1.2846   (0.143 / layer, and -0.173 / layer over the last 4)
+
+        i.e. sensitivity rises monotonically with depth and is ~0 for the first third. The
+        mechanism is the same one that made the span curriculum a null result: the expert's
+        layer map is CONTRACTIVE, so an error in cache layer 0 has 27 layers of damping ahead
+        of it while an error at layer 27 reaches action_out_proj almost directly.
+
+        ⚠️ 'ladder' FLOORS the early layers rather than zeroing them. The ladder showed that
+        CORRECTING layers 0-9 buys nothing; it did NOT show they can be left unsupervised --
+        substituting the teacher's better values is not the same as letting the student's drift
+        arbitrarily. 'deep_only' takes that stronger bet, and is the sharper test.
+        """
+        w = self.block_layer_weights.strip()
+        if "," in w:
+            vals = [float(x) for x in w.split(",") if x != ""]
+            if len(vals) != n_layers:
+                raise ValueError(
+                    f"block_layer_weights lists {len(vals)} weights for {n_layers} layers")
+            return vals
+        if w == "uniform":
+            return [1.0] * n_layers
+        # bands are expressed as FRACTIONS of depth so the profile transfers to a student of
+        # a different depth instead of silently mis-binning
+        def band(l: int) -> float:
+            f = l / max(n_layers - 1, 1)
+            if w == "deep_only":
+                return 1.0 if f >= 19 / 27 else 0.0
+            if w == "ladder_add":
+                # ADDITIVE variant: never below 1.0, so the deep layers gain pressure without
+                # the early layers losing supervision outright. ⚠️ The weighted mean is
+                # normalised by the WEIGHT SUM, so this still reallocates share -- just far
+                # less: early layers go 1/28 -> 1/32.25, a 13% cut, against the 72% cut that
+                # 'ladder' applied and that measurably HURT (min_ade +0.1487, z +7.84).
+                if f < 19 / 27:
+                    return 1.00
+                return 1.25 if f < 24 / 27 else 1.75
+            if w == "ladder":
+                if f < 10 / 27:
+                    return 0.25          # floored, not zeroed -- see the warning above
+                if f < 19 / 27:
+                    return 1.00
+                if f < 24 / 27:
+                    return 1.25
+                return 1.75
+            raise ValueError(f"unknown block_layer_weights={w!r}")
+        return [band(l) for l in range(n_layers)]
+
     def _surviving_expert_layers(self):
         """Indices of expert layers NOT replaced by identity stand-ins, or None if unpruned.
 
@@ -703,11 +780,24 @@ class KDReasoningVLA(TrainableReasoningVLA):
             would be m x the compute for the same coverage.
             ⚠️ m=1 must reduce EXACTLY to block_output_loss: same fresh single-layer cache, same
             captured kwargs, same normaliser. That equivalence is the self-test.
-            ⚠️ CHECKPOINTED per layer. The m=28 stage IS the full free-run, and retaining
-            activations for a 28-deep chain OOMed the L_freerun arm (75 -> >79 GB); its backward
-            also produced non-finite gradients in bf16, which is why the finiteness guard below
-            is not optional at the long-span stages.
+            ⚠️ CHECKPOINTED per layer, but ONLY from m >= SPAN_CKPT_MIN (default 14).
+            Retaining activations for a 28-deep chain OOMed the L_freerun arm (75 -> >79 GB), so
+            the long stages need it; its backward also produced non-finite gradients in bf16,
+            which is why the finiteness guard below is not optional there.
+            ⚠️ But checkpointing EVERY m > 1 was 4.2x slower for nothing at m=7. MEASURED on the
+            curriculum: m=1 (uncheckpointed) ran 4.81 s/it, m=7 (checkpointed) 20 s/it, with GPU
+            util at 25-35% -- the card idling while the backward serially recomputes all 28
+            blocks. The span count is DISJOINT, so m=7 does the same 28 block-forwards as m=1;
+            checkpointing was the only difference, and it doubles them. Memory said it was
+            unnecessary too: m=7 checkpointed used 66 GiB where m=1 uncheckpointed used 68.3.
+            Raise SPAN_CKPT_MIN if a mid-length stage OOMs; lower it to 2 for the old behaviour.
             """
+            # Deep chains must trade compute for memory; short ones must not (see docstring).
+            _span_ckpt = m >= int(os.environ.get("SPAN_CKPT_MIN", "14"))
+            if not getattr(self, "_span_ckpt_logged", False):
+                print(f"[span] m={m} checkpointing={'ON' if _span_ckpt else 'OFF'} "
+                      f"(SPAN_CKPT_MIN={os.environ.get('SPAN_CKPT_MIN', '14')})", flush=True)
+                self._span_ckpt_logged = True
             acc = None
             n_span = 0
             for l0 in range(0, n_layers - m + 1, m):
@@ -733,7 +823,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 for l in idx:
                     h = (torch.utils.checkpoint.checkpoint(
                             _one, h, torch.tensor(l), use_reentrant=False)
-                         if m > 1 else _one(h, torch.tensor(l)))
+                         if _span_ckpt else _one(h, torch.tensor(l)))
                 tgt = captured[idx[-1]]["y_out"].float().detach()
                 num = (h.float() - tgt).pow(2).mean()
                 if self.block_norm == "cache" and y_zero.get(idx[-1]) is not None:
@@ -756,21 +846,45 @@ class KDReasoningVLA(TrainableReasoningVLA):
             # gradient into a shared LR schedule at stage 4 is how L_roll at lambda=1 NaN'd.
             return acc / max(n_span, 1) / m if acc is not None else None
 
+        lw = self._layer_weights(n_layers)
+        if not self._blw_logged:
+            self._blw_logged = True
+            print(f"[blw] block_layer_weights={self.block_layer_weights} -> "
+                  f"{[round(x, 2) for x in lw]}", flush=True)
+
+        _bands = {"early": [None, 0], "mid": [None, 0], "deep": [None, 0]}
+
         def _sweep(k_list, v_list):
             acc = None
-            n_used = 0
+            w_used = 0.0
             for l in range(n_layers):
                 if l in skip:      # identity stand-in: B_l(h) == h, term is trivially 0
                     continue
-                n_used += 1
+                w = lw[l]
+                if w == 0.0:       # zero weight: skip the forward too, not just the term
+                    continue
                 c = captured[l]
-                term = block_output_loss(
+                term = w * block_output_loss(
                     expert.expert.layers[l], c["h_in"], c["y_out"],
                     k_list[l], v_list[l], dict(c["kwargs"]),
                     y_zero=y_zero.get(l),
                 )
                 acc = term if acc is None else acc + term
-            return acc / max(n_used, 1)
+                w_used += w
+                # per-band UNWEIGHTED means, so "did the deep layers actually improve" is
+                # answerable from the curve. The scalar block_loss is a weighted average and
+                # can fall by REALLOCATION alone, which would otherwise be invisible.
+                f = l / max(n_layers - 1, 1)
+                band = ("early" if f < 10 / 27 else
+                        "mid" if f < 19 / 27 else "deep")
+                add = term.detach() / max(w, 1e-8)   # undo the weight: report raw per-layer
+                _bands[band][0] = add if _bands[band][0] is None else _bands[band][0] + add
+                _bands[band][1] += 1
+            # ⚠️ WEIGHTED mean, divided by the weight sum rather than the layer count, so the
+            # loss MAGNITUDE is unchanged by reweighting. Dividing by n_used instead would
+            # scale the loss (and therefore the effective LR) with the profile -- the same
+            # confound the /m note on _span_sweep documents.
+            return acc / max(w_used, 1e-8)
 
         # ⚠️ DIAGNOSTIC, opt-in via BLOCK_FREERUN=1. Answers whether teacher-forcing hides
         # compounding: L_block feeds each block the TEACHER's h_l, so per-layer error is
@@ -1429,8 +1543,43 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # ⚠️ m=1 routes to _sweep (the original per-layer path) rather than _span_sweep, so
         # the m=1 stage of the schedule is bit-identical to every block-loss number already in
         # this tree -- the curriculum's first epoch is not a new objective.
-        block_term = (_sweep(s_k, s_v) if self.block_span <= 1
-                      else _span_sweep(s_k, s_v, self.block_span))
+        # ⚠️ _span_sweep compares at SPAN EXITS, so a per-layer profile has no well-defined
+        # meaning there -- applying it to the exit layer only would silently weight 1/m of the
+        # layers. Refuse rather than half-apply.
+        if self.block_span > 1 and self.block_layer_weights != "uniform":
+            raise ValueError(
+                f"block_layer_weights={self.block_layer_weights} needs block_span=1; spans "
+                "compare at exits, so a per-layer profile cannot be applied inside one.")
+        self._tf_term = self._span_term = None
+        if self.block_span_mix > 1:
+            # BOTH objectives at once: teacher-forced per-layer (each layer graded in
+            # isolation) AND the span at m (m blocks chained on the student's own cache).
+            # They constrain different things -- per-layer fidelity vs. survival of a chain --
+            # and the span curriculum showed the span term alone is nearly m-invariant, so it
+            # adds little on its own; this asks whether it adds anything ON TOP of m=1.
+            tf = _sweep(s_k, s_v)
+            sp = _span_sweep(s_k, s_v, self.block_span_mix)
+            w = self.block_span_mix_weight
+            if not self._mix_logged:
+                self._mix_logged = True
+                print(f"[mix] teacher-forced(m=1) + {w} x span(m={self.block_span_mix}), "
+                      f"weighted MEAN", flush=True)
+            self._tf_term = None if tf is None else tf.detach()
+            self._span_term = None if sp is None else sp.detach()
+            if tf is None:
+                block_term = sp
+            elif sp is None:
+                block_term = tf          # a fully non-finite span must not kill the step
+            else:
+                # ⚠️ weighted MEAN, not sum. Both terms are already per-layer-normalised, so
+                # summing them would double the gradient scale and silently change the
+                # effective LR -- the confound the /m note on _span_sweep documents.
+                block_term = (tf + w * sp) / (1.0 + w)
+        else:
+            block_term = (_sweep(s_k, s_v) if self.block_span <= 1
+                          else _span_sweep(s_k, s_v, self.block_span))
+        self._last_bands = {k: (v[0] / v[1] if v[0] is not None and v[1] else None)
+                            for k, v in _bands.items()}
         return block_term, fr_term, field_term, roll_term
 
     def forward(
@@ -1698,6 +1847,11 @@ class KDReasoningVLA(TrainableReasoningVLA):
                         if getattr(self, "_kv_ratio_k", None) is not None else None),
             kv_ratio_v=(torch.tensor(self._kv_ratio_v)
                         if getattr(self, "_kv_ratio_v", None) is not None else None),
+            block_loss_tf=getattr(self, "_tf_term", None),
+            block_loss_span=getattr(self, "_span_term", None),
+            block_loss_early=getattr(self, "_last_bands", {}).get("early"),
+            block_loss_mid=getattr(self, "_last_bands", {}).get("mid"),
+            block_loss_deep=getattr(self, "_last_bands", {}).get("deep"),
             kv_loss_vision=region_losses.get("vision"),
             kv_loss_text=region_losses.get("text"),
             kv_loss_traj=region_losses.get("traj"),

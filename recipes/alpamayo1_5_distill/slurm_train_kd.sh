@@ -144,6 +144,48 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    block2bmix)
+        # BOTH block objectives: teacher-forced per-layer (m=1) + span(m=7), weighted mean.
+        # Rationale: alone, the span term is nearly m-INVARIANT (0.0017 at m=1 -> 0.00093 at
+        # m=28 on the weights it inherited) and the four-stage curriculum was a null result
+        # (min_ade 2.8367 -> 2.3760, last stage z=-1.90 / +0.63). Layer REWEIGHTING was worse
+        # still (+0.1487 and +0.1787 vs uniform). This asks the remaining question about the
+        # span term: does chaining add anything ON TOP of per-layer teacher forcing, rather
+        # than instead of it. Same 2-camera stack; block_span stays 1 so _sweep is the m=1
+        # path bit-identical to every prior block number.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-7}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        # the mix parameters go in the ARM name -- RUN_TAG derives from ARM alone, so two
+        # configurations under one ARM would share an output_dir and a wandb id (job 493).
+        ARM="${ARM}_m${MIXM:-7}w${MIXW:-1.0}" ;;
+    block2bdepth)
+        # DEPTH-WEIGHTED block loss, from the cache ladder rather than from a guess.
+        # The span curriculum was a null result (min_ade 2.8367 -> 2.3760 over four epochs,
+        # the last stage z=-1.90 on min_ade and +0.63 on ade) because spans probe compounding
+        # ACROSS LAYERS, and the ladder showed that compounding is damped by construction:
+        # substituting the teacher's cache into layers 0-9 moves min_ade +0.0120 against a
+        # 0.034 noise floor, while layers 19-27 alone recover 95% of the -1.3452 gap. A
+        # uniform per-layer mean therefore spends the student on layers the expert ignores.
+        # Same 2-camera stack and span=1 as the curriculum's first stage, so the ONE
+        # difference from the m=1 epoch (min_ade 2.8367 / ade 5.8744) is the weighting.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_layer_weights="${BLW:-ladder}")
+        # ⚠️ The WEIGHTING GOES IN THE ARM NAME. RUN_TAG is derived from ARM alone, so two
+        # profiles under one ARM share an output_dir: the second run would overwrite the
+        # first's checkpoint AND be handed its .wandb_id, appending a different objective's
+        # curve onto a finished run. Caught mid-flight once (job 493 vs 489's jxtq7mk7).
+        ARM="${ARM}_${BLW:-ladder}" ;;
     block2bspan)
         # The SPAN CURRICULUM: same 2-camera stack as block2b2cam, but its own output_dir.
         # ⚠️ That separation is not cosmetic. Reusing block2b2cam's dir meant (a) save_total_limit
