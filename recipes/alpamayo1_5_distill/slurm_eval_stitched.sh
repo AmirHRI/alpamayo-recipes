@@ -94,7 +94,23 @@ else
         [[ -z "$CKPT" ]] && { echo "[slurm] no checkpoint for ARM=$ARM" >&2; exit 1; }
     fi
 fi
-TAG="stitch_${MODEL_TAG}_${ARM}_$(basename "$CKPT")"
+# CAMERAS=[1,3] -> evaluate on that camera SUBSET, with the prompt rebuilt from it.
+# ⚠️ REQUIRED for any arm trained on a subset. block2bspan / block2b2cam train on cameras
+# [1,3] (sft_kd_cosmos2b_2cam_lcdrive), but the val_dataset shipped here is the 4-camera
+# PAIDataset -- so scoring one of those students without this is the SAME off-distribution
+# error as dropping the camera-id flags, which moved min_ade 1.116 -> 0.626. It desynchronises
+# both halves of the stitch at once: the student never saw 4 cameras, and the expert reads a
+# cache built from a prompt the student was not trained on.
+# evaluate_hf.py:79 instantiates val_dataset with model_config=model.config, which is the
+# argument CameraSubsetPAIDataset needs; the base _target_ comes from sft_base.
+TAG_SUF=""
+if [[ -n "${CAMERAS:-}" ]]; then
+    EXTRA+=(++data.val_dataset._target_=alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+            ++data.val_dataset.cameras="$CAMERAS")
+    TAG_SUF="_cam$(tr -d '[], ' <<< "$CAMERAS")"
+    echo "[slurm] CAMERAS=$CAMERAS -> CameraSubsetPAIDataset, prompt rebuilt"
+fi
+TAG="stitch_${MODEL_TAG}_${ARM}_$(basename "$CKPT")${TAG_SUF}"
 echo "[slurm] ARM=$ARM ckpt=$CKPT -> $OUT_DIR/$TAG.json"
 
 "${LAUNCH[@]}" "$VENV/torchrun" --nproc_per_node 1 --master_port "$MASTER_PORT" \

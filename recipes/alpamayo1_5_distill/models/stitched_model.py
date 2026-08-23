@@ -458,9 +458,19 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         num_traj_sets: int = 1,
         diffusion_kwargs: dict[str, Any] | None = None,
         return_action: bool = False,
+        cache_hook: Any = None,
+        step_probe: Any = None,
         **kwargs: Any,
     ):
         """Prefill the VLM once, hand that cache to the expert. No generation.
+
+        ``cache_hook(cache, input_ids, tokenized_data) -> cache`` (default None) intercepts the
+        prefill cache before it is batch-expanded, so a caller can SUBSTITUTE part of it. That
+        is the only way to ask "which part of the cache does the expert actually need": the
+        expert's inputs are exactly (noisy action embedding, VLM cache), and the action
+        embedding is the shared action_in_proj of the same traj_data, so 100% of a student's
+        trajectory gap is attributable to the cache. Swapping teacher K/V into chosen
+        layers/positions and re-reading min_ade localises it. Left None the path is unchanged.
 
         **Why this is not an approximation of the rollout -- it is the same measurement.**
         ``sample_trajectories_from_data_with_vlm_rollout`` calls ``vlm.generate`` and then
@@ -499,6 +509,9 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         prompt_cache, prefill_seq_len, rope_deltas = self._prefill_prompt_cache(
             input_ids, tokenized_data
         )
+        if cache_hook is not None:
+            # BEFORE _expand_cache: the hook sees one row per clip, not one per traj sample.
+            prompt_cache = cache_hook(prompt_cache, input_ids, tokenized_data)
 
         # Where does the prompt end? The same rule the rollout uses, applied to the PROMPT:
         # first <|traj_future_start|>, inclusive. ⚠️ Sequences are right-padded to the batch
@@ -542,6 +555,8 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         if self.config.expert_non_causal_attention:
             forward_kwargs["is_causal"] = False
 
+        _step = {"i": 0}
+
         def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             # ⚠️ AUTOCAST here, not at the call site. `action_in_proj` (PerWaypointActionInProjV2)
             # forces `x.float()` internally, so its fp32 activations meet bf16 weights and raise
@@ -566,9 +581,18 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
             prompt_cache.crop(prefill_seq_len)
             last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                return self.action_out_proj(last_hidden).view(
-                -1, *self.action_space.get_action_space_dims()
-            )
+                vel = self.action_out_proj(last_hidden).view(
+                    -1, *self.action_space.get_action_space_dims()
+                )
+            # ``step_probe(i, t, x, last_hidden, vel)`` (default None) exposes the tensors on
+            # BOTH sides of the action head at every Euler step: `last_hidden` is pre-head,
+            # `vel` is post-head. Both have been used as training targets (L_block matches the
+            # former, L_field the latter) but neither has ever been checked for whether it
+            # PREDICTS per-clip ade -- which is what a proxy has to do to be worth optimising.
+            if step_probe is not None:
+                step_probe(_step["i"], t, x, last_hidden, vel)
+                _step["i"] += 1
+            return vel
 
         sampled_action = self.diffusion.sample(
             batch_size=b_star, step_fn=step_fn, device=device,
