@@ -317,6 +317,87 @@ Baselines this arm must be read against (n=1000, stitched, LCDrive val):
 
 ---
 
+## 9. The 2B plateau: five hypotheses, one survivor
+
+`L_block` on the 2B converges to `block_loss` ~8.8e-4 and stops. Stitched eval at
+checkpoint-3000: **min_ade 2.6444 / ade 4.8203** (n=1000, tripwires clean, mode-collapse 16.7%
+which is inside the 15.6-17.8% band of every other arm). Against the teacher's 0.5776 and the
+pruned expert's 0.7893 ceiling, that is a large gap, and the obvious explanations were tested
+one at a time. Four failed.
+
+| hypothesis | probe | verdict |
+|---|---|---|
+| compounding along LAYERS hides error from `L_block` | span n = 1/2/4/7/14 | **refuted**: amplification 1.08 -> 1.19 to n=7, then **0.88** at n=14 |
+| the 10-step ODE integrates a biased field error | rollout vs per-step sum | **refuted**: endpoint error *below* the sum (0.69), though bias cos = 0.93 |
+| MSE is the wrong readout (direction vs scale) | cosine decomposition | **refuted**: `mse = 2(1-cos)` to 3 digits, scale term 1000x smaller |
+| the velocity head is under-weighted | `L_field` arm, lambda 2e-4 and 1e-3 | **no effect**: block and field both flat over 715 steps |
+| the LR is too low to escape | 5e-5 and 1e-4, 300 steps | **refuted**: both DAMAGED it (1.25e-3 / 1.44e-3 vs 8.8e-4) |
+| aggregate capacity | single-clip overfit | **survives**: 1.85e-4, **5x below** the training floor, still falling |
+
+**The span curve is the interesting one.** Amplification rises with span length only to n = 7 and
+then falls below 1, because the two halves differ: layers 0-13 amplify (1.23) and layers 14-27
+**contract** (0.79). So the deep half damps what the shallow half amplifies.
+
+**And it corrects a conclusion recorded earlier in this file's history.** The "32x" free-running
+ratio was read as evidence that compounding dominates. It is `fr_last / tf_MEAN`, so it is
+~L x 1: measured `fr_last / (L x tf_mean)` is **0.74** (4B) and **0.92** (2B). Errors accumulate
+ADDITIVELY along depth, and `L_block` already minimises that sum. Only the ~14% amplification
+was ever invisible to it.
+
+**Why "small loss, bad model" is not a paradox.** Every stage on one scale (2B, RMS):
+
+| stage | RMS | factor |
+|---|---|---|
+| per-layer block output (what `L_block` trains) | 3.2% | - |
+| accumulated over 28 layers | 18.5% | x5.8 |
+| after `action_out_proj` -> velocity | 30% | x1.6 |
+| after 10 Euler steps -> action | 50% | x1.7 |
+
+3.2% per layer becomes a 50% endpoint error. Calibrating min_ade against final-layer RMS
+(teacher 0%/0.5776, 4B 11.4%/1.6008, 2B 18.5%/2.6444) gives ~0.09-0.11 min_ade per 1% RMS, so
+reaching min_ade ~1.0 needs the per-layer error **~13x lower** -- which no reweighting delivers.
+
+**The cache is not "mis-rotated" either.** A closed-form ridge fit from the student's pre-RoPE
+K/V to the teacher's at pi(j), scored on held-out clips, cuts the raw distance 20x (K) and 13.5x
+(V) but leaves 0.37 / 0.73 where predicting zero scores 1.0. Meanwhile the same checkpoint
+matches the expert's *block outputs* to 1.14e-3. The student found a cache that is 744%
+different from the teacher's in raw terms and functionally equivalent to 0.1% -- so raw-cache
+equality is neither necessary nor achievable, and an adapter fitted to K/V distance would
+optimise something the expert ignores. (This is also a mechanism for `L_KV` losing to `L_block`
+by -0.752, z = -11.53, though that was measured on the 4B, not here.)
+
+**What did work: train the expert on the student's cache** (`sft_expert_on_student_2b_lcdrive`),
+1 epoch, VLM frozen, 1.77 B trainable:
+
+| | min_ade | ade |
+|---|---|---|
+| 2B student + frozen teacher expert | 2.6444 | 4.8203 |
+| **2B student + expert trained on it** | **2.3668** | **3.8103** |
+
+Paired n=1000: min_ade **-0.2776, z = -7.51**, better on 63.0% of clips; ade **-1.0099,
+z = -13.42**, better on 72.7%. That closes 13.4% of the gap to the teacher (the 4B's version
+closed 19%, but this is larger in absolute terms: -0.278 vs -0.196). Note the `ade` gain (-21%)
+is twice the `min_ade` gain (-10.5%) -- the typical draw improved more than the best-of-6,
+which is the metric deployment actually gets.
+
+### Deployment latency (H100, bs=1, sdpa, bf16, model only)
+
+| cameras x 4 frames | tokens | 2B prefill | 2B step | 2B total | 4B prefill | 4B step | 4B total |
+|---|---|---|---|---|---|---|---|
+| 4 | 3073 | 90.7 | 14.9 | **240.2** | 131.6 | 21.6 | **347.7** |
+| 3 (L/wide/R) | 2324 | 70.2 | 16.1 | 231.2 | 101.5 | 18.1 | 282.5 |
+| 2 (wide+tele) | 1577 | 50.0 | 14.4 | 194.1 | 69.5 | 18.1 | 250.9 |
+| 1 (wide) | 828 | 30.6 | 14.6 | 176.9 | 40.6 | 18.1 | 221.3 |
+
+Prefill is linear in tokens (2B 0.0295 ms/tok, 4B 0.0428). The expert step is **flat** in camera
+count -- it is 28 (or 36) blocks over 64 action tokens, not a function of cache length -- so the
+10 denoising steps are a 150-215 ms floor that no camera reduction touches, and are 60-65% of
+total latency everywhere. At 4 cameras the 2B buys 107 ms (-31%) for +0.96 min_ade. Halving
+`num_inference_steps` would save ~108 ms on the 4B alone, i.e. the same latency the entire 2B
+distillation delivers.
+
+---
+
 ## 9. Lessons
 
 1. **Similarity metrics did not predict causal damage.** Three refutations: `kvband`

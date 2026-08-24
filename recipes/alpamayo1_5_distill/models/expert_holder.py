@@ -47,7 +47,10 @@ logger = logging.getLogger(__name__)
 #: Teacher tensors this module owns. `vlm.*` is excluded -- that is the whole point --
 #: and so is `action_out_proj`: L_block compares BLOCK OUTPUTS, never the predicted
 #: velocity, so the output head is never called. `diffusion` has no parameters at all.
-PREFIXES = ("expert.", "action_in_proj.")
+#: ``action_out_proj`` is loaded ALWAYS since L_field: it is the velocity head, ~12
+#: tensors, and the term that matters most is measured through it. Leaving it out
+#: would let it sit at its random init and produce a healthy-looking loss on noise.
+PREFIXES = ("expert.", "action_in_proj.", "action_out_proj.")
 
 
 def _read_config(checkpoint_path: str) -> dict:
@@ -90,6 +93,24 @@ class FrozenExpert(nn.Module):
             out_dim=expert_config.hidden_size,
         )
 
+        # ⚠️ action_out_proj + diffusion are loaded ONLY for BLOCK_ODE=1. L_block compares block
+        # OUTPUTS and never the predicted velocity, so the training path genuinely does not need
+        # them (see the note above); the ODE diagnostic integrates the real sampler and does.
+        # ⚠️ kwargs mirror AlpamayoR1.__init__ exactly (in_features/out_features, and
+            # x_dims on the sampler). Guessing the names here builds a differently-shaped head
+            # that then fails to load, or worse, loads partially.
+        self.action_out_proj = instantiate(
+            cfg["action_out_proj_cfg"],
+            in_features=expert_config.hidden_size,
+            out_features=self.action_space.get_action_space_dims()[-1],
+        )
+        # The sampler holds NO parameters and is needed by both the ODE probe and the rollout
+        # objective (for its t grid and step count), so it is always built.
+        self.diffusion = instantiate(
+            cfg["diffusion_cfg"], x_dims=self.action_space.get_action_space_dims()
+        )
+        self._ode = os.environ.get("BLOCK_ODE") == "1"
+
         self._load(checkpoint_path)
         self.eval()
         for p in self.parameters():
@@ -103,11 +124,12 @@ class FrozenExpert(nn.Module):
         index = os.path.join(checkpoint_path, "model.safetensors.index.json")
         with open(index) as fh:
             weight_map = json.load(fh)["weight_map"]
-        wanted = [k for k in weight_map if k.startswith(PREFIXES)]
+        prefixes = PREFIXES
+        wanted = [k for k in weight_map if k.startswith(prefixes)]
         state: dict[str, torch.Tensor] = {}
         for shard in sorted({weight_map[k] for k in wanted}):
             sd = load_file(os.path.join(checkpoint_path, shard))
-            state.update({k: v for k, v in sd.items() if k.startswith(PREFIXES)})
+            state.update({k: v for k, v in sd.items() if k.startswith(prefixes)})
         # ⚠️ DEPTH REMAP. The expert's layer count is derived from the VLM's text config, so a
         # 28-layer student (Cosmos-Reason2-2B) yields a 28-layer expert while the teacher
         # checkpoint holds 36. Pruning is therefore a LOAD-TIME REMAP -- teacher expert layer
@@ -149,10 +171,41 @@ class FrozenExpert(nn.Module):
         params = dict(self.named_parameters())
         # Only a missing PARAMETER is a fault; deterministic buffers (action_in_proj.*.freqs)
         # are recomputed at init and are absent from the checkpoint by design.
-        bad = [k for k in missing if k.startswith(PREFIXES) and k in params]
+        bad = [k for k in missing if k.startswith(prefixes) and k in params]
         if unexpected or bad:
             raise RuntimeError(f"frozen expert load failed: unexpected={unexpected[:5]} missing={bad[:5]}")
         logger.info(f"[block] frozen expert: {len(state)} tensors, {len(self.expert.layers)} layers")
+
+    def velocity(self, h_last: torch.Tensor) -> torch.Tensor:
+        """Final block output -> predicted velocity, the quantity the trajectory depends on.
+
+        ⚠️ The expert applies its FINAL NORM before ``last_hidden_state``
+        (``modeling_qwen3.py:421``), so the head must be fed ``norm(h)``, not ``h``. Skipping
+        it is the same class of bug that pinned ``freerun_loss`` at 0.999: it runs, it is
+        finite, and it measures the wrong thing. Owned here so L_field and the ODE probe
+        cannot drift apart.
+        """
+        h = self.expert.norm(h_last)
+        return self.action_out_proj(h).view(-1, *self.x_dims)
+
+    def noisy_x(self, traj_data: dict, t: torch.Tensor, device):
+        """The raw noisy ACTION at ``t`` -- the sampler's state, before ``action_in_proj``.
+
+        ``noisy_action_embeds`` returns the projected embeddings; a rollout needs the state
+        itself so it can be advanced by ``x + dt * v``. Same interpolation, same convention:
+        ``noisy_x = t * x + (1 - t) * noise``.
+        """
+        action = self.action_space.traj_to_action(
+            traj_history_xyz=traj_data["ego_history_xyz"],
+            traj_history_rot=traj_data["ego_history_rot"],
+            traj_future_xyz=traj_data["ego_future_xyz"],
+            traj_future_rot=traj_data["ego_future_rot"],
+        ).reshape(-1, *self.x_dims).to(device=device, dtype=torch.float32)
+        noise = torch.randn(action.shape, device=device, dtype=torch.float32)
+        tt = t.to(device=device, dtype=torch.float32)
+        while tt.dim() < action.dim():
+            tt = tt.unsqueeze(-1)
+        return tt * action + (1.0 - tt) * noise
 
     def noisy_action_embeds(self, traj_data: dict, t: torch.Tensor, device, dtype):
         """Action embeddings at a SAMPLED point on the flow, built from the GT trajectory.

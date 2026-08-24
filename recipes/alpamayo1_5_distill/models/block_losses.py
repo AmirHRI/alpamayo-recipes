@@ -100,6 +100,7 @@ def block_output_loss(
     student_v: torch.Tensor,
     layer_kwargs: dict,
     normalize: bool = True,
+    y_zero: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One layer's normalized MSE and cosine distance, kept apart -- NOT summed.
 
@@ -121,10 +122,13 @@ def block_output_loss(
             form and computes mrope embeddings, and a hand-built substitute attends
             differently. ``past_key_values`` is supplied here and must be absent from this
             dict.
-        normalize: divide the MSE term by the teacher output's mean square so per-layer terms
-            are commensurable. Expert activations span orders of magnitude across depth, so
-            without this the largest layers own the gradient. The cosine term is already
-            scale-free and is never divided by this.
+        normalize: divide the MSE term so per-layer terms are commensurable. Expert
+            activations span orders of magnitude across depth, so without this the largest
+            layers own the gradient. The cosine term is already scale-free and is never
+            divided by this.
+        y_zero: this layer's output driven by a ZERO cache, detached. When given, the MSE
+            normaliser becomes ``||y_teacher - y_zero||^2`` -- the cache-attributable part of
+            the output -- instead of ``||y_teacher||^2``. See the note at the division.
 
     Returns:
         ``(mse, cosine)`` -- normalized MSE and cosine distance, unsummed.
@@ -140,9 +144,74 @@ def block_output_loss(
     y_s, y_t = y_student.float(), y_teacher.float().detach()
     mse = (y_s - y_t).pow(2).mean()
     if normalize:
-        # Guarded: a layer whose teacher output is ~0 would divide by ~0 and produce an inf
-        # that poisons the whole sum.
-        scale = y_t.pow(2).mean().clamp_min(1e-6)
-        mse = mse / scale
+        if y_zero is not None:
+            # ⚠️ CACHE-ATTRIBUTABLE normalisation. Dividing by ||y_teacher||^2 (the old default)
+            # normalises by the WHOLE block output, which is dominated by the residual stream --
+            # a component the student cannot get wrong. MEASURED: driving the block with a ZERO
+            # cache scores only 0.0104, so 99% of ||y_teacher||^2 is cache-independent and the
+            # entire informative band is 0..0.0104 while a trained student sits at 0.0012. It has
+            # already captured 88% of the band, and the whole remaining gap to the teacher lives
+            # in the last 12% -- which is why 500 steps moved this loss within noise while `ade`
+            # moved -13% at z=-3.44.
+            # Dividing by ||y_teacher - y_zero||^2 -- what the cache actually contributes at this
+            # layer -- makes zero-cache score exactly 1.0, puts the model at ~0.115, and weights
+            # layers by how much the cache controls them rather than by residual magnitude.
+            # ⚠️ Adam is per-parameter scale-invariant, so this changes the CROSS-LAYER weighting
+            # and the readability of the curve, NOT the gradient direction within a layer. Do not
+            # expect it to close a capacity gap: the same loss reaches 1.85e-4 on a single clip,
+            # 5x below the training floor, so the floor is aggregate capacity, not conditioning.
+            scale = (y_t - y_zero.float().detach()).pow(2).mean()
+        else:
+            scale = y_t.pow(2).mean()
+        # Guarded: a layer whose normaliser is ~0 would divide by ~0 and produce an inf that
+        # poisons the whole sum. For the cache-attributable form that means a layer the cache
+        # genuinely does not affect -- correctly contributing ~nothing rather than exploding.
+        mse = mse / scale.clamp_min(1e-6)
     cosine = 1.0 - torch.nn.functional.cosine_similarity(y_s, y_t, dim=-1).mean()
     return mse, cosine
+
+
+def block_span_output(
+    blocks: list[torch.nn.Module],
+    h_in: torch.Tensor,
+    student_k: list[torch.Tensor],
+    student_v: list[torch.Tensor],
+    layer_kwargs: list[dict],
+) -> torch.Tensor:
+    """Chain ``len(blocks)`` expert blocks on the STUDENT's cache from one teacher-forced entry.
+
+    The span generalisation of :func:`block_output_loss`: teacher-force only ``h_in`` (the
+    span ENTRY) and let each block feed the next, so an error injected at the first layer is
+    carried -- and possibly amplified -- by the rest of the span. At ``len(blocks) == 1`` this
+    is exactly what ``block_output_loss`` evaluates, which is the self-test worth running.
+
+    ⚠️ Each block gets its OWN fresh single-layer cache seeded with that layer's prefix, and
+    its OWN captured kwargs. Reusing one DynamicCache across the span would let layer l+1
+    attend to the action K/V that layer l appended -- the expert's layers do not share a cache
+    slot, and that would silently change what is being measured.
+
+    Returns:
+        The span's output, ``B_{l+n-1}(...B_l(h_in)...)``.
+    """
+    h = h_in
+    for blk, k, v, kw in zip(blocks, student_k, student_v, layer_kwargs):
+        cache = DynamicCache()
+        cache.update(k, v, 0, {})
+        with _as_layer0(blk):
+            out = blk(h, past_key_values=cache, use_cache=True, **kw)
+        h = out[0] if isinstance(out, tuple) else out
+    return h
+
+
+def block_output_only(block, h_in, k, v, layer_kwargs) -> torch.Tensor:
+    """One block's output for a given cache -- the loss's building block, without the loss.
+
+    Used for the ZERO-cache baseline that ``block_output_loss(y_zero=...)`` normalises by.
+    Identical driving to :func:`block_output_loss` (fresh single-layer cache, borrowed
+    ``layer_idx``, captured kwargs) so the baseline is comparable term by term.
+    """
+    cache = DynamicCache()
+    cache.update(k, v, 0, {})
+    with _as_layer0(block):
+        out = block(h_in, past_key_values=cache, use_cache=True, **layer_kwargs)
+    return (out[0] if isinstance(out, tuple) else out).detach()

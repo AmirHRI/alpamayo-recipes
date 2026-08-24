@@ -144,6 +144,125 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    nav2bmix)
+        # 2B student, 2 front cameras, NAV-CONDITIONED, on the teacher-forced block loss (m=1)
+        # AND the m=7 span loss at EQUAL weight (block_span_mix=7, weight 1.0 -> weighted mean).
+        # ⚠️ t0 is per-ANNOTATION (116 distinct values, event-anchored), NOT the 5.1 s keyframe,
+        # so NOTHING here is comparable to the arms that use the default -- this run needs its
+        # own no-nav control on the same annotations before its number means anything.
+        # ⚠️ The route reaches BOTH towers: they read one input_ids tensor, and the config puts
+        # "route" in components_order (CameraSubsetPAIDataset raises if it is missing).
+        # SPEED: m=7 < SPAN_CKPT_MIN=14, so the span chain is UNCHECKPOINTED (4.3x measured);
+        # the mix still costs ~2x block-only because it runs both sweeps.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_nav_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-7}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        ARM="${ARM}_m${MIXM:-7}w${MIXW:-1.0}" ;;
+    field2b)
+        # L_FIELD ALONE on the 2B/pruned-expert 2-camera stack: chain all 28 layers on the
+        # STUDENT's own cache (no teacher forcing anywhere), take expert.norm +
+        # action_out_proj, and MSE the VELOCITY against the teacher's, at a random t.
+        # Never run before -- L_field only ever ran ALONGSIDE L_block (arm blockfield, which
+        # itself never got past checkpoint-500 and was never evaluated).
+        # WHY: BLOCK_ODE measured the velocity at 30% RMS error while the hidden states
+        # L_block matches are only 3.2% off per layer (PRUNING.md:353) -- the quantity the
+        # trajectory integrates is 10x more wrong than the one four epochs optimised.
+        # AGAINST: L_field's gradient reaches shallow layers only through the contractive deep
+        # half, so it may under-train them -- and ladder_add showed under-training early layers
+        # hurts even though the ladder says the EXPERT ignores them (the VLM compounds forward).
+        # The two arguments point opposite ways, which is why this is measured not argued.
+        # Matched control: the block-only epoch 1 from scratch, min_ade 2.8367 / ade 5.8744.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=0.0 ++model.kd.block_timestep=beta
+                ++model.kd.field_weight="${FIELD_W:-1.0}") ;;
+    block2bmix)
+        # BOTH block objectives: teacher-forced per-layer (m=1) + span(m=7), weighted mean.
+        # Rationale: alone, the span term is nearly m-INVARIANT (0.0017 at m=1 -> 0.00093 at
+        # m=28 on the weights it inherited) and the four-stage curriculum was a null result
+        # (min_ade 2.8367 -> 2.3760, last stage z=-1.90 / +0.63). Layer REWEIGHTING was worse
+        # still (+0.1487 and +0.1787 vs uniform). This asks the remaining question about the
+        # span term: does chaining add anything ON TOP of per-layer teacher forcing, rather
+        # than instead of it. Same 2-camera stack; block_span stays 1 so _sweep is the m=1
+        # path bit-identical to every prior block number.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-7}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        # the mix parameters go in the ARM name -- RUN_TAG derives from ARM alone, so two
+        # configurations under one ARM would share an output_dir and a wandb id (job 493).
+        ARM="${ARM}_m${MIXM:-7}w${MIXW:-1.0}" ;;
+    block2bdepth)
+        # DEPTH-WEIGHTED block loss, from the cache ladder rather than from a guess.
+        # The span curriculum was a null result (min_ade 2.8367 -> 2.3760 over four epochs,
+        # the last stage z=-1.90 on min_ade and +0.63 on ade) because spans probe compounding
+        # ACROSS LAYERS, and the ladder showed that compounding is damped by construction:
+        # substituting the teacher's cache into layers 0-9 moves min_ade +0.0120 against a
+        # 0.034 noise floor, while layers 19-27 alone recover 95% of the -1.3452 gap. A
+        # uniform per-layer mean therefore spends the student on layers the expert ignores.
+        # Same 2-camera stack and span=1 as the curriculum's first stage, so the ONE
+        # difference from the m=1 epoch (min_ade 2.8367 / ade 5.8744) is the weighting.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_layer_weights="${BLW:-ladder}")
+        # ⚠️ The WEIGHTING GOES IN THE ARM NAME. RUN_TAG is derived from ARM alone, so two
+        # profiles under one ARM share an output_dir: the second run would overwrite the
+        # first's checkpoint AND be handed its .wandb_id, appending a different objective's
+        # curve onto a finished run. Caught mid-flight once (job 493 vs 489's jxtq7mk7).
+        ARM="${ARM}_${BLW:-ladder}" ;;
+    block2bspan)
+        # The SPAN CURRICULUM: same 2-camera stack as block2b2cam, but its own output_dir.
+        # ⚠️ That separation is not cosmetic. Reusing block2b2cam's dir meant (a) save_total_limit
+        # would have pruned job 470's checkpoints -- including the 3597 that was already
+        # evaluated -- and (b) wandb_utils found the previous run's state in the dir and RESUMED
+        # run evdhdhs1, appending a from-scratch curriculum onto a finished 3-epoch run's curves.
+        # A new ARM gives a clean checkpoint namespace and a fresh wandb run.
+        # block_span is passed per stage via EXTRA_ARGS: 1 -> 7 -> 14 -> 28, one epoch each.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher) ;;
+    block2b2cam)
+        # 2B student + pruned expert, L_block with sampled t, but TWO cameras (front-wide +
+        # telephoto, ~1577 tokens instead of 3073) and the ViT at the FULL learning rate.
+        # See configs/sft_kd_cosmos2b_2cam_lcdrive.yaml for why both.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    blockfield)
+        # L_block + L_field on the 2B/pruned-expert stack. L_field matches the VELOCITY
+        # (action_out_proj output), which the BLOCK_ODE probe measured at 30% RMS error while
+        # the hidden states L_block matches are only 3.2% off per layer -- the head reads one
+        # narrow projection that the uniform hidden-state loss under-weights.
+        # ⚠️ Runs ALONGSIDE L_block, not instead of it: L_field's gradient reaches shallow
+        # layers only through the deep half, which is contractive (0.79 across layers 14-27),
+        # so on its own it would under-train exactly where L_block is strongest.
+        # FIELD_W calibrates the mix; 1.0 is a starting point, not a measured optimum.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.field_weight="${FIELD_W:-1.0}") ;;
     blockfr)
         # L_block + L_freerun: keep the teacher-forced per-layer term AND add a term on the
         # student's OWN chain at the final layer, which is the only place compounding shows.

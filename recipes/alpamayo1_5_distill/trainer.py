@@ -50,7 +50,16 @@ AUX_LOSS_KEYS = (
     "block_loss",
     "block_loss_mse",
     "block_loss_cosine",
+    "block_loss_tf",
+    "block_loss_span",
+    "block_loss_early",
+    "block_loss_mid",
+    "block_loss_deep",
     "freerun_loss",
+    "field_loss",
+    "roll_loss",
+    "kv_ratio_k",
+    "kv_ratio_v",
 )
 
 #: Parameters excluded from weight decay on top of HF's own bias/norm exclusions.

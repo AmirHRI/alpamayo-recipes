@@ -55,10 +55,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import torch
+import einops
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.models.token_utils import to_special_token
 from safetensors.torch import load_file
 
 from alpamayo1_5_sft.models.sft_alpamayo_r1 import TrainableAlpamayoR1
@@ -143,12 +146,57 @@ def _load_teacher_non_vlm(checkpoint_path: str, model: torch.nn.Module) -> None:
     for shard in sorted({weight_map[k] for k in wanted}):
         shard_sd = load_file(os.path.join(checkpoint_path, shard))
         state.update({k: v for k, v in shard_sd.items() if k.startswith(TEACHER_PREFIXES)})
+    # Captured BEFORE the remap below renames keys: the "was every wanted tensor actually read
+    # from a shard?" check has to run on checkpoint names, not remapped ones.
+    loaded_orig = set(state)
+
+    # ⚠️ DEPTH REMAP, mirroring expert_holder._load. The expert's layer count is derived from
+    # the VLM's text config, so stitching a 28-layer student (Cosmos-Reason2-2B) builds a
+    # 28-layer expert while this checkpoint holds 36 -- and the strict checks below would fire
+    # on unexpected=['expert.layers.28...']. PRUNE_EXPERT_LAYERS names the teacher layers to
+    # DROP; the survivors in order are pi, and teacher expert layer pi(j) becomes slot j, the
+    # SAME map training used. Getting this wrong does not crash, it silently evaluates a
+    # differently-wired expert, so the count is asserted rather than trusted.
+    # NOTE: this is the alternative to _apply_expert_pruning, not a companion to it. That one
+    # keeps 36 slots and bypasses 8 (the ablation); this one builds 28 real ones.
+    n_have = len(model.expert.layers)
+    n_ckpt = 1 + max((int(m.group(1)) for m in
+                      (re.match(r"expert\.layers\.(\d+)\.", k) for k in state) if m),
+                     default=-1)
+    if n_ckpt > n_have:
+        drop = {int(x) for x in os.environ.get("PRUNE_EXPERT_LAYERS", "").split(",") if x.strip()}
+        surv = [i for i in range(n_ckpt) if i not in drop]
+        if len(surv) != n_have:
+            raise RuntimeError(
+                f"expert depth {n_have} but checkpoint has {n_ckpt}; PRUNE_EXPERT_LAYERS must "
+                f"drop exactly {n_ckpt - n_have} layers (currently drops {len(drop)})")
+        remap = {pi: j for j, pi in enumerate(surv)}
+        out: dict[str, torch.Tensor] = {}
+        for k, v in state.items():
+            m = re.match(r"(expert\.layers\.)(\d+)(\..*)", k)
+            if not m:
+                out[k] = v
+                continue
+            if int(m.group(2)) in remap:
+                out[f"{m.group(1)}{remap[int(m.group(2))]}{m.group(3)}"] = v
+        # `wanted`/`unloaded` below are keyed by the ORIGINAL names, so drop the 8 removed
+        # layers from the expectation too -- otherwise a correct load reports them unloaded.
+        for k in list(wanted):
+            m = re.match(r"expert\.layers\.(\d+)\.", k)
+            if m and int(m.group(1)) not in remap:
+                wanted.remove(k)
+        state = {k: v for k, v in out.items()}
+        logger.warning("[stitch] expert DEPTH REMAP %d -> %d layers; dropped %s",
+                       n_ckpt, n_have, sorted(drop))
+        print(f"[stitch] expert REMAP {n_ckpt}->{n_have}, dropped {sorted(drop)}", flush=True)
 
     missing, unexpected = model.load_state_dict(state, strict=False)
     # `missing` is dominated by every vlm.* key, which is correct and expected here -- the
     # student's VLM weights are already in place and must NOT be overwritten. What must be
     # empty is `unexpected`, and no teacher-side key may be left unloaded.
-    unloaded = sorted(set(wanted) - set(state))
+    # ⚠️ compare on the PRE-remap names: the remap renames keys, so checking `state`
+    # directly would report every renamed tensor as unloaded.
+    unloaded = sorted(set(wanted) - loaded_orig)
     # A missing teacher-side key is only a real fault if it is a PARAMETER. Deterministic
     # buffers -- e.g. action_in_proj.sinus.*.freqs, the sinusoidal frequency tables -- are
     # recomputed at __init__ and are absent from the checkpoint by design, so demanding them
@@ -357,6 +405,221 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         _apply_expert_pruning(model)
         return model
 
+    # ------------------------------------------------------------------ prefill-only
+    @torch.no_grad()
+    def _prefill_prompt_cache(self, input_ids, tokenized_data):
+        """One prefill of the prompt. Returns (cache, prefill_len, rope_deltas).
+
+        ⚠️ ``logits_to_keep=1``: nothing here reads the LM head, and without it this pays a
+        [T, 155697] vocab matmul per clip and throws it away -- the same waste the training
+        forward already avoids.
+        """
+        out = self.vlm(
+            input_ids=input_ids,
+            use_cache=True,
+            logits_to_keep=1,
+            **tokenized_data,
+        )
+        cache = out.past_key_values
+        return cache, cache.get_seq_length(), self.vlm.model.rope_deltas
+
+    @staticmethod
+    def _expand_cache(cache, n: int) -> None:
+        """Repeat every cached K/V ``n`` times along BATCH, in place.
+
+        The 6 trajectory samples of a clip share one prompt, so they share one prefill; only
+        the diffusion noise differs. ``generate(num_return_sequences=n)`` instead expands the
+        batch BEFORE prefill and pays for n identical prefills (plus n ViT passes).
+        ⚠️ repeat_interleave, not repeat: the diffusion batch is laid out (b ns nj), so clip
+        i's samples must be CONTIGUOUS or every trajectory is attributed to the wrong clip.
+        """
+        if n == 1:
+            return
+        layers = getattr(cache, "layers", None)
+        if layers is not None:
+            for lyr in layers:
+                lyr.keys = lyr.keys.repeat_interleave(n, dim=0)
+                lyr.values = lyr.values.repeat_interleave(n, dim=0)
+        else:  # older transformers cache API
+            for i in range(len(cache.key_cache)):
+                cache.key_cache[i] = cache.key_cache[i].repeat_interleave(n, dim=0)
+                cache.value_cache[i] = cache.value_cache[i].repeat_interleave(n, dim=0)
+
+    # ⚠️ @torch.no_grad() IS LOAD-BEARING, not hygiene. `vlm.generate` carries its own
+    # no_grad, so the rollout path never built a graph; a plain forward does, and retaining
+    # activations for a 3073-token prefill plus 60 expert passes OOM'd a card with 57 GiB
+    # free (it tried to allocate 50 MiB at 57.36 GiB in use). The metric runner does not wrap
+    # its call site, so the decorator has to live here.
+    @torch.no_grad()
+    def sample_trajectories_prefill_only(
+        self,
+        data: dict[str, Any],
+        num_traj_samples: int = 6,
+        num_traj_sets: int = 1,
+        diffusion_kwargs: dict[str, Any] | None = None,
+        return_action: bool = False,
+        cache_hook: Any = None,
+        step_probe: Any = None,
+        **kwargs: Any,
+    ):
+        """Prefill the VLM once, hand that cache to the expert. No generation.
+
+        ``cache_hook(cache, input_ids, tokenized_data) -> cache`` (default None) intercepts the
+        prefill cache before it is batch-expanded, so a caller can SUBSTITUTE part of it. That
+        is the only way to ask "which part of the cache does the expert actually need": the
+        expert's inputs are exactly (noisy action embedding, VLM cache), and the action
+        embedding is the shared action_in_proj of the same traj_data, so 100% of a student's
+        trajectory gap is attributable to the cache. Swapping teacher K/V into chosen
+        layers/positions and re-reading min_ade localises it. Left None the path is unchanged.
+
+        **Why this is not an approximation of the rollout -- it is the same measurement.**
+        ``sample_trajectories_from_data_with_vlm_rollout`` calls ``vlm.generate`` and then
+        discards everything it produced, because the eval prompt ALREADY ends with
+        ``<|traj_future_start|>``: ``get_component_str`` always emits ``start_str``, and
+        ``components_prompt: [traj_future]`` makes that the only thing it emits. The rollout
+        then takes the FIRST occurrence of that token in ``sequences`` (which include the
+        prompt), so ``offset`` lands at the end of the prompt, and
+        ``attention_mask[i, offset:-n_diffusion] = False`` masks the whole generated span
+        while the action tokens' RoPE continues from ``rope_deltas + offset``. The expert
+        therefore attends to the prompt prefill and nothing else -- exactly the cache training
+        teaches, cropped at ``tfs_idx + 1`` on both sides.
+
+        So the generation was pure cost: ``num_return_sequences=6`` expands the batch before
+        prefill, making each iteration prefill 6x identical sequences (ViT included) and then
+        autoregressively decode tokens that are masked out.
+
+        Set ``STITCH_ROLLOUT=1`` to force the old path (for re-measuring an old number), and
+        ``STITCH_PREFILL_SELFTEST=1`` to assert on real data that both paths build the same
+        cache.
+        """
+        n_samples_total = num_traj_samples * num_traj_sets
+        ego_history_xyz = data["ego_history_xyz"]
+        ego_history_rot = data["ego_history_rot"]
+        B, n_traj_group, _, _ = ego_history_xyz.shape
+        assert n_traj_group == 1, "Only one trajectory group is supported for inference."
+
+        tokenized_data = dict(data["tokenized_data"])
+        input_ids = tokenized_data.pop("input_ids")
+        input_ids = self.fuse_traj_tokens(
+            input_ids,
+            {"ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot},
+        )
+        device = input_ids.device
+
+        prompt_cache, prefill_seq_len, rope_deltas = self._prefill_prompt_cache(
+            input_ids, tokenized_data
+        )
+        if cache_hook is not None:
+            # BEFORE _expand_cache: the hook sees one row per clip, not one per traj sample.
+            prompt_cache = cache_hook(prompt_cache, input_ids, tokenized_data)
+
+        # Where does the prompt end? The same rule the rollout uses, applied to the PROMPT:
+        # first <|traj_future_start|>, inclusive. ⚠️ Sequences are right-padded to the batch
+        # max, so this offset is what excludes each clip's padding -- taking prefill_seq_len
+        # would feed the expert padding K/V for every clip shorter than the longest.
+        tfs_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+        tfs_mask = input_ids == tfs_id
+        if not bool(tfs_mask.any(dim=1).all()):
+            missing = (~tfs_mask.any(dim=1)).nonzero().flatten().tolist()
+            raise RuntimeError(
+                f"prompt rows {missing} contain no <traj_future_start>; the prefill-only path "
+                "needs it to know where the expert's cache ends. Is components_prompt missing "
+                "'traj_future', or generation_mode false?"
+            )
+        offset = tfs_mask.int().argmax(dim=1) + 1                      # [B]
+
+        self._expand_cache(prompt_cache, n_samples_total)
+        b_star = B * n_samples_total
+        offset = offset.repeat_interleave(n_samples_total)
+        rope_deltas = (
+            rope_deltas.repeat_interleave(n_samples_total, dim=0)
+            if torch.is_tensor(rope_deltas) and rope_deltas.numel() == B
+            else rope_deltas
+        )
+
+        n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
+        position_ids = torch.arange(n_diffusion_tokens, device=device)
+        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
+        position_ids += (rope_deltas + offset[:, None]).to(position_ids.device)
+
+        kv_len = prefill_seq_len + n_diffusion_tokens
+        attention_mask = torch.zeros(
+            (b_star, 1, n_diffusion_tokens, kv_len), dtype=self.dtype, device=device
+        )
+        for i in range(b_star):
+            attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = torch.finfo(
+                self.dtype
+            ).min
+
+        forward_kwargs = {}
+        if self.config.expert_non_causal_attention:
+            forward_kwargs["is_causal"] = False
+
+        _step = {"i": 0}
+
+        def step_fn(x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+            # ⚠️ AUTOCAST here, not at the call site. `action_in_proj` (PerWaypointActionInProjV2)
+            # forces `x.float()` internally, so its fp32 activations meet bf16 weights and raise
+            # "mat1 and mat2 must have the same dtype". evaluate_hf happens to wrap its call in
+            # autocast, which is why the eval path works -- but that makes this method silently
+            # caller-dependent, and it broke the moment a script drove it directly.
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                future_token_embeds = self.action_in_proj(x, t)
+            future_token_embeds = future_token_embeds.to(self.dtype)
+            if future_token_embeds.dim() == 2:
+                future_token_embeds = future_token_embeds.view(x.shape[0], n_diffusion_tokens, -1)
+            expert_out = self.expert(
+                inputs_embeds=future_token_embeds,
+                position_ids=position_ids,
+                past_key_values=prompt_cache,
+                attention_mask=attention_mask,
+                use_cache=True,
+                **forward_kwargs,
+            )
+            # ⚠️ roll the action K/V back off the cache: the next denoising step appends its
+            # own, and without this the cache grows by 64 tokens per step.
+            prompt_cache.crop(prefill_seq_len)
+            last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vel = self.action_out_proj(last_hidden).view(
+                    -1, *self.action_space.get_action_space_dims()
+                )
+            # ``step_probe(i, t, x, last_hidden, vel)`` (default None) exposes the tensors on
+            # BOTH sides of the action head at every Euler step: `last_hidden` is pre-head,
+            # `vel` is post-head. Both have been used as training targets (L_block matches the
+            # former, L_field the latter) but neither has ever been checked for whether it
+            # PREDICTS per-clip ade -- which is what a proxy has to do to be worth optimising.
+            if step_probe is not None:
+                step_probe(_step["i"], t, x, last_hidden, vel)
+                _step["i"] += 1
+            return vel
+
+        sampled_action = self.diffusion.sample(
+            batch_size=b_star, step_fn=step_fn, device=device,
+            return_all_steps=False, **(diffusion_kwargs or {}),
+        )
+        hist_xyz_rep = einops.repeat(ego_history_xyz[:, -1], "b ... -> (b n) ...",
+                                     n=n_samples_total)
+        hist_rot_rep = einops.repeat(ego_history_rot[:, -1], "b ... -> (b n) ...",
+                                     n=n_samples_total)
+        pred_xyz, pred_rot = self.action_space.action_to_traj(
+            sampled_action, hist_xyz_rep, hist_rot_rep
+        )
+        pred_xyz = einops.rearrange(pred_xyz, "(b ns nj) ... -> b ns nj ...",
+                                    ns=num_traj_sets, nj=num_traj_samples)
+        pred_rot = einops.rearrange(pred_rot, "(b ns nj) ... -> b ns nj ...",
+                                    ns=num_traj_sets, nj=num_traj_samples)
+        if return_action:
+            # ⚠️ The action the SAMPLER produced, not one recovered from the trajectory.
+            # Inverting `action_to_traj` via `traj_to_action` is NOT a way to get this back:
+            # that path runs `theta_smooth` plus three ridge-regularised solves
+            # (`unicycle_accel_curvature.py:269-283`), so it returns a SMOOTHED fit and a
+            # bounds check applied to it can pass on a trajectory that is not feasible.
+            return pred_xyz, pred_rot, einops.rearrange(
+                sampled_action, "(b ns nj) ... -> b ns nj ...",
+                ns=num_traj_sets, nj=num_traj_samples)
+        return pred_xyz, pred_rot
+
     def sample_trajectories_from_data(self, data: dict[str, Any], **kwargs: Any):  # type: ignore[override]
         """Route the metric runner to the EXPERT, not the trajectory-token head.
 
@@ -364,12 +627,100 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         and ``AlpamayoR1`` does not override it -- so an unmodified AlpamayoR1 scores its
         *token* head. That is exactly why the existing 10B baselines in this tree are
         token-head numbers. Overriding here is what makes the harness measure the expert.
+
+        Defaults to the PREFILL-ONLY path: the rollout's generation is masked out of the
+        expert's attention anyway (see sample_trajectories_prefill_only), so it was ~6x of
+        wasted prefill. STITCH_ROLLOUT=1 restores it.
         """
         # `last_component` / `traj_only_generation` are token-head knobs the rollout does
         # not take; dropping them here keeps MetricRunner's call site unchanged.
         for dead in ("last_component", "traj_only_generation", "return_extra"):
             kwargs.pop(dead, None)
-        return self.sample_trajectories_from_data_with_vlm_rollout(data=data, **kwargs)
+        if os.environ.get("STITCH_ROLLOUT") == "1":
+            return self.sample_trajectories_from_data_with_vlm_rollout(data=data, **kwargs)
+        if os.environ.get("STITCH_PREFILL_SELFTEST") == "1" and not getattr(
+            self, "_prefill_selftested", False
+        ):
+            self._prefill_selftested = True
+            self._selftest_prefill_matches_rollout(data, dict(kwargs))
+        kwargs.pop("max_generation_length", None)   # no generation happens here
+        kwargs.pop("top_p", None)
+        kwargs.pop("temperature", None)
+        return self.sample_trajectories_prefill_only(data=data, **kwargs)
+
+    @staticmethod
+    def _cache_layers(cache):
+        """``[(K, V), ...]`` from either cache API. The installed transformers exposes
+        ``cache.layers``; older ones ``key_cache``/``value_cache``."""
+        layers = getattr(cache, "layers", None)
+        if layers is not None:
+            return [(l.keys, l.values) for l in layers]
+        return list(zip(cache.key_cache, cache.value_cache))
+
+    @torch.no_grad()
+    def _selftest_prefill_matches_rollout(self, data, kwargs) -> None:
+        """Do both paths hand the expert the same K/V? Compared on real data, once.
+
+        "The rollout's generated tokens are discarded" is an argument about masks and offsets;
+        this is the measurement. Only the region the expert can attend to (rows 0..offset) is
+        compared -- that is the only part either path uses.
+        """
+        n = kwargs.get("num_traj_samples", 6) * kwargs.get("num_traj_sets", 1)
+        tfs_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
+
+        def fresh(d):
+            # ⚠️ a FRESH nested dict: the rollout does tokenized_data.pop("input_ids"), so
+            # reusing the batch for a second path dies with KeyError: 'input_ids'.
+            out = dict(d)
+            out["tokenized_data"] = dict(d["tokenized_data"])
+            return out
+
+        d0 = fresh(data)
+        ids = self.fuse_traj_tokens(
+            d0["tokenized_data"]["input_ids"],
+            {"ego_history_xyz": d0["ego_history_xyz"], "ego_history_rot": d0["ego_history_rot"]},
+        )
+        off = ((ids == tfs_id).int().argmax(dim=1) + 1).repeat_interleave(n)
+
+        store = {}
+
+        def pre(_m, _a, kw):
+            if "cache" not in store and kw.get("past_key_values") is not None:
+                store["cache"] = [(k.clone(), v.clone())
+                                  for k, v in self._cache_layers(kw["past_key_values"])]
+            return None
+
+        h = self.expert.register_forward_pre_hook(pre, with_kwargs=True)
+        try:
+            self.sample_trajectories_from_data_with_vlm_rollout(data=fresh(data), **kwargs)
+        finally:
+            h.remove()
+        if "cache" not in store:
+            raise RuntimeError("self-test could not capture the rollout's cache")
+        roll = store["cache"]
+
+        d = fresh(data)
+        td = dict(d["tokenized_data"]); td.pop("input_ids")
+        cache, _, _ = self._prefill_prompt_cache(ids, td)
+        self._expand_cache(cache, n)
+        pre_kv = self._cache_layers(cache)
+
+        worst = 0.0
+        for (kr, vr), (kp, vp) in zip(roll, pre_kv):
+            for i in range(kr.shape[0]):
+                m = int(off[i])
+                worst = max(
+                    worst,
+                    float((kr[i, :, :m].float() - kp[i, :, :m].float()).abs().max()),
+                    float((vr[i, :, :m].float() - vp[i, :, :m].float()).abs().max()),
+                )
+        print(f"[selftest] prefill vs rollout cache over the ATTENDED region: "
+              f"max |diff| = {worst:.3e} across {len(roll)} layers, "
+              f"{roll[0][0].shape[0]} rows, offsets {off[:3].tolist()}", flush=True)
+        if worst > 1e-2:
+            raise RuntimeError(
+                f"prefill-only cache differs from the rollout's (max {worst:.3e}); the two "
+                "paths are NOT the same measurement -- do not trust either number.")
 
 
 class TrainableStitchedAlpamayoR1(StitchedAlpamayoR1):
