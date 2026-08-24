@@ -45,7 +45,10 @@ ARM="${ARM:?set ARM=teacher|ce|kd|kv|cekv|kvonly|block2b|<arm>_eN}"
 # to the caller, because a missing pin would raise mid-load after ~5 min of weight loading.
 MODEL_TAG=4b
 CONFIG_NAME=sft_eval_stitched_4b_lcdrive
-if [[ "$ARM" == block2b* ]]; then
+# ⚠️ SUBSTRING, not a `block2b*` prefix: the tag is derived from the ARM NAME, so a new 2B arm
+# whose name does not start with "block2b" silently resolved MODEL_TAG=4b and died looking for
+# output_kd_4b_<arm>_lcdrive (job 512, ARM=field2b). Any arm carrying "2b" is the 2B stack.
+if [[ "$ARM" == *2b* ]]; then
     MODEL_TAG=2b
     CONFIG_NAME=sft_eval_stitched_2b_prunedexpert_lcdrive
     export PRUNE_EXPERT_LAYERS="${PRUNE_EXPERT_LAYERS:-4,10,13,15,19,25,27,34}"

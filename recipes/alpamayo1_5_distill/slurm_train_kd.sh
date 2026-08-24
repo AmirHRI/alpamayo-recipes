@@ -144,6 +144,26 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    field2b)
+        # L_FIELD ALONE on the 2B/pruned-expert 2-camera stack: chain all 28 layers on the
+        # STUDENT's own cache (no teacher forcing anywhere), take expert.norm +
+        # action_out_proj, and MSE the VELOCITY against the teacher's, at a random t.
+        # Never run before -- L_field only ever ran ALONGSIDE L_block (arm blockfield, which
+        # itself never got past checkpoint-500 and was never evaluated).
+        # WHY: BLOCK_ODE measured the velocity at 30% RMS error while the hidden states
+        # L_block matches are only 3.2% off per layer (PRUNING.md:353) -- the quantity the
+        # trajectory integrates is 10x more wrong than the one four epochs optimised.
+        # AGAINST: L_field's gradient reaches shallow layers only through the contractive deep
+        # half, so it may under-train them -- and ladder_add showed under-training early layers
+        # hurts even though the ladder says the EXPERT ignores them (the VLM compounds forward).
+        # The two arguments point opposite ways, which is why this is measured not argued.
+        # Matched control: the block-only epoch 1 from scratch, min_ade 2.8367 / ade 5.8744.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=0.0 ++model.kd.block_timestep=beta
+                ++model.kd.field_weight="${FIELD_W:-1.0}") ;;
     block2bmix)
         # BOTH block objectives: teacher-forced per-layer (m=1) + span(m=7), weighted mean.
         # Rationale: alone, the span term is nearly m-INVARIANT (0.0017 at m=1 -> 0.00093 at

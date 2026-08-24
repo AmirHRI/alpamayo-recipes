@@ -115,6 +115,59 @@ Per-band loss on the trained ckpt-1199, for reference: early **0.000422**, mid *
 deep **0.001934**. Difficulty is **not** monotone in depth — mid is the hardest band, and early
 is 5.8× easier than mid while carrying zero importance.
 
+### 4a. `L_field` alone — the objective is NECESSARY, not just weak
+
+The counterpart question: drop the per-layer loss entirely and match only what the expert
+**outputs**. `L_field` chains all 28 layers on the student's own cache (no teacher forcing
+anywhere), applies `expert.norm` + `action_out_proj`, and MSEs the **velocity** against the
+teacher's at a random `t`, expert frozen. It had never been run alone — every prior use was
+alongside `L_block` (arm `blockfield`, which itself never passed checkpoint-500 and was never
+evaluated).
+
+Motivated by a real measurement: `BLOCK_ODE` puts the **velocity at 30% RMS error** while the
+hidden states `L_block` matches are only **3.2%** off per layer (`PRUNING.md:353`) — the
+quantity the trajectory integrates was ten times more wrong than the one four epochs optimised.
+
+From scratch, 1 epoch, 2 cameras, matched to the block-only epoch in every other respect:
+
+| objective | `min_ade` | `ade` |
+|---|---|---|
+| `L_block` (m=1, random `t`) | **2.8367** | **5.8744** |
+| **`L_field` only** (random `t`) | **22.0637** | **27.3783** |
+
+**7.8× worse — and worse than the CE-only (6.9948) and KD-only (11.3750) floors.** Wired
+correctly, too: the field self-test gives `identity(teacher cache) 4.8e-06`, so this is not a
+convention error.
+
+⚠️ **Why, and it is the opposite of what was predicted.** `L_field` constrains only the
+ENDPOINT, so intermediate representations are free to drift as long as they *compose* to the
+right velocity. The optimiser duly reduced velocity error 5.2× by moving the cache **away** from
+the teacher's (block diagnostic, taken under no_grad throughout):
+
+| | step 1 | step 1199 |
+|---|---|---|
+| field loss (the objective) | 5.761 | **1.107** ↓ 5.2× |
+| `block_loss` | 0.679 | **17.374** ↑ 25.6× |
+| `block_loss_early` | 0.998 | 4.385 ↑ 4.4× |
+| `block_loss_deep` | 0.826 | **46.836** ↑ **56.7×** |
+| `kv_ratio_v` | — | **9.539** (every block run held 2.65–2.71) |
+
+The arm's documented objection was that field-only would under-train the **shallow** layers; the
+damage is concentrated in the **deep** band (56.7× vs early's 4.4×), because the layers nearest
+the output have the most freedom to be wrong in hidden-state terms while still landing on the
+right projection. A 20-step smoke showed early rising fastest and was misleading.
+
+**Consequence, taken with §3–§4:** `L_block` is a **weak but NECESSARY** constraint. Driving it
+down harder barely moves `ade` (four negatives), and letting it go destroys the model. The 30%
+velocity error is real but is not a better training target — it can be reduced by moving the
+cache away from the teacher's, which is exactly what happened.
+
+⚠️ Also: `_field_layer` checkpointing was disabled here by analogy with `_span_sweep` (where
+peak memory was FLAT at 65.8 GiB from m=1 to m=28). That inference was **wrong for this path** —
+it runs at 71.9 GiB with ~8 GiB headroom, and `expandable_segments` converted the pressure into
+throughput loss rather than an OOM: **38 s/it vs 9.3**, 5:44 instead of ~3.5 h. Leave
+checkpointing ON for the field chain.
+
 ## 5. Cache ladder — which part of the cache the expert reads
 
 Substitute the teacher's K/V into part of the student's prefill cache and re-read `min_ade`.
@@ -280,3 +333,6 @@ Artefacts: `training/stitch_*.json` (§1–4), `training/stepsweep/` (§7),
   config's `components_order` too, or it will train on nav data with the instruction invisible.
 * **`--horizon-start` variant** of the val annotations, for a leak-free nav number.
 * Whether the nav gain concentrates on the 79 turn clips (§7d).
+* **`blockfield` (block + field)** — the one arm that tests whether the velocity term adds
+  anything ON TOP of a constraint that keeps the cache anchored. Built for exactly this, never
+  ran past checkpoint-500, never evaluated. Run it with field checkpointing ON (§4a).

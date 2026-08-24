@@ -1497,10 +1497,15 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 return o[0] if isinstance(o, tuple) else o
 
             h_f = embeds
+            # ⚠️ same gate as _span_sweep: checkpointing a 28-deep chain was measured at 4.3x
+            # slower with GPU util at 25-35%, for no memory benefit (peak was FLAT at 65.8 GiB
+            # from m=1 to m=28). SPAN_CKPT_MIN>n_layers disables it here too.
+            _f_ckpt = n_layers >= int(os.environ.get("SPAN_CKPT_MIN", "14"))
             with torch.autocast("cuda", enabled=True):
                 for _l in range(n_layers):
-                    h_f = torch.utils.checkpoint.checkpoint(
-                        _field_layer, h_f, torch.tensor(_l), use_reentrant=False)
+                    h_f = (torch.utils.checkpoint.checkpoint(
+                               _field_layer, h_f, torch.tensor(_l), use_reentrant=False)
+                           if _f_ckpt else _field_layer(h_f, torch.tensor(_l)))
                 v_s = expert.velocity(h_f)
                 with torch.no_grad():
                     # ⚠️ FREE: the teacher's final block output is already captured, so the
@@ -1575,6 +1580,15 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 # summing them would double the gradient scale and silently change the
                 # effective LR -- the confound the /m note on _span_sweep documents.
                 block_term = (tf + w * sp) / (1.0 + w)
+        elif self.block_weight == 0.0:
+            # ⚠️ block_weight=0 (e.g. FIELD-ONLY): the per-layer sweep is a DIAGNOSTIC here,
+            # not a loss -- and it is 28 block forwards, so building its graph and discarding
+            # it is pure waste. Under no_grad it still reports whether training on the field
+            # term also reduces the block term, which is the cross-check between the two
+            # objectives, at a fraction of the cost.
+            with torch.no_grad():
+                block_term = (_sweep(s_k, s_v) if self.block_span <= 1
+                              else _span_sweep(s_k, s_v, self.block_span))
         else:
             block_term = (_sweep(s_k, s_v) if self.block_span <= 1
                           else _span_sweep(s_k, s_v, self.block_span))
