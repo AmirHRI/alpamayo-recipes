@@ -22,8 +22,14 @@ objective fixes both: run each frozen expert block twice on the SAME teacher act
 once with the teacher's VLM cache and once with the student's, and match the outputs.
 
 .. math::
-    L_{block} = \frac{1}{L}\sum_l \big\| B_l(h^T_l;\,K^S_l, V^S_l)
+    L_{block} = \frac{1}{L}\sum_l \Big[ \big\| B_l(h^T_l;\,K^S_l, V^S_l)
                                     - \mathrm{sg}\,B_l(h^T_l;\,K^T_l, V^T_l) \big\|_2^2
+                                    + \big(1 - \cos\angle\big(B_l(h^T_l;\,K^S_l, V^S_l),\,
+                                    \mathrm{sg}\,B_l(h^T_l;\,K^T_l, V^T_l)\big)\big) \Big]
+
+MSE alone is scale-sensitive -- it can be driven down by shrinking the output's magnitude
+without the direction improving. Adding cosine distance supervises direction independently
+of scale, on top of (not instead of) the normalized MSE term.
 
 **Why teacher-forcing ``h^T_l`` is the whole trick.**  The block weights are identical, the
 action input ``h^T_l`` is identical, and the timestep conditioning is identical -- therefore
@@ -94,8 +100,13 @@ def block_output_loss(
     student_v: torch.Tensor,
     layer_kwargs: dict,
     normalize: bool = True,
-) -> torch.Tensor:
-    """One layer's ``|| B(h; K_s,V_s) - sg B(h; K_t,V_t) ||^2``.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One layer's normalized MSE and cosine distance, kept apart -- NOT summed.
+
+    Returned separately (rather than as one combined scalar) so callers can log each
+    term's own curve, the same way ``L_KV`` splits into vision/text/traj: a combined
+    number cannot tell you whether direction (cosine) or magnitude (MSE) is the one
+    actually converging.
 
     Args:
         block: the frozen expert decoder layer ``B_l``.
@@ -110,12 +121,13 @@ def block_output_loss(
             form and computes mrope embeddings, and a hand-built substitute attends
             differently. ``past_key_values`` is supplied here and must be absent from this
             dict.
-        normalize: divide by the teacher output's mean square so per-layer terms are
-            commensurable. Expert activations span orders of magnitude across depth, so
-            without this the largest layers own the gradient.
+        normalize: divide the MSE term by the teacher output's mean square so per-layer terms
+            are commensurable. Expert activations span orders of magnitude across depth, so
+            without this the largest layers own the gradient. The cosine term is already
+            scale-free and is never divided by this.
 
     Returns:
-        Scalar.
+        ``(mse, cosine)`` -- normalized MSE and cosine distance, unsummed.
     """
     cache = DynamicCache()
     # Seed the prefix as the rollout's prompt_cache does; the block appends its own
@@ -125,10 +137,12 @@ def block_output_loss(
         out = block(h_in, past_key_values=cache, use_cache=True, **layer_kwargs)
     y_student = out[0] if isinstance(out, tuple) else out
 
-    diff = (y_student.float() - y_teacher.float().detach()).pow(2).mean()
+    y_s, y_t = y_student.float(), y_teacher.float().detach()
+    mse = (y_s - y_t).pow(2).mean()
     if normalize:
         # Guarded: a layer whose teacher output is ~0 would divide by ~0 and produce an inf
         # that poisons the whole sum.
-        scale = y_teacher.float().detach().pow(2).mean().clamp_min(1e-6)
-        diff = diff / scale
-    return diff
+        scale = y_t.pow(2).mean().clamp_min(1e-6)
+        mse = mse / scale
+    cosine = 1.0 - torch.nn.functional.cosine_similarity(y_s, y_t, dim=-1).mean()
+    return mse, cosine

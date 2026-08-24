@@ -35,7 +35,9 @@ from alpamayo1_5_sft.trainer import ReasoningVLA_Trainer
 #: covers ``KaVaVLAOutput`` and ``KDVLAOutput`` without either needing to know about the
 #: other. The ``kv_loss_*`` region splits matter because ~93% of positions are vision: a
 #: single ``kv_loss`` scalar cannot show whether the vision region is converging at a
-#: different rate from text and trajectory, or swamping them.
+#: different rate from text and trajectory, or swamping them. Same reasoning for
+#: ``block_loss_mse``/``block_loss_cosine``: the combined ``block_loss`` can fall while
+#: only one of magnitude or direction is actually improving.
 AUX_LOSS_KEYS = (
     "ce_loss",
     "latent_loss",
@@ -46,6 +48,8 @@ AUX_LOSS_KEYS = (
     "kv_loss_text",
     "kv_loss_traj",
     "block_loss",
+    "block_loss_mse",
+    "block_loss_cosine",
     "freerun_loss",
 )
 

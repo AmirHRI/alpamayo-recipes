@@ -91,6 +91,8 @@ class KDVLAOutput(ModelOutput):
     kd_loss: torch.FloatTensor | None = None
     kv_loss: torch.FloatTensor | None = None
     block_loss: torch.FloatTensor | None = None
+    block_loss_mse: torch.FloatTensor | None = None
+    block_loss_cosine: torch.FloatTensor | None = None
     freerun_loss: torch.FloatTensor | None = None
     kv_loss_vision: torch.FloatTensor | None = None
     kv_loss_text: torch.FloatTensor | None = None
@@ -514,7 +516,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
 
     def _block_loss(self, student_kv, teacher_kv, rope, traj_mask, attn_mask,
                     traj_data=None):
-        """L_block = mean_l || B_l(h_l^T; K_s,V_s) - sg B_l(h_l^T; K_t,V_t) ||^2.
+        """L_block = mean_l [ || B_l(h_l^T; K_s,V_s) - sg B_l(h_l^T; K_t,V_t) ||^2 + (1 - cos angle) ].
 
         ⚠️ The per-layer re-run reuses the EXACT kwargs the expert's own forward handed each
         layer -- captured by hook, never reconstructed. The enclosing
@@ -590,19 +592,23 @@ class KDReasoningVLA(TrainableReasoningVLA):
         skip = set(range(n_layers)) - set(self._surviving_expert_layers() or range(n_layers))
 
         def _sweep(k_list, v_list):
-            acc = None
+            """Returns ``(mse + cosine, mse_mean, cosine_mean)``, each averaged over layers."""
+            mse_acc = cos_acc = None
             n_used = 0
             for l in range(n_layers):
                 if l in skip:      # identity stand-in: B_l(h) == h, term is trivially 0
                     continue
                 n_used += 1
                 c = captured[l]
-                term = block_output_loss(
+                mse, cosine = block_output_loss(
                     expert.expert.layers[l], c["h_in"], c["y_out"],
                     k_list[l], v_list[l], dict(c["kwargs"]),
                 )
-                acc = term if acc is None else acc + term
-            return acc / max(n_used, 1)
+                mse_acc = mse if mse_acc is None else mse_acc + mse
+                cos_acc = cosine if cos_acc is None else cos_acc + cosine
+            n = max(n_used, 1)
+            mse_mean, cos_mean = mse_acc / n, cos_acc / n
+            return mse_mean + cos_mean, mse_mean, cos_mean
 
         # ⚠️ DIAGNOSTIC, opt-in via BLOCK_FREERUN=1. Answers whether teacher-forcing hides
         # compounding: L_block feeds each block the TEACHER's h_l, so per-layer error is
@@ -636,10 +642,12 @@ class KDReasoningVLA(TrainableReasoningVLA):
                         h_.remove()
                 rel = lambda a, b: float((a.float() - b.float()).pow(2).mean()
                                          / b.float().pow(2).mean().clamp_min(1e-9))
-                tf = [float(block_output_loss(expert.expert.layers[l], captured[l]["h_in"],
+                def _tf_term(l):
+                    m, c = block_output_loss(expert.expert.layers[l], captured[l]["h_in"],
                                               captured[l]["y_out"], s_k[l], s_v[l],
-                                              dict(captured[l]["kwargs"])))
-                      for l in range(n_layers)]
+                                              dict(captured[l]["kwargs"]))
+                    return float(m + c)
+                tf = [_tf_term(l) for l in range(n_layers)]
                 fr = [rel(fr_h[l], captured[l]["h_in"]) for l in range(n_layers)]
                 fr.append(rel(fr_h[n_layers], captured[n_layers - 1]["y_out"]))
                 print("[freerun] layer teacher_forced free_running", flush=True)
@@ -657,10 +665,10 @@ class KDReasoningVLA(TrainableReasoningVLA):
         # healthy the curve looks.
         if os.environ.get("BLOCK_SELFTEST") == "1":
             with torch.no_grad():
-                ident = float(_sweep(t_k, t_v))
+                ident = float(_sweep(t_k, t_v)[0])
                 shuf = list(range(n_layers))[::-1]
-                shuffled = float(_sweep([s_k[i] for i in shuf], [s_v[i] for i in shuf]))
-                real = float(_sweep(s_k, s_v))
+                shuffled = float(_sweep([s_k[i] for i in shuf], [s_v[i] for i in shuf])[0])
+                real = float(_sweep(s_k, s_v)[0])
             print(
                 f"[block-selftest] identity(teacher cache)={ident:.6e}  student={real:.4f}  "
                 f"layer-shuffled={shuffled:.4f}  | identity ~0 and student < shuffled",
@@ -723,7 +731,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
             tgt = captured[n_layers - 1]["y_out"]
             fr_term = ((h_s.float() - tgt.float()).pow(2).mean()
                        / tgt.float().pow(2).mean().clamp_min(1e-6))
-        return _sweep(s_k, s_v), fr_term
+        total, mse_mean, cos_mean = _sweep(s_k, s_v)
+        return total, mse_mean, cos_mean, fr_term
 
     def forward(
         self,
@@ -822,6 +831,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
         attached: dict[str, torch.Tensor] = {} if ce_loss is None else {"ce": ce_loss}
 
         kd_loss = kv_loss = block_loss = fr_loss = None
+        block_loss_mse = block_loss_cosine = None
         region_losses: dict[str, torch.Tensor] = {}
 
         if need_teacher:
@@ -896,9 +906,9 @@ class KDReasoningVLA(TrainableReasoningVLA):
                                                 for j, i in enumerate(pi[::-1])},
                             }
                             for nm, tk in cands.items():
-                                lo, _ = self._block_loss(s_kv, tk, rope, traj_mask,
-                                                         tokenized_data.get("attention_mask"),
-                                                         None)
+                                lo, _, _, _ = self._block_loss(
+                                    s_kv, tk, rope, traj_mask,
+                                    tokenized_data.get("attention_mask"), None)
                                 print(f"[pi-probe] {nm:12s} block_loss {float(lo):.6f}",
                                       flush=True)
                     t_kv_b = {j: t_kv_b[i] for j, i in enumerate(pi)}
@@ -913,7 +923,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                              "ego_history_rot": ego_history_rot,
                              "ego_future_xyz": ego_future_xyz,
                              "ego_future_rot": ego_future_rot}
-                block_loss, fr_loss = self._block_loss(
+                block_loss, block_loss_mse, block_loss_cosine, fr_loss = self._block_loss(
                     s_kv, t_kv_b, rope, traj_mask,
                     tokenized_data.get("attention_mask"), _traj)
                 total_loss = total_loss + self.block_weight * block_loss
@@ -963,6 +973,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
             kd_loss=None if kd_loss is None else kd_loss.detach(),
             kv_loss=None if kv_loss is None else kv_loss.detach(),
             block_loss=None if block_loss is None else block_loss.detach(),
+            block_loss_mse=None if block_loss_mse is None else block_loss_mse.detach(),
+            block_loss_cosine=None if block_loss_cosine is None else block_loss_cosine.detach(),
             freerun_loss=None if fr_loss is None else fr_loss.detach(),
             kv_loss_vision=region_losses.get("vision"),
             kv_loss_text=region_losses.get("text"),
