@@ -113,6 +113,25 @@ if [[ -n "${CAMERAS:-}" ]]; then
     TAG_SUF="_cam$(tr -d '[], ' <<< "$CAMERAS")"
     echo "[slurm] CAMERAS=$CAMERAS -> CameraSubsetPAIDataset, prompt rebuilt"
 fi
+# NAV=<annotations.json> -> evaluate through PAIDatasetWithNav: one sample per ANNOTATION, its
+# own t0_relative, and the route in the prompt. Requires CAMERAS (it routes through
+# CameraSubsetPAIDataset, which raises if "route" is missing from components_order).
+# ⚠️ NOT comparable to the default-keyframe evals: the annotations carry 116 distinct t0 values
+# and event-anchored sampling is +0.0440 min_ade harder than the 5.1 s keyframe. Report which
+# one a number came from -- the _nav suffix in the tag is there so the files cannot be confused.
+if [[ -n "${NAV:-}" ]]; then
+    [[ -n "${CAMERAS:-}" ]] || { echo "[slurm] NAV needs CAMERAS (e.g. CAMERAS='[1,3]')" >&2; exit 1; }
+    [[ -f "$NAV" ]] || { echo "[slurm] no such annotations file: $NAV" >&2; exit 1; }
+    EXTRA+=(++data.val_dataset.annotations_path="$NAV"
+            ++data.val_dataset.vla_preprocess_args.components_order="[image,traj_history,route,prompt,traj_future]")
+    # ⚠️ the annotations BASENAME goes in the tag, not a bare "_nav": two NAV evals of the same
+    # checkpoint (e.g. nav vs its no-nav control) otherwise write the SAME per_clip_output path
+    # and the second silently overwrites the first, destroying the paired comparison that is
+    # the whole reason for running a control.
+    TAG_SUF="${TAG_SUF}_$(basename "$NAV" .json | sed 's/^nav_lcdrive_val_mysubset_1k//; s/^_//; s/^$/nav/')"
+    echo "[slurm] NAV=$NAV -> PAIDatasetWithNav, route in components_order"
+fi
+[[ -n "${EXTRA_ARGS:-}" ]] && EXTRA+=($EXTRA_ARGS)
 TAG="stitch_${MODEL_TAG}_${ARM}_$(basename "$CKPT")${TAG_SUF}"
 echo "[slurm] ARM=$ARM ckpt=$CKPT -> $OUT_DIR/$TAG.json"
 

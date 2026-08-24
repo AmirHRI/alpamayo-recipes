@@ -144,6 +144,25 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    nav2bmix)
+        # 2B student, 2 front cameras, NAV-CONDITIONED, on the teacher-forced block loss (m=1)
+        # AND the m=7 span loss at EQUAL weight (block_span_mix=7, weight 1.0 -> weighted mean).
+        # ⚠️ t0 is per-ANNOTATION (116 distinct values, event-anchored), NOT the 5.1 s keyframe,
+        # so NOTHING here is comparable to the arms that use the default -- this run needs its
+        # own no-nav control on the same annotations before its number means anything.
+        # ⚠️ The route reaches BOTH towers: they read one input_ids tensor, and the config puts
+        # "route" in components_order (CameraSubsetPAIDataset raises if it is missing).
+        # SPEED: m=7 < SPAN_CKPT_MIN=14, so the span chain is UNCHECKPOINTED (4.3x measured);
+        # the mix still costs ~2x block-only because it runs both sweeps.
+        export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_nav_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-7}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        ARM="${ARM}_m${MIXM:-7}w${MIXW:-1.0}" ;;
     field2b)
         # L_FIELD ALONE on the 2B/pruned-expert 2-camera stack: chain all 28 layers on the
         # STUDENT's own cache (no teacher forcing anywhere), take expert.norm +

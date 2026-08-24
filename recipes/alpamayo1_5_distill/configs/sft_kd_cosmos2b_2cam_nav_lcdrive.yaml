@@ -1,0 +1,156 @@
+# 2B student + pruned expert, L_block, with TWO CAMERAS and the ViT at the FULL learning rate.
+#
+# Two changes from sft_kd_cosmos2b_prunedexpert_lcdrive, both motivated by measurements:
+#
+# 1. CAMERAS = front-wide + front-telephoto (loader indices [1, 3]), 4 frames each -> 8 images,
+#    ~1577 tokens instead of 3073. On the teacher this pair was the best latency/accuracy trade
+#    measured anywhere in this tree: min_ade 0.6981 vs 0.5918 (+18%) for 279 ms vs 380 ms
+#    (-26%), and it BEATS 3 cameras (1.3647) because the telephoto carries the long-horizon
+#    information -- dropping it more than doubles the 5 s error. See LATENCY_PROFILE.md.
+#    ⚠️ The prompt is rebuilt, not truncated: fewer images means fewer `frame N` tags and one
+#    fewer camera label. Both towers read one input_ids tensor, so teacher and student get the
+#    identical 2-camera prompt and their caches stay position-for-position comparable.
+#
+# 2. ViT LR = LLM LR. The parent config ships `lr_multiplier: {vlm.model.visual: 0.1}`, which
+#    trains the vision tower at a tenth of everything else -- while ~93% of the cache positions
+#    the expert reads are vision tokens. The 2B's plateau was traced to aggregate capacity
+#    (PRUNING.md §9: five fixes refuted, single-clip overfit reaches 1.85e-4 vs the 8.8e-4
+#    floor), and a throttled ViT is one of the few untested contributors to it.
+#
+# ⚠️ Still REQUIRES PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34: the student is 28 layers, so the
+# expert is built 28 deep and the teacher's 36-layer expert loads through the depth remap
+# (teacher layer pi(j) -> slot j) in expert_holder._load.
+#
+# Launch:  ARM=block2b2cam PIN_GPUS=1,2 WORKERS=16 sbatch --gpus=4 --cpus-per-task=64 slurm_train_kd.sh
+
+defaults:
+  - sft_base
+  - /models/cosmos2b_prunedexpert_kd@model
+  # ⚠️ The group ships `team: ???` and `project: ???`, and train_hf does
+  # `init_wandb(**cfg.wandb)` -- the `**` expansion resolves EVERY key, so leaving either
+  # unset raises MissingMandatoryValue during hydra resolution, before wandb is even
+  # reached. `WANDB_MODE=disabled` does not help: that is a wandb runtime setting and this
+  # fails earlier. Both are given real values in the `wandb:` block below; do not remove it.
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+data:
+  # ⚠️ The teacher's config.json declares include_camera_ids / include_frame_nums TRUE and
+  # the reference create_message() prefixes each image with "Front left camera: frame 0 ".
+  # The repo's `default` processor sets both FALSE -- deliberately, to keep the 10B
+  # comparable with our 2B -- and evaluating the 10B in that format moved min_ade
+  # 1.116 -> 0.626, a 44% swing that produced two retracted findings. Student and teacher
+  # must both use the annotated format, or the sequences differ and every position-wise
+  # KV target is misaligned.
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]          # front-wide, front-telephoto (loader order, NOT the global table)
+    # ⚠️ NAV: one sample per ANNOTATION, each with its OWN t0_relative (116 distinct values,
+    # event-anchored) and its own nav_text. NOT the default 5.1 s keyframe -- so nothing trained
+    # here is comparable to the arms that use it; this run needs its own no-nav control.
+    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      # ⚠️ "route" MUST be here or nav_text is silently discarded: r1_5.py emits the route only
+      # on `case "route":`. Canonical order, asserted in tests/test_recipe_static_contracts.py.
+      # Both towers read ONE input_ids tensor, so the teacher sees the instruction too.
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: true
+  # Set on the collator too. It only re-tokenizes the already-built text, so this is
+  # belt-and-braces -- but the flags live in three independent places and a mismatch is
+  # exactly the class of error that cost two findings.
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  # ⚠️ NO lr_multiplier: the ViT trains at the same rate as the LLM here, which is the point of
+  # this arm. The parent config throttles it to 0.1x.
+  ddp_find_unused_parameters: false
+
+  # ABSOLUTE path. sft_base sets `configs/deepspeed/zero2.json`, which only resolves when
+  # cwd is the *sft* recipe dir. Left relative, accelerate tries to json.loads() the path
+  # string and dies with "Expecting value: line 1 column 1".
+  deepspeed: /home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/configs/deepspeed/zero2.json
+
+  # ✅ ON, unlike the KAVA recipe. KaVaReasoningVLA must forbid checkpointing because its
+  # forward hooks capture DETACHED K/V under it. This student recomputes K/V from
+  # output_hidden_states instead (verified rel-L2 0.000e+00 against the hook path on all
+  # 36 layers), which survives checkpointing and still carries grad_fn.
+  # Measured on a real clip: peak 69.6 GB without, 38.6 GB with -- and the losses agree to
+  # five decimals. That 31 GB is exactly what makes the co-resident teacher fit.
+  gradient_checkpointing: true
+
+  # bs=1 x 4 GPUs. Measured at bs=1: 38.6 GB forward+backward including the frozen teacher
+  # and student params, plus ~15.5 GB of ZeRO-2 optimizer shard at 4 ranks = ~54 GB.
+  # bs=2 projects to ~66 GB; raise only after confirming on the target node.
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 12
+  learning_rate: 1e-5
+  # ⚠️ warmup is ~21% of ONE EPOCH, so it must be rederived whenever GPUS/BS/ACCUM change --
+  # it is a step count, not a fraction, and the steps per epoch move with the effective batch.
+  # 38,340 clips actually present (the filter lists 39,072):
+  #     2 GPUs x 1 x 12 = 24  -> 1,598 steps/epoch -> warmup 340
+  #     2 GPUs x 8 x 2  = 32  -> 1,198 steps/epoch -> warmup 255
+  # ⚠️ NAV run: 50,000 ANNOTATIONS (not 38,340 clips), so
+  #     2 GPUs x 8 x 2  = 32  -> 1,563 steps/epoch -> warmup 333   <- pass WARMUP=333
+  # 21.3% is the fraction the Stage-1 LCDrive baseline used, and warmup fraction is one of the
+  # few schedule knobs the KAVA arms proved sensitive to.
+  warmup_steps: 333
+  num_train_epochs: 5
+
+  # STEP-based saving, not epoch. 3 epochs at 2 GPUs x 1 x 12 = ~4,794 steps, so 500-step
+  # saves give ~9 checkpoints and the limit of 10 keeps every one of them -- an epoch
+  # boundary (1598 / 3196) is never a checkpoint here, so quote the STEP when reporting.
+  # ⚠️ save_total_limit prunes by step order, so if the run ever exceeds 5,000 steps the
+  # earliest checkpoints start disappearing; raise the limit rather than the interval if
+  # early-training snapshots matter.
+  # one checkpoint per EPOCH, as the run was specified; 5 epochs -> 5 checkpoints, all kept.
+  save_strategy: epoch
+  save_total_limit: 10
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_2b_2cam_lcdrive
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_kd_cosmos2b_prunedexpert_lcdrive
+run_name: kd_2b_${now:%m%d-%H%M}
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-kd-cosmos2b-prunedexpert
+  # ONE group for all three arms, overriding the default group's `${run_name}`. The whole
+  # point of ce / kd / kv is that they are read against each other, and a per-run group
+  # puts each on its own chart. slurm_train_kd.sh still gives each arm a distinct
+  # `run_name`, so they stay separate runs inside this group.
+  group: kd_2b_2cam_vitfull

@@ -318,6 +318,57 @@ events*, not by choice. If matching train's ratios matters more than one-per-cli
 
 ---
 
+## 12a. What the instruction is actually worth — teacher and 2B student
+
+Three conditions, each evaluated on 1000 clips at 10 denoising steps, 2 cameras, paired per clip.
+`t0` and the presence of the route are the only things that vary.
+
+| case | `t0` | route in prompt | 2B `min_ade` | 2B `ade` | teacher `min_ade` | teacher `ade` |
+|---|---|---|---|---|---|---|
+| **A** | default 5.1 s | no | **2.3310** | 5.4275 | **0.7185** | 1.6736 |
+| **B** | event-anchored | **yes** | 2.6216 | **5.2087** | 0.7441 | 1.6976 |
+| **C** | event-anchored | no | 2.7927 | 5.5757 | 0.7625 | 1.7188 |
+
+⚠️ The teacher runs its **unpruned 36-layer** expert; the 2B student runs the **28-layer set-C**
+one. The columns are NOT a like-for-like gap — read each model's A/B/C *pattern*, not the
+difference between the two halves of the table.
+
+**B − C is the instruction, isolated**: same weights, same clips, same `t0`, differing only in
+whether the route is in the prompt.
+
+| | `min_ade` | z | `ade` | z |
+|---|---|---|---|---|
+| **2B student** (trained with the route) | **−0.1711** | **−9.05** | **−0.3670** | **−10.10** |
+| teacher (accepts a route, not trained on these anchors) | −0.0184 | −1.75 | −0.0212 | −1.63 |
+
+The student's gain is **~9× the teacher's**, and it is the only place in this work where both
+metrics agree in sign *and* significance. A model trained with the instruction uses it; one that
+merely accepts it barely moves. (The teacher's per-`k` effect is marginal individually but
+−0.0208, z −5.88 pooled over all ten step counts — see `COMPARE_EVAL.md` §7b.)
+
+**A − C is the `t0` shift**, both no-nav:
+
+| | `min_ade` | z |
+|---|---|---|
+| 2B student | **−0.4617** | −5.14 |
+| teacher | −0.0440 | −1.36 |
+
+Event-anchored sampling costs the student **10× what it costs the teacher**. The turn-rich
+distribution (§1: 4.0% → 7.9% turns) is where a distilled 2B degrades fastest — which is an
+argument for training on these anchors, and a warning that any student evaluated only at the
+default keyframe is being flattered.
+
+⚠️ **Both student numbers carry a leak.** These annotations were generated with
+`--horizon-start 0`, so the route restates the direction of the very trajectory being
+predicted. −0.1711 is what a *correct* instruction is worth — an upper bound on a
+planner-supplied one (§12).
+
+⚠️ **A is not attributable to nav alone.** That run differs from the tree's other 2B arms in
+three ways at once: nav conditioning, event-anchored `t0`, and 5 epochs over 50k annotations
+rather than 1–4 over 38k clips. B − C isolates the instruction at INFERENCE; isolating its
+TRAINING contribution needs a no-nav-trained control on the same 50k annotations, which has not
+been run.
+
 ## 13. Reproducing
 
 ```bash

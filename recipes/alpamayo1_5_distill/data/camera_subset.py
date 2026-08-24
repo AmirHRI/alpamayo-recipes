@@ -71,24 +71,48 @@ class CameraSubsetPAIDataset(torch.utils.data.Dataset):
             instead so it runs AFTER slicing.
         model_config: forwarded to the processor; supplies the trajectory vocabulary and the
             pixel budget.
+        annotations_path: when given, the base becomes ``PAIDatasetWithNav`` instead of
+            ``PAIDataset``, so one sample per ANNOTATION (its own ``t0_relative`` and
+            ``nav_text``) rather than one per clip. ⚠️ The route only reaches the prompt if
+            ``"route"`` is in the processor's ``components_order`` -- ``r1_5.py`` emits it via
+            `case "route":`, so otherwise nav_text is silently discarded and the run trains on
+            nav data with the instruction invisible. Both towers read ONE input_ids tensor, so
+            adding it here conditions the teacher and the student identically.
         **pai_kwargs: everything else ``PAIDataset`` takes (``local_dir``, ``chunk_ids``,
             ``clip_uuid_filter``, ``use_default_keyframe``, ...).
     """
 
     def __init__(self, cameras, vla_preprocess_args=None, model_config=None,
-                 **pai_kwargs: Any) -> None:
+                 annotations_path: str | None = None, **pai_kwargs: Any) -> None:
         from alpamayo.data.pai import PAIDataset
+        from alpamayo.data.pai_nav import PAIDatasetWithNav
 
         if vla_preprocess_args is None:
             raise ValueError(
                 "CameraSubsetPAIDataset needs vla_preprocess_args: it exists to run the "
                 "processor AFTER slicing, so there is nothing to do without one.")
         self.cameras = [int(c) for c in cameras]
-        # ⚠️ model_config=None / no preprocess on the base: we want the RAW sample.
-        self.base = PAIDataset(**pai_kwargs, model_config=None, vla_preprocess_args=None)
+        # ⚠️ model_config=None / no preprocess on the base: we want the RAW sample. With a nav
+        # base that also means PAIDatasetWithNav skips its own preprocess, leaving nav_text in
+        # the raw dict for our processor to pick up after slicing.
+        if annotations_path is not None:
+            self.base = PAIDatasetWithNav(annotations_path=annotations_path, **pai_kwargs,
+                                          model_config=None, vla_preprocess_args=None)
+        else:
+            self.base = PAIDataset(**pai_kwargs, model_config=None, vla_preprocess_args=None)
         self.pre = instantiate(vla_preprocess_args, model_config=model_config)
-        print(f"[camsubset] {len(self.base)} clips, cameras {self.cameras} "
+        kind = "nav samples" if annotations_path is not None else "clips"
+        print(f"[camsubset] {len(self.base)} {kind}, cameras {self.cameras} "
               f"({len(self.cameras)} x 4 frames = {len(self.cameras) * 4} images)", flush=True)
+        if annotations_path is not None:
+            order = (vla_preprocess_args or {}).get("components_order") or []
+            if "route" not in list(order):
+                raise ValueError(
+                    "annotations_path is set but 'route' is NOT in components_order="
+                    f"{list(order)}. r1_5.py emits the route only on `case \"route\":`, so the "
+                    "nav instruction would be silently dropped and this run would train on nav "
+                    "data with the instruction invisible. Canonical order: "
+                    "[image, traj_history, route, prompt, traj_future].")
 
     def __len__(self) -> int:
         return len(self.base)
