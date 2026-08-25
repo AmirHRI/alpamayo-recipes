@@ -60,6 +60,14 @@ AUX_LOSS_KEYS = (
     "roll_loss",
     "kv_ratio_k",
     "kv_ratio_v",
+    # Consistency distillation. `cd_loss` is the total; the per-rung terms are what
+    # distinguish a healthy bootstrap (the anchor rung falls first, then propagates toward
+    # noise) from a collapse to the conditional mean (the noise end falls fastest).
+    "cd_loss",
+    "cd_loss_anchor",
+    "cd_loss_mid",
+    "cd_loss_noise",
+    "ema_dist",
 )
 
 #: Parameters excluded from weight decay on top of HF's own bias/norm exclusions.
@@ -83,12 +91,29 @@ GRAD_PROBE_STEPS = int(os.environ.get("KAVA_GRAD_PROBE_STEPS", 200))
 #: ``layers.14.`` — mid-stack for the 28-layer 2B, but silently 39% depth on a 36-layer
 #: Qwen3-VL-4B, which would have made gradient shares incomparable between students
 #: without anything looking wrong.
+#:
+#: ⚠️ On an arm where the VLM is FROZEN and only the expert trains (the consistency and
+#: expert-on-student arms), no ``vlm.*`` parameter has ``requires_grad``, so the probe's
+#: parameter list came back empty and ``_probe_gradient_shares`` set ``_probe_failed`` and
+#: disabled itself for the rest of the run -- silently, since an empty list is not an error.
+#: Falling back to the expert's own mid-stack layer keeps the probe meaningful there; it is
+#: still "one mid-depth block of whatever is being trained".
 def probe_layer_prefix(base: Any) -> str:
     try:
-        n_layers = len(base.vlm.model.language_model.layers)
+        vlm_trainable = any(p.requires_grad for p in base.vlm.parameters())
     except AttributeError:
-        n_layers = 28
-    return f"vlm.model.language_model.layers.{n_layers // 2}."
+        vlm_trainable = False
+    if vlm_trainable:
+        try:
+            n_layers = len(base.vlm.model.language_model.layers)
+        except AttributeError:
+            n_layers = 28
+        return f"vlm.model.language_model.layers.{n_layers // 2}."
+    try:
+        n_layers = len(base.expert.layers)
+    except AttributeError:
+        n_layers = 36
+    return f"expert.layers.{n_layers // 2}."
 
 
 class KaVaTrainer(ReasoningVLA_Trainer):
@@ -114,6 +139,87 @@ class KaVaTrainer(ReasoningVLA_Trainer):
     def get_decay_parameter_names(self, model: Any) -> list[str]:
         decay = super().get_decay_parameter_names(model)
         return [name for name in decay if not any(part in name for part in NO_DECAY_PARAMS)]
+
+    # ------------------------------------------------------------------ EMA save
+    def _ema(self):
+        """The ``ExpertEMA`` owned by an ``EMACallback``, if one is configured."""
+        for cb in getattr(self.callback_handler, "callbacks", []):
+            ema = getattr(cb, "ema", None)
+            if ema is not None and hasattr(ema, "swap_in"):
+                return ema
+        return None
+
+    def _save_checkpoint(self, model: Any, trial: Any, **kwargs: Any):
+        """Serialise the EMA weights instead of the training weights, when an EMA exists.
+
+        ⚠️ This MUST wrap the write, not follow it. ``_maybe_log_save_evaluate`` calls
+        ``_save_checkpoint`` and only then ``callback_handler.on_save`` (transformers 4.57.1,
+        ``trainer.py:3227-3229``), so doing the swap in an ``on_save`` callback saves the
+        training weights and then leaves the EMA in the live model -- wrong on both counts.
+
+        Why swap at all rather than write a side-car: the eval path loads a trained expert
+        back through the TEACHER slot (``++model.teacher_checkpoint_path=<ckpt>``), and
+        ``stitched_model._load_teacher_non_vlm`` looks for canonical ``expert.*`` names in a
+        sharded ``model.safetensors`` + index. An ``ema.safetensors`` beside it would be
+        invisible to that loader and to ``FrozenExpert._load``. Swapping keeps every existing
+        eval command working unchanged.
+
+        try/finally is not decoration: an exception during serialisation (a full disk, an
+        interrupted NFS write) would otherwise leave EMA weights in the live model and
+        training would silently continue from the average.
+        """
+        ema = self._ema()
+        if ema is None:
+            return super()._save_checkpoint(model, trial, **kwargs)
+        base = self._unwrapped(model)
+        verify = os.environ.get("CD_VERIFY_SAVE") == "1"
+        probe = next(iter(ema.shadow))
+        live_before = dict(base.named_parameters())[probe].detach().float().clone()
+        if verify:
+            d = float((live_before - ema.shadow[probe].to(live_before.device).float()).norm())
+            print(f"[ema-save] ||live - ema|| on {probe} = {d:.6e}", flush=True)
+        ema.swap_in(base)
+        try:
+            out = super()._save_checkpoint(model, trial, **kwargs)
+        finally:
+            ema.swap_out(base)
+        if verify:
+            restored = float(
+                (dict(base.named_parameters())[probe].detach().float() - live_before).norm())
+            print(f"[ema-save] restore error after swap_out = {restored:.3e} (must be 0)",
+                  flush=True)
+            self._verify_saved_is_ema(probe, ema)
+        return out
+
+    def _verify_saved_is_ema(self, probe: str, ema: Any) -> None:
+        """Read the tensor back off disk and confirm it is the EMA, not the live weights.
+
+        End-to-end rather than by inspection: this is the one path where getting it wrong is
+        silent -- you would ship a checkpoint of the training weights and never know.
+        """
+        import glob
+        import json as _json
+
+        from safetensors.torch import load_file as _load
+        ck = sorted(glob.glob(os.path.join(self.args.output_dir, "checkpoint-*")),
+                    key=lambda q: int(q.rsplit("-", 1)[1]))
+        if not ck:
+            print("[ema-save] no checkpoint dir found to verify", flush=True)
+            return
+        idx = os.path.join(ck[-1], "model.safetensors.index.json")
+        single = os.path.join(ck[-1], "model.safetensors")
+        if os.path.exists(idx):
+            with open(idx) as fh:
+                shard = _json.load(fh)["weight_map"][probe]
+            got = _load(os.path.join(ck[-1], shard))[probe]
+        elif os.path.exists(single):
+            got = _load(single)[probe]
+        else:
+            print(f"[ema-save] {ck[-1]} has no safetensors to verify", flush=True)
+            return
+        err = float((got.float() - ema.shadow[probe].cpu().float()).norm())
+        print(f"[ema-save] saved-vs-EMA on {probe} = {err:.3e} (must be ~0)  <- {ck[-1]}",
+              flush=True)
 
     def compute_loss(self, model: Any, inputs: Any, return_outputs: bool = False, **kwargs: Any):
         base = self._unwrapped(model)
@@ -194,6 +300,14 @@ class KaVaTrainer(ReasoningVLA_Trainer):
             "kv": float(getattr(base, "kv_loss_weight", getattr(base, "kv_weight", 0.0))),
             "kd": float(getattr(base, "kd_weight", 0.0)),
             "block": float(getattr(base, "block_weight", 0.0)),
+            # ⚠️ `freerun`, `field` and `roll` are in `attached` but were never listed here,
+            # so `weights.get(name, 1.0)` silently reported them at weight 1.0 regardless of
+            # their configured value. Added along with `cd` so the probe reports what
+            # actually enters the total.
+            "freerun": float(getattr(base, "block_freerun_weight", 0.0)),
+            "field": float(getattr(base, "field_weight", 0.0)),
+            "roll": float(getattr(base, "roll_weight", 0.0)),
+            "cd": float(getattr(base, "cd_weight", 0.0)),
         }
         try:
             norms = {}

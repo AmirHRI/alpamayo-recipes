@@ -117,11 +117,10 @@ def block_output_loss(
         y_teacher: ``y^T_l`` as the real forward produced it, detached.
         student_k / student_v: student PREFIX cache, K already rotated. These carry the grad.
         layer_kwargs: ⚠️ the EXACT kwargs the enclosing model handed this layer, captured by
-            hook -- causal mask, position_embeddings, position_ids, cache_position. Do NOT
-            rebuild these: the model's forward converts the 2-D key mask to the causal 4-D
-            form and computes mrope embeddings, and a hand-built substitute attends
-            differently. ``past_key_values`` is supplied here and must be absent from this
-            dict.
+            hook -- attention mask, position_embeddings, position_ids, cache_position. Do NOT
+            rebuild these: the model's forward prepares the backend-specific mask and mrope
+            embeddings, and a hand-built substitute attends differently. ``past_key_values``
+            is supplied here and must be absent from this dict.
         normalize: divide the MSE term so per-layer terms are commensurable. Expert
             activations span orders of magnitude across depth, so without this the largest
             layers own the gradient. The cosine term is already scale-free and is never

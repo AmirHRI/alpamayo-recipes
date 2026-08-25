@@ -75,6 +75,7 @@ from alpamayo1_5_distill.models.block_losses import (
     block_span_output,
     rotate_keys,
 )
+from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
 from alpamayo1_5_distill.models.expert_holder import FrozenExpert
 from alpamayo1_5_distill.models.kv_distill import (
     KVProjectorBank,
@@ -659,16 +660,16 @@ class KDReasoningVLA(TrainableReasoningVLA):
         return None if len(surv) == len(layers) else surv
 
     def _block_loss(self, student_kv, teacher_kv, rope, traj_mask, attn_mask,
-                    traj_data=None):
+                    rope_deltas, traj_data=None):
         """L_block = mean_l [ || B_l(h_l^T; K_s,V_s) - sg B_l(h_l^T; K_t,V_t) ||^2 + (1 - cos angle) ].
 
         ⚠️ The per-layer re-run reuses the EXACT kwargs the expert's own forward handed each
         layer -- captured by hook, never reconstructed. The enclosing
-        ``Qwen3VLTextModel.forward`` converts the 2-D key mask into the causal 4-D form the
-        attention implementation wants and computes ``position_embeddings`` via mrope; a
-        layer called directly with a hand-built 2-D mask and self-computed cos/sin attends
-        DIFFERENTLY. That bug made even the teacher's own cache fail to reproduce the
-        teacher's own outputs (self-test identity 1.04e3 instead of ~0, and layer-shuffling
+        ``Qwen3VLTextModel.forward`` prepares the backend-specific mask and computes
+        ``position_embeddings`` via mrope; a layer called directly with a reconstructed mask
+        and self-computed cos/sin attends DIFFERENTLY. That bug made even the teacher's own
+        cache fail to reproduce the teacher's own outputs (self-test identity 1.04e3 instead
+        of ~0, and layer-shuffling
         the student *improved* the loss). Capturing removes the entire class of error.
 
         ⚠️ The action noise is drawn ONCE. Both sides consume the same ``h_l^T`` from that
@@ -679,20 +680,33 @@ class KDReasoningVLA(TrainableReasoningVLA):
         cos, sin = rope["cos"], rope["sin"]
         n_layers = len(expert.expert.layers)
 
-        # The expert reads the cache only up to <|traj_future_start|>, i.e. everything before
-        # the first trajectory token -- cropping there reproduces the rollout's
-        # `attention_mask[offset:-n_action] = False` without rebuilding that mask.
-        first_traj = int(traj_mask[0].nonzero()[0].item())
+        b = teacher_kv[0][0].shape[0]
+        device, dtype = teacher_kv[0][0].device, teacher_kv[0][0].dtype
+        n_act = expert.n_action_tokens
+        conditioning = build_expert_conditioning(
+            traj_future_start_mask=traj_mask,
+            tokenizer_attention_mask=attn_mask,
+            rope_deltas=rope_deltas,
+            n_action_tokens=n_act,
+            dtype=dtype,
+            attention_implementation=getattr(
+                expert.expert.config, "_attn_implementation", None
+            ),
+        )
+        prefix_len = conditioning.prefix_len
+        e_mask = conditioning.attention_mask
+        pos = conditioning.position_ids
+
+        # One physical cache length is shared by the batch. Per-row left padding and any
+        # positions after that row's <traj_future_start> are excluded by e_mask. The +1 in
+        # build_expert_conditioning includes the handoff token, matching deployment.
         rot = lambda k: rotate_keys(
-            k[:, :, :first_traj], cos[:, :first_traj], sin[:, :first_traj]
+            k[:, :, :prefix_len], cos[:, :prefix_len], sin[:, :prefix_len]
         )
         t_k = [rot(teacher_kv[i][0]) for i in range(n_layers)]
-        t_v = [teacher_kv[i][1][:, :, :first_traj] for i in range(n_layers)]
+        t_v = [teacher_kv[i][1][:, :, :prefix_len] for i in range(n_layers)]
         s_k = [rot(student_kv[i][0]) for i in range(n_layers)]
-        s_v = [student_kv[i][1][:, :, :first_traj] for i in range(n_layers)]
-
-        b = t_k[0].shape[0]
-        device, dtype = t_k[0].device, t_k[0].dtype
+        s_v = [student_kv[i][1][:, :, :prefix_len] for i in range(n_layers)]
 
         captured: dict[int, dict] = {}
 
@@ -711,9 +725,10 @@ class KDReasoningVLA(TrainableReasoningVLA):
             else:
                 t_s = self._sample_block_t(b, device)
                 embeds = expert.noisy_action_embeds(traj_data, t_s, device, dtype)
-            n_act = embeds.shape[1]
-            pos = torch.arange(first_traj, first_traj + n_act, device=device)[None].expand(b, -1)
-            e_mask = torch.ones((b, first_traj + n_act), dtype=torch.bool, device=device)
+            if embeds.shape[1] != n_act:
+                raise RuntimeError(
+                    f"expert produced {embeds.shape[1]} action tokens, expected {n_act}"
+                )
 
             cache = DynamicCache()
             for i in range(n_layers):
@@ -725,7 +740,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
             try:
                 expert.expert(
                     inputs_embeds=embeds, attention_mask=e_mask, position_ids=pos,
-                    past_key_values=cache, use_cache=True,
+                    past_key_values=cache, use_cache=True, is_causal=False,
                 )
             finally:
                 for h in handles:
@@ -918,7 +933,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
                       for i in range(n_layers)]
                 try:
                     expert.expert(inputs_embeds=embeds, attention_mask=e_mask,
-                                  position_ids=pos, past_key_values=fr_cache, use_cache=True)
+                                  position_ids=pos, past_key_values=fr_cache, use_cache=True,
+                                  is_causal=False)
                 finally:
                     for h_ in fh:
                         h_.remove()
@@ -952,7 +968,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
                            for i in range(n_layers)]
                     try:
                         expert.expert(inputs_embeds=embeds, attention_mask=e_mask,
-                                      position_ids=pos, past_key_values=z_cache, use_cache=True)
+                                      position_ids=pos, past_key_values=z_cache, use_cache=True,
+                                      is_causal=False)
                     finally:
                         for h_ in zhs:
                             h_.remove()
@@ -1069,7 +1086,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
                           for i in range(n_layers)]
                     try:
                         expert.expert(inputs_embeds=emb_t, attention_mask=e_mask,
-                                      position_ids=pos, past_key_values=c_t, use_cache=True)
+                                      position_ids=pos, past_key_values=c_t, use_cache=True,
+                                      is_causal=False)
                     finally:
                         for h_ in hs:
                             h_.remove()
@@ -1200,7 +1218,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
                     if emb.dim() == 2:
                         emb = emb.view(x.shape[0], n_act, -1)
                     out = expert.expert(inputs_embeds=emb, attention_mask=e_mask,
-                                        position_ids=pos, past_key_values=c, use_cache=True)
+                                        position_ids=pos, past_key_values=c, use_cache=True,
+                                        is_causal=False)
                     h = out.last_hidden_state[:, -n_act:]
                     with torch.autocast("cuda", dtype=torch.bfloat16):
                         return expert.action_out_proj(h).view(-1, *expert.x_dims)
@@ -1412,7 +1431,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 if emb.dim() == 2:
                     emb = emb.view(x.shape[0], expert.n_action_tokens, -1)
                 out = expert.expert(inputs_embeds=emb, attention_mask=e_mask, position_ids=pos,
-                                    past_key_values=cache, use_cache=True)
+                                    past_key_values=cache, use_cache=True, is_causal=False)
                 h = out.last_hidden_state[:, -expert.n_action_tokens:]
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     return expert.velocity(h)
@@ -1757,6 +1776,20 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 # positions, prompt and image tokens are identical by construction -- asserted
                 # rather than assumed, because the whole objective is meaningless otherwise.
                 h, d = self._kv_shape()
+                student_rope_deltas = getattr(outputs, "rope_deltas", None)
+                teacher_rope_deltas = getattr(t_out, "rope_deltas", None)
+                if student_rope_deltas is None or teacher_rope_deltas is None:
+                    raise RuntimeError(
+                        "block-family losses need rope_deltas from both VLM prefills"
+                    )
+                if not torch.equal(
+                    student_rope_deltas.to(teacher_rope_deltas.device),
+                    teacher_rope_deltas,
+                ):
+                    raise RuntimeError(
+                        "student and teacher rope_deltas differ for the same prompt; "
+                        "their expert cache positions are not comparable"
+                    )
                 self._ensure_expert(
                     self._block_ckpt, input_ids.device, next(self.vlm.parameters()).dtype
                 )
@@ -1799,9 +1832,11 @@ class KDReasoningVLA(TrainableReasoningVLA):
                                                 for j, i in enumerate(pi[::-1])},
                             }
                             for nm, tk in cands.items():
-                                lo, _, _, _, _, _ = self._block_loss(
+                                lo, *_ = self._block_loss(
                                     s_kv, tk, rope, traj_mask,
-                                    tokenized_data.get("attention_mask"), None)
+                                    tokenized_data.get("attention_mask"),
+                                    student_rope_deltas, None,
+                                )
                                 print(f"[pi-probe] {nm:12s} block_loss {float(lo):.6f}",
                                       flush=True)
                     t_kv_b = {j: t_kv_b[i] for j, i in enumerate(pi)}
@@ -1820,7 +1855,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                     (block_loss, block_loss_mse, block_loss_cosine,
                      fr_loss, field_loss, roll_loss) = self._block_loss(
                         s_kv, t_kv_b, rope, traj_mask,
-                        tokenized_data.get("attention_mask"), _traj)
+                        tokenized_data.get("attention_mask"), student_rope_deltas, _traj)
                 if self.block_weight > 0:
                     total_loss = total_loss + self.block_weight * block_loss
                 attached["block"] = block_loss      # logged either way, as a free diagnostic

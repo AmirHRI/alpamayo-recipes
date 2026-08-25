@@ -1,0 +1,144 @@
+# Train the PRUNED action expert on the NAV-CONDITIONED 2B student's cache. VLM FROZEN.
+#
+# The student is the 5-epoch nav run (block m=1 + span m=7, equal weight, 50k event-anchored
+# annotations, 2 front cameras): min_ade 2.3310 at the default keyframe -- the best 2B in the
+# tree -- and 2.6216 with the route on its own event-anchored distribution.
+#
+# ⚠️ The DATA must match what the student was trained on: same 50k annotations, same per-anchor
+# t0, same 2 cameras, and "route" in components_order. The expert is being made tolerant of the
+# cache this student actually produces, so it has to see that cache under the same conditioning.
+#
+# WHY THIS ARM, in one line: the student's cache is at its aggregate-capacity floor, so make
+# the expert tolerant of the cache it actually gets instead of trying to improve the cache.
+# Everything measured on the 2B says the cache cannot improve by loss-shaping:
+#   * span teacher-forcing (n=1..14): amplification 1.2x at best, deep half CONTRACTS (0.79)
+#   * 10-step ODE rollout: endpoint error BELOW the sum of per-step errors (0.69)
+#   * L_field (velocity-matching): no measurable effect at the plateau
+#   * LR 5e-5 / 1e-4: both DAMAGED the converged solution (1.25e-3 / 1.44e-3 vs 8.8e-4)
+#   * single-clip overfit: 1.85e-4, 5x BELOW the training floor -> it is not representational
+# The one thing with a measured win in this framework is this arm, on the 4B:
+#   student + teacher expert            min_ade 1.6008
+#   student + expert trained on it      min_ade 1.4044   (-0.196, 19% of the gap to teacher)
+#
+# ⚠️ REQUIRES PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34. The student is 28 layers, so the
+# expert is built 28 deep and the teacher's 36-layer expert is loaded through the DEPTH REMAP
+# in stitched_model._load_teacher_non_vlm (teacher layer pi(j) -> slot j). Without the pin the
+# load raises rather than silently wiring a different expert.
+#
+# Launch (GPUs pinned, no srun -- srun re-derives CUDA_VISIBLE_DEVICES and discards the pin):
+#   PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34 CUDA_VISIBLE_DEVICES=1,2 \
+#     torchrun --nproc_per_node 2 -m alpamayo1_5_sft.train_hf \
+#     --config-path pkg://alpamayo1_5_distill/configs \
+#     --config-name sft_expert_on_student_2b_lcdrive
+
+defaults:
+  - sft_base
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.stitched_model.TrainableStitchedAlpamayoR1.from_student
+  # The nav-conditioned 2B, end of epoch 5.
+  checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_2b_nav2bmix_m7w1.0_lcdrive/checkpoint-7815
+  # ⚠️ the SNAPSHOT dir, not the repo root -- the parent has no config.json/weights.
+  vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+  teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  # Supplies the +4000 trajectory vocabulary the student tower was built with.
+  alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  attn_implementation: sdpa
+  cotrain_vlm: false
+
+data:
+  # Identical preprocessing to every other arm here -- the teacher declares
+  # include_camera_ids / include_frame_nums TRUE and evaluating it in the other format
+  # moved min_ade 1.116 -> 0.626 once, which produced two retracted findings.
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]          # front-wide, front-telephoto -- what the student was trained on
+    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]
+    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+
+trainer:
+  report_to: wandb
+  ddp_find_unused_parameters: false
+  # ⚠️ The 8 identity stand-ins have NO parameters and the frozen VLM produces none either,
+  # so DDP would otherwise warn about unused params every step.
+
+  # ⚠️ NO deepspeed here, deliberately. DeepSpeed's bf16 casts parameters but does NOT wrap
+  # the forward in torch.autocast; `action_in_proj` (PerWaypointActionInProjV2) forces
+  # `x.float()` internally, so its fp32 activations meet bf16 weights and raise
+  # "mat1 and mat2 must have the same dtype". Every other path here (evaluate_hf:122,
+  # initial_action_embeds) runs under autocast for exactly this reason. Plain bf16=True in
+  # sft_base gives the Trainer's native autocast, which handles it.
+  # Affordable: only 2.28 B trains, so weights+grads+Adam ~ 36 GB on top of the frozen
+  # 8 B VLM (~16 GB) -- fits an 80 GB card without ZeRO sharding.
+  # ⚠️ Must be an explicit null: sft_base.yaml:62 sets `deepspeed: configs/deepspeed/zero2.json`,
+  # so merely omitting the key inherits that RELATIVE path, which accelerate then tries to
+  # base64-decode as an inline config ("binascii.Error: Incorrect padding").
+  deepspeed: null
+  # ⚠️ MUST be false: KaVaExpertTeacher raises "does not support gradient checkpointing".
+  # Affordable here because only the 2.28 B expert is trainable and it sees just 64 action
+  # tokens -- the frozen VLM builds no graph (its params are requires_grad=False and the
+  # inputs do not require grad), so its 3073-token activations are never retained.
+  gradient_checkpointing: false
+
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 12
+  # Fine-tuning 2.28 B of already-trained expert onto a slightly different cache, not
+  # steering an 8 B VLM. Conservative: it starts at teacher weights and should not move far.
+  learning_rate: 2e-5
+  # 50,000 annotations / (2 x 1 x 12 = 24) = 2,083 steps/epoch; 200/1598 = 12.5% -> 260
+  warmup_steps: 260
+  num_train_epochs: 5
+  # ⚠️ step-based, not epoch: an epoch-only policy left the 16-hour L_freerun run with
+  # NOTHING on disk when it was killed at step 288 of 3196.
+  # one checkpoint per EPOCH, as specified. 5 epochs -> 5 checkpoints, all kept.
+  save_strategy: epoch
+  save_total_limit: 10
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_eos_2b_nav_lcdrive
+
+# ⚠️ REQUIRED, not optional. The `/wandb: default` group ships `team: ???` and
+# `project: ???`, and train_hf does `init_wandb(**cfg.wandb)` -- the `**` resolves EVERY
+# key, so an unset one raises MissingMandatoryValue during hydra resolution, before wandb
+# is reached. WANDB_MODE=disabled does not help; that is a runtime setting and this fails
+# earlier.
+wandb:
+  team: zrb20
+  project: alpamayo1_5-expert-on-student
+  group: expert_on_student_2b
+
+evaluate:
+  eval_ckpt: null

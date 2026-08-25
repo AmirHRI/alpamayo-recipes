@@ -66,6 +66,7 @@ from safetensors.torch import load_file
 
 from alpamayo1_5_sft.models.sft_alpamayo_r1 import TrainableAlpamayoR1
 from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA, load_alpamayo1_vlm
+from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
 
 logger = logging.getLogger(__name__)
 
@@ -513,10 +514,10 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
             # BEFORE _expand_cache: the hook sees one row per clip, not one per traj sample.
             prompt_cache = cache_hook(prompt_cache, input_ids, tokenized_data)
 
-        # Where does the prompt end? The same rule the rollout uses, applied to the PROMPT:
-        # first <|traj_future_start|>, inclusive. ⚠️ Sequences are right-padded to the batch
-        # max, so this offset is what excludes each clip's padding -- taking prefill_seq_len
-        # would feed the expert padding K/V for every clip shorter than the longest.
+        # Where does the prompt end? The same rule the rollout uses, applied per row to the
+        # PROMPT: first <|traj_future_start|>, inclusive. The shared helper preserves either
+        # left or right tokenizer padding and masks every cache position after that row's
+        # handoff token.
         tfs_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
         tfs_mask = input_ids == tfs_id
         if not bool(tfs_mask.any(dim=1).all()):
@@ -526,11 +527,14 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
                 "needs it to know where the expert's cache ends. Is components_prompt missing "
                 "'traj_future', or generation_mode false?"
             )
-        offset = tfs_mask.int().argmax(dim=1) + 1                      # [B]
-
         self._expand_cache(prompt_cache, n_samples_total)
         b_star = B * n_samples_total
-        offset = offset.repeat_interleave(n_samples_total)
+        tfs_mask = tfs_mask.repeat_interleave(n_samples_total, dim=0)
+        prompt_attention_mask = tokenized_data.get("attention_mask")
+        if prompt_attention_mask is not None:
+            prompt_attention_mask = prompt_attention_mask.repeat_interleave(
+                n_samples_total, dim=0
+            )
         rope_deltas = (
             rope_deltas.repeat_interleave(n_samples_total, dim=0)
             if torch.is_tensor(rope_deltas) and rope_deltas.numel() == B
@@ -538,18 +542,19 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         )
 
         n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
-        position_ids = torch.arange(n_diffusion_tokens, device=device)
-        position_ids = einops.repeat(position_ids, "l -> 3 b l", b=b_star).clone()
-        position_ids += (rope_deltas + offset[:, None]).to(position_ids.device)
-
-        kv_len = prefill_seq_len + n_diffusion_tokens
-        attention_mask = torch.zeros(
-            (b_star, 1, n_diffusion_tokens, kv_len), dtype=self.dtype, device=device
+        conditioning = build_expert_conditioning(
+            traj_future_start_mask=tfs_mask,
+            tokenizer_attention_mask=prompt_attention_mask,
+            rope_deltas=rope_deltas,
+            n_action_tokens=n_diffusion_tokens,
+            dtype=self.dtype,
+            attention_implementation=getattr(
+                self.expert.config, "_attn_implementation", None
+            ),
+            cache_len=prefill_seq_len,
         )
-        for i in range(b_star):
-            attention_mask[i, :, :, offset[i] : -n_diffusion_tokens] = torch.finfo(
-                self.dtype
-            ).min
+        position_ids = conditioning.position_ids
+        attention_mask = conditioning.attention_mask
 
         forward_kwargs = {}
         if self.config.expert_non_causal_attention:

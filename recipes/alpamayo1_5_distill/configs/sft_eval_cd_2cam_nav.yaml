@@ -1,0 +1,97 @@
+# THE eval the KV objective was actually built for: student VLM -> teacher's action expert.
+#
+# `L_KV` trains the student's K/V cache to be the teacher's, and the teacher's expert is the
+# module that READS that cache (it self-attends over it as `past_key_values`,
+# alpamayo_r1.py:282-289). Scoring the student's own trajectory-token head -- which is what
+# sft_kd_qwen3_4b_lcdrive + evaluate_hf does -- measures something L_KV never targeted, and
+# on that endpoint the KV arm looked WORSE than the control (+0.635 min_ade). This config
+# measures the endpoint the hypothesis is actually about.
+#
+#   ARM=ce sbatch slurm_eval_stitched.sh   # control: student never trained to match K/V
+#   ARM=kd sbatch slurm_eval_stitched.sh   # logit-KD only, still no K/V objective
+#   ARM=kv sbatch slurm_eval_stitched.sh   # the arm that should win here, if L_KV works
+#
+# READ THE CONTROLS FIRST. `ce` and `kd` are the arms whose caches were never trained toward
+# the teacher, so they are the floor: if the expert drives them just as well as `kv`, the
+# expert is not really reading what we think it is, and any `kv` number is uninterpretable.
+# The ceiling is the teacher's own expert-head score on the same 1k clips -- NOT the
+# token-head baselines (10B no-CoT ade 1.2111 / min_ade 0.6413), which come from a different
+# head and are not comparable to anything produced here.
+#
+# ⚠️ NOTHING in this file is a duplicate of sft_kd_qwen3_4b_lcdrive.yaml by accident: hydra
+# forbids inheriting a config that declares `hydra.searchpath`, so the data block is
+# restated rather than reused. If you change camera-id / frame-num flags in one, change BOTH.
+defaults:
+  - sft_base
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.stitched_model.StitchedAlpamayoR1.from_stitch
+  # The student's base tower. Its +4000 trajectory vocabulary comes from alpamayo_config_path.
+  vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
+  # Supplies traj tokenizer AND expert_cfg / diffusion_cfg / action_*_cfg -- this is what
+  # makes the skeleton an AlpamayoR1 with an expert rather than a bare VLA.
+  alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  # Left null: evaluate_hf.py:70 overwrites it with `evaluate.eval_ckpt`, which is how the
+  # per-arm student checkpoint gets in. Setting it here would be silently discarded.
+  checkpoint_path: null
+  # Where the frozen expert + action projections come from (397 + 12 tensors).
+  teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+
+data:
+  # ⚠️ NAV-CONDITIONED EVAL. The CD expert is trained on nav text + event-anchored t0, so
+  # scoring it on the plain prompt would be out of distribution and the number would be
+  # meaningless. `nav_lcdrive_val_mysubset_1k.json` is the 1k val subset with the SAME shape
+  # as training: 116 distinct event-anchored t0 values, 40 distinct nav texts.
+  #
+  # ⚠️ Consequently the Gate C rows (2cam, NO-nav, default t0: min_ade 0.7185 at 10 steps)
+  # are NOT the baseline for this arm. The teacher must be re-scored through this same
+  # config -- that is what `TAG=teacher` does in slurm_eval_cd.sh.
+  #
+  # ⚠️ PAIDatasetWithNav directly, NOT CameraSubsetPAIDataset: eval_step_sweep pops
+  # vla_preprocess_args and applies its own `_CameraSubset` wrapper with `sweep.cameras`,
+  # so wrapping here too would slice the camera axis twice.
+  val_dataset:
+    _target_: alpamayo.data.pai_nav.PAIDatasetWithNav
+    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      # "route" or nav_text is silently discarded -- r1_5.py emits it only on `case "route":`
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: true
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+evaluate:
+  eval_ckpt: null
+  max_eval_steps: -1
+  torch_dtype: bfloat16
+  metric_runner:
+    _target_: alpamayo.metrics.metric_runner.MetricRunner
+    metrics:
+      - _target_: alpamayo.metrics.metric_api.ReasoningSampler
+        num_traj_sets: 1
+        top_p: 0.98
+        temperature: 0.6
+        traj_only_generation: false
+        max_generation_length: 256
+      - _target_: alpamayo.metrics.metric_api.DistanceMetrics
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/evalstitch
+
+task_name: alpamayo_1_5_kd_stitched_eval
+run_name: stitch_4b_${now:%m%d-%H%M}
