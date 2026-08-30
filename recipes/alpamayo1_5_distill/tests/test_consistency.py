@@ -32,10 +32,13 @@ from alpamayo1_5_distill.models.consistency_losses import (
     consistency_fn,
     interpolate,
     needs_target,
+    sample_cached_teacher_transition,
     sample_rungs,
     tau_to_s,
     teacher_step,
+    transition_velocity,
     uniform_tau_grid,
+    x0_reconstruction_loss,
 )
 from alpamayo1_5_distill.models.ema import ExpertEMA
 
@@ -105,6 +108,47 @@ def test_consistency_fn_recovers_x0_under_the_optimal_field():
         torch.testing.assert_close(consistency_fn(interpolate(x0, eps, tau), tau, v_repo), x0)
 
 
+def test_x0_reconstruction_is_zero_for_the_optimal_field():
+    """The supervised endpoint must vanish when the online field reconstructs x0."""
+    x0, eps = torch.randn(B, T, C), torch.randn(B, T, C)
+    v_repo = x0 - eps
+    for tv in (0.1, 0.5, 1.0):
+        tau = _tau(tv)
+        loss, per = x0_reconstruction_loss(
+            interpolate(x0, eps, tau), tau, v_repo, x0,
+        )
+        torch.testing.assert_close(loss, torch.zeros_like(loss), atol=1e-12, rtol=0)
+        torch.testing.assert_close(per, torch.zeros_like(per), atol=1e-12, rtol=0)
+
+
+def test_x0_reconstruction_gradient_reaches_only_online_velocity():
+    """Ground truth is a fixed label; only the online student may receive gradients."""
+    x_hi = torch.randn(B, T, C)
+    tau = _tau(0.7)
+    v_online = torch.randn(B, T, C, requires_grad=True)
+    x0 = torch.randn(B, T, C, requires_grad=True)
+
+    loss, per = x0_reconstruction_loss(x_hi, tau, v_online, x0)
+    loss.backward()
+
+    assert v_online.grad is not None and v_online.grad.abs().sum() > 0
+    assert x0.grad is None
+    assert per.shape == (B,) and not per.requires_grad
+
+
+def test_x0_reconstruction_weights_velocity_error_by_tau_squared():
+    """Equal field error matters 100x more at tau=1 than tau=.1 for one-step x0."""
+    x_hi = torch.zeros(2, T, C)
+    x0 = torch.zeros_like(x_hi)
+    v_online = torch.ones_like(x_hi)
+    tau = torch.tensor([0.1, 1.0]).view(2, 1, 1)
+
+    loss, per = x0_reconstruction_loss(x_hi, tau, v_online, x0)
+
+    torch.testing.assert_close(per, torch.tensor([0.01, 1.0]))
+    torch.testing.assert_close(loss, torch.tensor(0.505))
+
+
 # ---------------------------------------------------------------- grid / blend
 
 
@@ -116,6 +160,57 @@ def test_grid_and_rungs_have_the_right_shapes_and_range():
     assert lo.shape == (B, 1, 1) and hi.shape == (B, 1, 1)
     assert torch.all(hi > lo) and torch.all(lo >= 0.0) and torch.all(hi <= 1.0)
     assert int(n.min()) >= 0 and int(n.max()) <= 9
+
+
+def test_cached_teacher_transition_preserves_rollout_order_and_time_orientation():
+    """Native s advances noise->data while CD tau decreases noise->data."""
+    batch, noises, m, tokens, channels = 3, 4, 10, 2, 2
+    states = torch.empty(batch, noises, m + 1, tokens, channels)
+    for bi in range(batch):
+        for ki in range(noises):
+            for si in range(m + 1):
+                states[bi, ki, si].fill_(100 * bi + 10 * ki + si)
+
+    s_idx, k_idx, x_hi, x_lo, tau_lo, tau_hi = sample_cached_teacher_transition(
+        states, m, generator=torch.Generator().manual_seed(7)
+    )
+    rows = torch.arange(batch)
+    torch.testing.assert_close(x_hi, states[rows, k_idx, s_idx])
+    torch.testing.assert_close(x_lo, states[rows, k_idx, s_idx + 1])
+    torch.testing.assert_close(
+        tau_hi.flatten(), 1.0 - s_idx.float() / m
+    )
+    torch.testing.assert_close(
+        tau_lo.flatten(), 1.0 - (s_idx.float() + 1.0) / m
+    )
+    assert bool((tau_hi > tau_lo).all())
+
+    v = transition_velocity(x_hi, x_lo, tau_lo, tau_hi)
+    recovered = teacher_step(x_hi, v, tau_hi - tau_lo)
+    torch.testing.assert_close(recovered, x_lo)
+
+
+def test_cached_teacher_transition_rejects_wrong_grid():
+    states = torch.randn(2, 3, 11, T, C)
+    try:
+        sample_cached_teacher_transition(states, 20)
+    except ValueError as ex:
+        assert "10 steps" in str(ex) and "m_rungs=20" in str(ex)
+    else:
+        raise AssertionError("cache/model grid mismatch should fail")
+
+
+def test_full_teacher_rollout_assembly_keeps_initial_noise_and_final_action():
+    from alpamayo1_5_distill.scripts.generate_teacher_trajectories import (
+        assemble_rollout_states,
+    )
+
+    pre = [torch.full((2, 3, 2), float(i)) for i in range(4)]
+    final = torch.full((2, 3, 2), 4.0)
+    states = assemble_rollout_states(pre, final, num_steps=4, num_noise=2)
+    assert states.shape == (2, 5, 3, 2)
+    for i in range(5):
+        torch.testing.assert_close(states[:, i], torch.full((2, 3, 2), float(i)))
 
 
 def test_anchor_rung_is_teacher_pure_and_needs_no_target():
@@ -402,6 +497,110 @@ def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice():
         assert arm.expert.kwargs["is_causal"] is False
         assert cache.crops == [conditioning.prefix_len]
 
+
+def test_pruned_consistency_student_requires_an_exact_explicit_map():
+    """A stray/mismatched pruning export must fail before the first expensive batch."""
+    from alpamayo1_5_distill.models.consistency_expert import _validate_student_pruning
+    from alpamayo1_5_distill.models.stitched_model import _SkippedExpertLayer
+
+    cut = (4, 10, 13, 15, 19, 25, 27, 34)
+    layers = torch.nn.ModuleList([torch.nn.Identity() for _ in range(36)])
+    for i in cut:
+        layers[i] = _SkippedExpertLayer(i)
+    assert _validate_student_pruning(layers, list(cut), ",".join(map(str, cut))) == cut
+
+    for configured, exported in ((None, ",".join(map(str, cut))), (cut, "4,10")):
+        try:
+            _validate_student_pruning(layers, configured, exported)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("mismatched pruning contract should fail")
+
+
+def test_consistency_teacher_must_have_all_real_layers():
+    from alpamayo1_5_distill.models.consistency_expert import _validate_full_teacher
+    from alpamayo1_5_distill.models.stitched_model import _SkippedExpertLayer
+
+    full = torch.nn.ModuleList([torch.nn.Identity() for _ in range(36)])
+    _validate_full_teacher(full, 36)
+    full[4] = _SkippedExpertLayer(4)
+    try:
+        _validate_full_teacher(full, 36)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a teacher with an identity-pruned layer should fail")
+
+
+def test_cached_full_teacher_mode_cannot_construct_an_online_teacher():
+    from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
+
+    owner = SimpleNamespace(teacher_source="cached_full")
+    try:
+        ConsistencyExpertVLA._ensure_teacher_expert(
+            owner, torch.device("cpu"), torch.float32
+        )
+    except RuntimeError as ex:
+        assert "must remain offline" in str(ex)
+    else:
+        raise AssertionError("cached teacher mode attempted to build an online teacher")
+
+
+def test_eos_factory_uses_one_checkpoint_for_online_and_frozen_teacher(monkeypatch):
+    """EoS CD must not silently fall back to the original 36-layer teacher."""
+    from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
+    from alpamayo1_5_distill.models.expert_teacher import KaVaExpertTeacher
+
+    calls = {}
+
+    class Dummy:
+        def _set_vlm_trainability(self):
+            calls["vlm_refrozen"] = True
+
+        def init_cd(self, **kwargs):
+            calls["init_cd"] = kwargs
+
+    dummy = Dummy()
+
+    def fake_from_pretrained_vlm(bound_cls, **kwargs):
+        calls["bound_cls"] = bound_cls
+        calls["factory"] = kwargs
+        return dummy
+
+    monkeypatch.setattr(
+        KaVaExpertTeacher,
+        "from_pretrained_vlm",
+        classmethod(fake_from_pretrained_vlm),
+    )
+    model = ConsistencyExpertVLA.from_eos_checkpoint(
+        eos_checkpoint_path="/eos/checkpoint",
+        vlm_name_or_path="/student/base",
+        alpamayo_config_path="/alpamayo",
+        cd={"m_rungs": 10},
+    )
+
+    assert model is dummy
+    assert calls["bound_cls"] is ConsistencyExpertVLA
+    assert calls["factory"]["stage2_checkpoint_path"] == "/eos/checkpoint"
+    assert calls["factory"]["expert_num_layers"] == 28
+    assert calls["factory"]["cotrain_vlm"] is False
+    assert calls["init_cd"]["teacher_checkpoint_path"] == "/eos/checkpoint"
+    assert calls["init_cd"]["teacher_num_layers"] == 28
+    assert calls["vlm_refrozen"]
+    assert dummy.cotrain_vlm is False and dummy.stop_grad_from_vlm is True
+
+    try:
+        ConsistencyExpertVLA.from_eos_checkpoint(
+            eos_checkpoint_path="/eos/checkpoint",
+            vlm_name_or_path="/student/base",
+            alpamayo_config_path="/alpamayo",
+            cotrain_vlm=True,
+        )
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("cotrain_vlm=True must be rejected for an EoS teacher")
 
 # ---------------------------------------------------------------- EMA
 

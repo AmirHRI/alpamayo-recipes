@@ -129,6 +129,66 @@ def sample_rungs(batch: int, m: int, device, generator: torch.Generator | None =
     return n, tau_lo, tau_hi
 
 
+def sample_cached_teacher_transition(
+    states: torch.Tensor,
+    m: int,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample an adjacent transition from cached full-teacher rollouts.
+
+    Args:
+        states: ``[B,K,M+1,T,C]`` states in the repository sampler's native
+            order: index 0 is noise at ``s=0``, index M is data at ``s=1``.
+        m: number of Euler steps used to generate the cache.
+
+    Returns:
+        ``(s_index, noise_index, x_hi, x_lo, tau_lo, tau_hi)``.  ``x_hi``
+        is the state before the selected teacher step (the noisier endpoint);
+        ``x_lo`` is the state after it.  Since CM time runs opposite native
+        sampler time, ``tau_hi = 1-s_n`` and ``tau_lo = 1-s_{n+1}``.
+
+    Sampling a whole cached rollout first and then an adjacent edge preserves
+    the teacher's autoregressive denoising dependency: every edge after the
+    first starts from the output of the preceding full-teacher Euler step.
+    """
+    if states.ndim != 5:
+        raise ValueError(
+            f"cached teacher states must be [B,K,M+1,T,C], got {tuple(states.shape)}"
+        )
+    batch, num_noise, n_states = states.shape[:3]
+    if num_noise < 1:
+        raise ValueError("cached teacher states contain no noise samples")
+    if n_states != m + 1:
+        raise ValueError(
+            f"cached teacher states have {n_states - 1} steps but model.cd.m_rungs={m}"
+        )
+    device = states.device
+    s_index = torch.randint(0, m, (batch,), device=device, generator=generator)
+    noise_index = torch.randint(
+        0, num_noise, (batch,), device=device, generator=generator
+    )
+    batch_index = torch.arange(batch, device=device)
+    x_hi = states[batch_index, noise_index, s_index]
+    x_lo = states[batch_index, noise_index, s_index + 1]
+    tau_hi = (1.0 - s_index.to(torch.float32) / m).view(batch, 1, 1)
+    tau_lo = (1.0 - (s_index + 1).to(torch.float32) / m).view(batch, 1, 1)
+    return s_index, noise_index, x_hi, x_lo, tau_lo, tau_hi
+
+
+def transition_velocity(
+    x_hi: torch.Tensor,
+    x_lo: torch.Tensor,
+    tau_lo: torch.Tensor,
+    tau_hi: torch.Tensor,
+) -> torch.Tensor:
+    """Exact native velocity whose Euler step maps cached ``x_hi -> x_lo``."""
+    dt = tau_hi.float() - tau_lo.float()
+    if bool((dt <= 0).any()):
+        raise ValueError("cached teacher transition requires tau_hi > tau_lo")
+    return (x_lo.float() - x_hi.float()) / dt
+
+
 def needs_target(tau_lo: torch.Tensor) -> torch.Tensor:
     """``[B]`` bool: does this sample's target term have a nonzero coefficient?
 
@@ -176,6 +236,31 @@ def blend_weight(tau_lo: torch.Tensor, tau_hi: torch.Tensor) -> torch.Tensor:
     dominates near the noise -- which is the direction information has to travel.
     """
     return (tau_hi - tau_lo) / tau_hi.clamp_min(torch.finfo(tau_hi.dtype).tiny)
+
+
+def x0_reconstruction_loss(
+    x_hi: torch.Tensor,
+    tau_hi: torch.Tensor,
+    v_online: torch.Tensor,
+    x0: torch.Tensor,
+    *,
+    normalizer: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Supervise the online consistency endpoint against the ground-truth action.
+
+    ``f_theta(x_hi, tau_hi) = x_hi + tau_hi * v_online`` is the clean-action estimate
+    used by a one-step consistency sampler. Unlike ``cd_loss``, this term is anchored to
+    the dataset target rather than to the teacher/EMA bootstrap. Arithmetic and reduction
+    stay in fp32 so small data-end residuals are not lost to bf16 cancellation.
+
+    Returns ``(loss, per_sample)``. Per-sample values are detached for logging.
+    """
+    if normalizer <= 0:
+        raise ValueError(f"normalizer must be positive, got {normalizer}")
+    pred_x0 = consistency_fn(x_hi.float(), tau_hi.float(), v_online.float())
+    residual = pred_x0 - x0.detach().float()
+    per_sample = residual.pow(2).flatten(1).mean(1)
+    return per_sample.mean() / float(normalizer), per_sample.detach()
 
 
 def cd_target_velocity(

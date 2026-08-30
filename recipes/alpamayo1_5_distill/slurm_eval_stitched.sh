@@ -132,8 +132,8 @@ if [[ -n "${NAV:-}" ]]; then
     echo "[slurm] NAV=$NAV -> PAIDatasetWithNav, route in components_order"
 fi
 [[ -n "${EXTRA_ARGS:-}" ]] && EXTRA+=($EXTRA_ARGS)
-TAG="stitch_${MODEL_TAG}_${ARM}_$(basename "$CKPT")${TAG_SUF}"
-echo "[slurm] ARM=$ARM ckpt=$CKPT -> $OUT_DIR/$TAG.json"
+TAG="stitch_${MODEL_TAG}_${ARM}_$(basename "$CKPT")${TAG_SUF}${TAG_SUFFIX:-}"
+echo "[slurm] ARM=$ARM ckpt=$CKPT -> $OUT_DIR/$TAG.json + $OUT_DIR/$TAG.npz"
 
 "${LAUNCH[@]}" "$VENV/torchrun" --nproc_per_node 1 --master_port "$MASTER_PORT" \
     -m alpamayo1_5_sft.evaluate_hf \
@@ -143,6 +143,7 @@ echo "[slurm] ARM=$ARM ckpt=$CKPT -> $OUT_DIR/$TAG.json"
     ++evaluate.eval_ckpt="$CKPT" \
     ++evaluate.max_eval_steps="$MAX_EVAL_STEPS" \
     ++evaluate.per_clip_output="$OUT_DIR/$TAG.json" \
+    ++evaluate.trajectory_output="$OUT_DIR/$TAG.npz" \
     ++trainer.per_device_eval_batch_size="$BS" \
     paths.output_dir="$OUT_DIR/$TAG" \
     "${EXTRA[@]}" \
@@ -154,16 +155,22 @@ grep -a "stitch\] loaded" "$LOG" | tail -1 || echo "!! expert never loaded"
 grep -a "Loaded .* VLM tensors" "$LOG" | tail -1
 grep -aE "val/count|kept [0-9]+/[0-9]+ clips" "$LOG" | tail -2
 BAD=$(grep -ac "Invalid token ids\|not equal to the expected" "$LOG" || true)
-"$VENV/python" - "$OUT_DIR/$TAG.json" "$BAD" <<'PY'
+"$VENV/python" - "$OUT_DIR/$TAG.json" "$BAD" "$OUT_DIR/$TAG.npz" <<'PY'
 import json, sys, statistics as st
+import numpy as np
 recs = json.load(open(sys.argv[1])); n=len(recs)
 print(f"per-clip records: {n}" + ("" if n==1000 else "   <-- ⚠️ EXPECTED 1000"))
 bad=int(sys.argv[2])
 print(f"malformed warnings: {bad}" + (f" = {100*bad/n:.1f}% of clips" if n else ""))
-for m in ("ade","min_ade"):
+for m in ("ade","min_ade","max_ade"):
     v=[r[m] for r in recs if m in r]
     if v: print(f"  {m:<8} {st.mean(v):.4f}  (se {st.stdev(v)/len(v)**0.5:.4f})")
 eq=sum(1 for r in recs if abs(r['ade']-r['min_ade'])<1e-9)
 print(f"  all-6-samples-identical: {eq}/{n} = {100*eq/n:.1f}%   (mode-collapse tripwire)")
+z=np.load(sys.argv[3], allow_pickle=False)
+assert z["pred_xyz"].shape[:3] == (n, 1, 6), z["pred_xyz"].shape
+assert z["gt_xyz"].shape[0] == n and len(z["clip_ids"]) == n
+print(f"  trajectory archive: pred {z['pred_xyz'].shape} {z['pred_xyz'].dtype}, "
+      f"gt {z['gt_xyz'].shape} {z['gt_xyz'].dtype}")
 print("  compare ONLY against ARM=teacher from this same script -- token-head numbers do not apply")
 PY

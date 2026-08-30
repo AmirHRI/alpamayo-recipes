@@ -47,7 +47,7 @@ purpose -- every row here is at the same camera count, so the K comparison is pa
 **min_ade 0.6981 / ade 1.6822** (``LATENCY_PROFILE.md:136``, n=1000, prefill-only).  If it does
 not, fix that before reading any other row.
 
-**What is reported per K**, beyond ``min_ade``/``ade``:
+**What is reported per K**, beyond ``min_ade``/``ade``/``max_ade``:
 
 * ``identical`` -- fraction of clips where all 6 samples coincide (``ade == min_ade``).  The
   mode-collapse tripwire ``slurm_eval_stitched.sh:128`` already uses; baseline band 15.6-17.8%.
@@ -145,6 +145,25 @@ def _pairwise_diversity(pred_xyz: torch.Tensor) -> torch.Tensor:
     d = torch.linalg.norm(p[:, :, None] - p[:, None, :], dim=-1).mean(-1)
     iu = torch.triu_indices(n, n, offset=1, device=p.device)
     return d[:, iu[0], iu[1]].mean(-1)
+
+
+def _max_ade(pred_xyz: torch.Tensor, gt_xyz: torch.Tensor) -> torch.Tensor:
+    """Worst-of-K ADE for every clip, averaged over trajectory sets.
+
+    ``pred_xyz`` is ``[B, N, K, T, 3]`` and ``gt_xyz`` is ``[B, T, 3]``. This is
+    the mirror of the evaluator's oracle ``min_ade``: first take the worst candidate
+    along K, then average over N. XY-only distance and the time average exactly match
+    ``DistanceMetrics``' ADE convention.
+    """
+    if pred_xyz.ndim != 5 or gt_xyz.ndim != 3:
+        raise ValueError(
+            f"expected pred [B,N,K,T,3] and gt [B,T,3], got "
+            f"{tuple(pred_xyz.shape)} and {tuple(gt_xyz.shape)}"
+        )
+    sample_ade = torch.linalg.norm(
+        pred_xyz[..., :2] - gt_xyz[:, None, None, :, :2], dim=-1
+    ).mean(dim=-1)
+    return sample_ade.amax(dim=2).mean(dim=1)
 
 
 def _out_of_bounds(model, action: torch.Tensor) -> torch.Tensor:
@@ -262,6 +281,7 @@ def main(cfg: DictConfig) -> None:
             out = {"pred_xyz": pred_xyz, "pred_rot": pred_rot}
             m = metric.evaluate(model, gpu, out)
             with torch.no_grad():
+                max_ade = _max_ade(pred_xyz, gpu["ego_future_xyz"][:, -1])
                 div = _pairwise_diversity(pred_xyz)
                 oob = _out_of_bounds(model, action)
                 geo = _geometric_infeasible(pred_xyz, model.action_space.dt,
@@ -277,7 +297,8 @@ def main(cfg: DictConfig) -> None:
                             "diversity": float(div[i]), "oob": float(oob[i]),
                             "geo": float(geo[i]),
                             **{kk: float(v[i]) for kk, v in m.items()
-                               if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == b}})
+                               if torch.is_tensor(v) and v.ndim >= 1 and v.shape[0] == b},
+                            "max_ade": float(max_ade[i])})
             seen += b
             if seen % 100 < bs:
                 done = [p for p in per if "min_ade" in p]
@@ -290,19 +311,22 @@ def main(cfg: DictConfig) -> None:
             cameras=np.array(cams), description=np.array(f"{k} Euler steps"),
             inference_step=np.array(k),
             min_ade=np.array([p.get("min_ade", np.nan) for p in per], dtype=np.float32),
-            ade=np.array([p.get("ade", np.nan) for p in per], dtype=np.float32))
+            ade=np.array([p.get("ade", np.nan) for p in per], dtype=np.float32),
+            max_ade=np.array([p.get("max_ade", np.nan) for p in per], dtype=np.float32))
         with open(os.path.join(out_dir, f"{tag}_{name}.json"), "w") as fh:
             json.dump(per, fh)
 
         ma = float(np.nanmean([p.get("min_ade", np.nan) for p in per]))
         ad = float(np.nanmean([p.get("ade", np.nan) for p in per]))
+        mx = float(np.nanmean([p.get("max_ade", np.nan) for p in per]))
         # ade is sample 0 and min_ade is oracle best-of-6, so equality means the 6 coincided.
         eq = float(np.mean([abs(p.get("ade", 0.0) - p.get("min_ade", 1.0)) < 1e-9 for p in per]))
         dv = float(np.nanmean([p["diversity"] for p in per]))
         ob = float(np.nanmean([p["oob"] for p in per]))
         ge = float(np.nanmean([p["geo"] for p in per]))
-        summary.append((name, k, len(per), ma, ad, eq, dv, ob, ge))
-        print(f"[step] === {tag} {name}: n={len(per)}  min_ade {ma:.4f}  ade {ad:.4f}  "
+        summary.append((name, k, len(per), ma, ad, mx, eq, dv, ob, ge))
+        print(f"[step] === {tag} {name}: n={len(per)}  min_ade {ma:.4f}  "
+              f"ade {ad:.4f}  max_ade {mx:.4f}  "
               f"identical {100 * eq:.1f}%  diversity {dv:.4f}  oob {100 * ob:.2f}%  "
               f"geo_infeas {100 * ge:.2f}%  -> {npz}", flush=True)
 
@@ -311,9 +335,9 @@ def main(cfg: DictConfig) -> None:
     # documents pred_xyz as [B, N, K, T, 3] "N groups of K candidates" -- and K is pinned at
     # `num_traj_samples` here. The swept axis is the Euler step count.
     print(f"[step] {'row':>5} {'steps':>5} {'n':>5} {'min_ade':>9} {'ade':>9} "
-          f"{'identical':>10} {'diversity':>10} {'oob':>8} {'geo':>8}")
-    for name, k, n, ma, ad, eq, dv, ob, ge in summary:
-        print(f"[step] {name:>5} {k:>5} {n:>5} {ma:>9.4f} {ad:>9.4f} "
+          f"{'max_ade':>9} {'identical':>10} {'diversity':>10} {'oob':>8} {'geo':>8}")
+    for name, k, n, ma, ad, mx, eq, dv, ob, ge in summary:
+        print(f"[step] {name:>5} {k:>5} {n:>5} {ma:>9.4f} {ad:>9.4f} {mx:>9.4f} "
               f"{100 * eq:>9.1f}% {dv:>10.4f} {100 * ob:>7.2f}% {100 * ge:>7.2f}%")
     ref = [s for s in summary if s[1] == 10]
     if ref and cams == DEFAULT_CAMERAS:

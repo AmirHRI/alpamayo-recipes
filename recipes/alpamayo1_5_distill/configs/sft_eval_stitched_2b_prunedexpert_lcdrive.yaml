@@ -76,6 +76,7 @@ trainer:
 
 evaluate:
   eval_ckpt: null
+  trajectory_output: null
   max_eval_steps: -1
   torch_dtype: bfloat16
   metric_runner:

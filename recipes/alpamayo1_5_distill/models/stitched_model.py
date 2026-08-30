@@ -328,6 +328,7 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         checkpoint_path: str,
         vlm_name_or_path: str,
         teacher_checkpoint_path: str | None = None,
+        sparse_pruned_expert: bool = False,
         # Accepted and ignored so this target is a DROP-IN for `from_stitch` in the same
         # config: the teacher reads its trajectory settings from `checkpoint_path` itself,
         # but the shared eval config supplies `alpamayo_config_path` and hydra cannot delete
@@ -402,8 +403,30 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
             pretrained_modules["traj_tokenizer"] = instantiate(config.traj_tokenizer_cfg)
         model = cls(config, pretrained_modules=pretrained_modules or None)
         model = load_alpamayo1_vlm(checkpoint_path, model)
-        _load_teacher_non_vlm(teacher_checkpoint_path or checkpoint_path, model)
-        _apply_expert_pruning(model)
+        expert_source = teacher_checkpoint_path or checkpoint_path
+        if sparse_pruned_expert:
+            if teacher_checkpoint_path is None:
+                raise ValueError(
+                    "sparse_pruned_expert needs teacher_checkpoint_path=<sparse checkpoint>; "
+                    "checkpoint_path remains the dense teacher source for the frozen VLM"
+                )
+            if not os.environ.get("PRUNE_EXPERT_LAYERS", "").strip():
+                raise ValueError(
+                    "sparse_pruned_expert requires PRUNE_EXPERT_LAYERS to name the absent slots"
+                )
+            # Replace the absent parameterised blocks BEFORE strict loading. The sparse CD
+            # checkpoint deliberately has no tensors for these slots; loading first would
+            # report them as missing parameters, while pruning afterwards is too late.
+            _apply_expert_pruning(model)
+            skipped = [i for i, layer in enumerate(model.expert.layers)
+                       if isinstance(layer, _SkippedExpertLayer)]
+            _load_teacher_non_vlm(expert_source, model)
+            print(f"[stitch] sparse-pruned expert loaded: "
+                  f"{len(model.expert.layers) - len(skipped)}/{len(model.expert.layers)} "
+                  f"active, skipped={skipped}", flush=True)
+        else:
+            _load_teacher_non_vlm(expert_source, model)
+            _apply_expert_pruning(model)
         return model
 
     # ------------------------------------------------------------------ prefill-only

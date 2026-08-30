@@ -60,6 +60,7 @@ AUX_LOSS_KEYS = (
     # distinguish a healthy bootstrap (the anchor rung falls first, then propagates toward
     # noise) from a collapse to the conditional mean (the noise end falls fastest).
     "cd_loss",
+    "x0_gt_loss",
     "cd_loss_anchor",
     "cd_loss_mid",
     "cd_loss_noise",
@@ -304,6 +305,7 @@ class KaVaTrainer(ReasoningVLA_Trainer):
             "field": float(getattr(base, "field_weight", 0.0)),
             "roll": float(getattr(base, "roll_weight", 0.0)),
             "cd": float(getattr(base, "cd_weight", 0.0)),
+            "x0_gt": float(getattr(base, "x0_gt_weight", 0.0)),
         }
         try:
             norms = {}

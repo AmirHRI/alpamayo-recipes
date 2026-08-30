@@ -20,6 +20,7 @@ from itertools import islice
 import hydra
 import hydra.utils as hyu
 import json
+import numpy as np
 import torch
 
 from omegaconf import DictConfig, OmegaConf
@@ -49,6 +50,63 @@ dtype_map = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
+
+
+def _add_max_ade_metrics(output_batch: dict) -> None:
+    """Add worst-of-K ADE from DistanceMetrics' per-candidate ADE tensor.
+
+    sample_ade is [B, N, K]: K sampled candidates in each of N trajectory
+    sets. This mirrors min_ADE's reduction, except it takes the worst candidate.
+    """
+    for key, value in list(output_batch.items()):
+        if not key.endswith("sample_ade") or not isinstance(value, torch.Tensor):
+            continue
+        if value.ndim != 3:
+            raise ValueError(f"{key} must have shape [B,N,K], got {tuple(value.shape)}")
+        prefix = key[: -len("sample_ade")]
+        output_batch[f"metric/{prefix}max_ade"] = value.amax(dim=2).mean(dim=1)
+
+
+def _save_trajectory_archive(
+    path: str,
+    clip_ids: list[str],
+    pred_batches: list[np.ndarray],
+    gt_batches: list[np.ndarray],
+    per_clip_records: list[dict],
+    eval_ckpt: str,
+) -> int:
+    """Write a complete, self-describing trajectory archive and return its clip count."""
+    if not pred_batches or not gt_batches:
+        raise RuntimeError("trajectory_output was requested but no trajectories were collected")
+    pred_xyz = np.concatenate(pred_batches, axis=0).astype(np.float32, copy=False)
+    gt_xyz = np.concatenate(gt_batches, axis=0).astype(np.float32, copy=False)
+    n = len(clip_ids)
+    if pred_xyz.shape[0] != n or gt_xyz.shape[0] != n or len(per_clip_records) != n:
+        raise RuntimeError(
+            "trajectory archive count mismatch: "
+            f"clip_ids={n} pred={pred_xyz.shape[0]} gt={gt_xyz.shape[0]} "
+            f"metrics={len(per_clip_records)}"
+        )
+    metrics = {}
+    for name in ("ade", "min_ade", "max_ade"):
+        values = [r.get(name) for r in per_clip_records]
+        if all(v is not None for v in values):
+            metrics[name] = np.asarray(values, dtype=np.float32)
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    np.savez_compressed(
+        path,
+        schema_version=np.asarray(1, dtype=np.int64),
+        clip_ids=np.asarray(clip_ids),
+        pred_xyz=pred_xyz,
+        gt_xyz=gt_xyz,
+        checkpoint=np.asarray(str(eval_ckpt)),
+        num_traj_sets=np.asarray(pred_xyz.shape[1], dtype=np.int64),
+        num_traj_samples=np.asarray(pred_xyz.shape[2], dtype=np.int64),
+        description=np.asarray("ReasoningSampler xyz trajectories in the ego frame"),
+        **metrics,
+    )
+    return n
 
 
 @hydra.main(version_base=None, config_path=None, config_name="config")
@@ -116,11 +174,38 @@ def evaluate(cfg: DictConfig) -> None:
     # single-process (nproc_per_node=1) run where each clip is seen exactly once.
     per_clip_records: list[dict] = []
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    trajectory_path = cfg.evaluate.get("trajectory_output", None)
+    trajectory_clip_ids: list[str] = []
+    trajectory_pred_batches: list[np.ndarray] = []
+    trajectory_gt_batches: list[np.ndarray] = []
+    if trajectory_path and world_size > 1:
+        raise RuntimeError(
+            "trajectory_output requires WORLD_SIZE=1; distributed ranks are not gathered "
+            "into one ordered clip archive"
+        )
 
     for data in tqdm(dataloader_iter, total=total, disable=not is_main_process):
         output_batch = {}
         with torch.autocast("cuda", dtype=dtype_map[cfg.evaluate.torch_dtype]):
             metric_runner.run(model, data, output_batch)
+        _add_max_ade_metrics(output_batch)
+
+        if is_main_process and trajectory_path:
+            clip_ids = data.get("clip_id", None)
+            pred_xyz = output_batch.get("pred_xyz", None)
+            gt_all = data.get("ego_future_xyz", None)
+            if clip_ids is None or pred_xyz is None or gt_all is None:
+                raise RuntimeError(
+                    "trajectory_output needs clip_id, pred_xyz, and ego_future_xyz"
+                )
+            if pred_xyz.shape[0] != len(clip_ids) or gt_all.shape[0] != len(clip_ids):
+                raise RuntimeError(
+                    f"trajectory batch mismatch: ids={len(clip_ids)} "
+                    f"pred={pred_xyz.shape[0]} gt={gt_all.shape[0]}"
+                )
+            trajectory_clip_ids.extend(str(cid) for cid in clip_ids)
+            trajectory_pred_batches.append(pred_xyz.detach().float().cpu().numpy())
+            trajectory_gt_batches.append(gt_all[:, -1].detach().float().cpu().numpy())
 
         batch_size = len(data["image_frames"])
         gathered_batch_size = accelerator.gather_for_metrics(
@@ -172,6 +257,17 @@ def evaluate(cfg: DictConfig) -> None:
         with open(per_clip_path, "w", encoding="utf-8") as f:
             json.dump(per_clip_records, f)
         logger.info(f"Wrote {len(per_clip_records)} per-clip metric records to {per_clip_path}")
+
+    if trajectory_path:
+        n_archive = _save_trajectory_archive(
+            str(trajectory_path),
+            trajectory_clip_ids,
+            trajectory_pred_batches,
+            trajectory_gt_batches,
+            per_clip_records,
+            str(cfg.evaluate.get("eval_ckpt", "")),
+        )
+        logger.info(f"Wrote {n_archive} generated-trajectory records to {trajectory_path}")
 
     final_metrics_dict = {}
     for key in metric_sums.keys():
