@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_stitch_eval
-#SBATCH --partition=debug
+#SBATCH --partition=gpu
 #SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stitcheval_%j.out
 #SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stitcheval_%j.err
 #SBATCH --nodes=1

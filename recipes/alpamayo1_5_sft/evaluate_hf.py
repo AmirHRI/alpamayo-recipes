@@ -20,6 +20,7 @@ from itertools import islice
 import hydra
 import hydra.utils as hyu
 import json
+import numpy as np
 import torch
 
 from omegaconf import DictConfig, OmegaConf
@@ -117,6 +118,16 @@ def evaluate(cfg: DictConfig) -> None:
     per_clip_records: list[dict] = []
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
+    # Optional raw-trajectory dump, so predictions can be re-scored later WITHOUT re-running
+    # the model. Opt-in via `evaluate.traj_output`; when unset nothing is collected and the
+    # eval behaves exactly as before. ⚠️ Same single-process caveat as per_clip_records: only
+    # the main process accumulates, so this is complete only at nproc_per_node=1 (which
+    # slurm_eval_eos.sh pins).
+    traj_path = cfg.evaluate.get("traj_output", None)
+    traj_ids: list[str] = []
+    traj_preds: list[np.ndarray] = []
+    traj_gts: list[np.ndarray] = []
+
     for data in tqdm(dataloader_iter, total=total, disable=not is_main_process):
         output_batch = {}
         with torch.autocast("cuda", dtype=dtype_map[cfg.evaluate.torch_dtype]):
@@ -146,6 +157,23 @@ def evaluate(cfg: DictConfig) -> None:
                         rec[mk] = vals[i]
                     per_clip_records.append(rec)
 
+            # Raw trajectories. `pred_xyz` is [B, N, K, Tf, 3] (N sets x K samples, ALL kept
+            # so best-of-K can be recomputed offline); GT `ego_future_xyz` is [B, ?, Tf, 3]
+            # and the LAST index is the one the metrics score against -- see
+            # distance_metrics.py, which compares pred against gt_xyz[:, None, None].
+            # fp16 for preds / fp32 for GT matches scripts/eval_step_sweep.py so the existing
+            # readers (viz_step_sweep.py) work on these files unchanged.
+            if traj_path is not None and clip_ids is not None:
+                pred = output_batch.get("pred_xyz", None)
+                gt = data.get("ego_future_xyz", None)
+                if pred is not None and gt is not None:
+                    pred_np = pred.detach().float().cpu().numpy().astype(np.float16)
+                    gt_np = gt[:, -1].detach().float().cpu().numpy().astype(np.float32)
+                    for i, cid in enumerate(clip_ids):
+                        traj_ids.append(str(cid))
+                        traj_preds.append(pred_np[i])
+                        traj_gts.append(gt_np[i])
+
         for k, v in output_batch.items():
             if not k.startswith("metric/"):
                 continue
@@ -172,6 +200,20 @@ def evaluate(cfg: DictConfig) -> None:
         with open(per_clip_path, "w", encoding="utf-8") as f:
             json.dump(per_clip_records, f)
         logger.info(f"Wrote {len(per_clip_records)} per-clip metric records to {per_clip_path}")
+
+    # Raw trajectories -> .npz, schema-compatible with scripts/eval_step_sweep.py.
+    if traj_path is not None and traj_ids:
+        os.makedirs(os.path.dirname(traj_path), exist_ok=True)
+        np.savez_compressed(
+            traj_path,
+            clip_ids=np.array(traj_ids),
+            pred_xyz=np.stack(traj_preds),
+            gt_xyz=np.stack(traj_gts),
+        )
+        logger.info(
+            f"Wrote {len(traj_ids)} trajectories to {traj_path} "
+            f"pred_xyz{np.stack(traj_preds).shape} gt_xyz{np.stack(traj_gts).shape}"
+        )
 
     final_metrics_dict = {}
     for key in metric_sums.keys():

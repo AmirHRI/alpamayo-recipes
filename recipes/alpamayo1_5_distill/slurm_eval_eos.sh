@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_eos_eval
-#SBATCH --partition=debug
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/eoseval_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/eoseval_%j.err
+#SBATCH --partition=gpu
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/eoseval_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/eoseval_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
@@ -35,9 +35,23 @@ set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
-EOS_DIR="$OUT_DIR/output_eos_2b_nav_lcdrive"
-TEACHER=/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+# MODEL selects which EOS run to score. The 2B arm stays the default so every previously
+# recorded invocation of this script keeps its exact meaning; 4b is opt-in.
+# ⚠️ RUN_DIR, CONFIG and the TAG prefix must move TOGETHER. Mixing a 4B checkpoint into the
+# 2B config loads a 28-layer expert config against 36-layer weights, and reusing the 2B TAG
+# would overwrite the 2B per-clip JSON with 4B numbers under a 2B name.
+MODEL="${MODEL:-2b}"
+case "$MODEL" in
+    2b) EOS_DIR="$OUT_DIR/output_eos_2b_nav_lcdrive"
+        CONFIG=sft_eval_eos_2b_nav_lcdrive
+        TAG_PREFIX=eos_2b_nav ;;
+    4b) EOS_DIR="$OUT_DIR/output_eos_4b_2cam_nav_lcdrive"
+        CONFIG=sft_eval_eos_4b_2cam_nav_lcdrive
+        TAG_PREFIX=eos_4b_2cam_nav ;;
+    *)  echo "[slurm] unknown MODEL=$MODEL (want 2b|4b)" >&2; exit 1 ;;
+esac
+TEACHER=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 
 ARM="${ARM:-eos}"                       # eos | control
 CKPT="${CKPT:-}"                        # e.g. checkpoint-4689; default = newest
@@ -79,8 +93,13 @@ fi
 # The student tower is the SAME in both arms -- only where `expert.*` comes from changes.
 EXPERT_SRC="$CKPT"
 [[ "$ARM" == "control" ]] && EXPERT_SRC="$TEACHER"
-# ...and the control DOES need the remap, because the 10B expert is 36 layers deep.
-[[ "$ARM" == "control" ]] && export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+# ...and the 2B control DOES need the remap, because the 10B expert is 36 layers deep while
+# the 2B student's is 28. ⚠️ NOT for 4b: that student's expert is already 36, so n_ckpt ==
+# n_have, the remap branch is skipped, and setting the pin would only mislead a later reader
+# into thinking a remap happened.
+if [[ "$ARM" == "control" && "$MODEL" == "2b" ]]; then
+    export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+fi
 
 cd "$RECIPE_DIR"
 export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
@@ -90,21 +109,23 @@ MASTER_PORT=$((29900 + ${SLURM_JOB_ID:-$$} % 20000))
 
 # ⚠️ nproc_per_node MUST stay 1. evaluate_hf collects per-clip records on the main process
 # only, so the per-clip JSON is complete only in a single-process run.
-TAG="eos_2b_nav_${ARM}_$(basename "$CKPT")"
+TAG="${TAG_PREFIX}_${ARM}_$(basename "$CKPT")"
 [[ "$NFE" != "10" ]] && TAG="${TAG}_nfe${NFE}"
 [[ "$MAX_EVAL_STEPS" != "-1" ]] && TAG="${TAG}_smoke${MAX_EVAL_STEPS}"
 echo "[slurm] ARM=$ARM student<-$CKPT expert<-$EXPERT_SRC bs=$BS nfe=$NFE steps=$MAX_EVAL_STEPS"
 echo "[slurm] -> $OUT_DIR/$TAG.json"
+echo "[slurm] -> $OUT_DIR/$TAG.npz  (raw pred_xyz/gt_xyz for offline re-scoring)"
 nvidia-smi -L
 
 srun "$VENV/torchrun" --nproc_per_node 1 --master_port "$MASTER_PORT" \
     -m alpamayo1_5_sft.evaluate_hf \
     --config-path pkg://alpamayo1_5_distill/configs \
-    --config-name sft_eval_eos_2b_nav_lcdrive \
+    --config-name "$CONFIG" \
     ++evaluate.eval_ckpt="$CKPT" \
     ++model.teacher_checkpoint_path="$EXPERT_SRC" \
     ++evaluate.max_eval_steps="$MAX_EVAL_STEPS" \
     ++evaluate.per_clip_output="$OUT_DIR/$TAG.json" \
+    ++evaluate.traj_output="$OUT_DIR/$TAG.npz" \
     ++evaluate.metric_runner.metrics.0.diffusion_kwargs.inference_step="$NFE" \
     ++trainer.per_device_eval_batch_size="$BS" \
     paths.output_dir="$OUT_DIR/$TAG" \

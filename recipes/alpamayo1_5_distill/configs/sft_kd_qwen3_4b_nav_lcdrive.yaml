@@ -1,0 +1,117 @@
+# Qwen3-VL-4B student, NAV-CONDITIONED: PAIDatasetWithNav loads one sample per ANNOTATION,
+# each with its OWN event-anchored t0 (NOT the default 5.1s keyframe), from a JSON annotation
+# file instead of iterating clips directly.
+#
+# ⚠️ "route" MUST be in components_order or nav_text is silently discarded: r1_5.py emits the
+# route only on `case "route":` (see sft_kd_cosmos2b_2cam_nav_lcdrive.yaml, the precedent for
+# this pattern). Both towers read one input_ids tensor, so the teacher sees the route too.
+# ⚠️ t0 is per-annotation (event-anchored), so nothing trained here is directly comparable to
+# the non-nav arms in sft_kd_qwen3_4b_lcdrive.yaml without its own no-nav control on the same
+# annotations.
+# ⚠️ NOTHING in this file is a duplicate of sft_kd_qwen3_4b_lcdrive.yaml by accident: hydra
+# forbids inheriting a config that declares `hydra.searchpath`, so the whole file is restated
+# rather than reused -- same reasoning as sft_eval_stitched_4b_lcdrive.yaml. If you change
+# camera-id / frame-num flags or trainer settings in one, change both.
+defaults:
+  - sft_base
+  - /models/qwen3_vl_4b_kd@model
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+data:
+  # ⚠️ The teacher's config.json declares include_camera_ids / include_frame_nums TRUE and
+  # the reference create_message() prefixes each image with "Front left camera: frame 0 ".
+  # Student and teacher must both use the annotated format, or the sequences differ and every
+  # position-wise KV target is misaligned.
+  train_dataset:
+    _target_: alpamayo.data.pai_nav.PAIDatasetWithNav
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  # ⚠️ NOT nav-conditioned, matching sft_kd_cosmos2b_2cam_nav_lcdrive.yaml's own precedent --
+  # val stays on the default 5.1s keyframe so eval numbers keep meaning across arms.
+  val_dataset:
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: true
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  # ⚠️ NO lr_multiplier: the ViT trains at the SAME rate as the LLM here, matching the 2B nav
+  # run this arm is the counterpart of. sft_kd_qwen3_4b_lcdrive.yaml throttles the vision
+  # tower to 0.1x; left inherited that would make the vision tower the one uncontrolled
+  # difference between the two students. `null` is explicit rather than omitted so the intent
+  # is visible -- SFTTrainer reads `getattr(args, "lr_multiplier", None)` and falls back to
+  # plain Trainer behaviour on None.
+  lr_multiplier: null
+  ddp_find_unused_parameters: false
+
+  # ABSOLUTE path. sft_base sets `configs/deepspeed/zero2.json`, which only resolves when
+  # cwd is the *sft* recipe dir.
+  deepspeed: /home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/configs/deepspeed/zero2.json
+
+  gradient_checkpointing: true
+
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 12
+  learning_rate: 1e-5
+  # ⚠️ warmup is ~21% of ONE EPOCH, so it must be rederived whenever GPUS/BS/ACCUM change --
+  # it is a step count, not a fraction, and the steps per epoch move with the effective batch.
+  # This dataset iterates 50,000 ANNOTATIONS (verified), NOT the 38,340 clips the 340 below
+  # was derived from:
+  #     2 GPUs x 1 x 12 = 24  -> 2,084 steps/epoch -> warmup 444
+  #     4 GPUs x 8 x 1  = 32  -> 1,563 steps/epoch -> warmup 333   <- the nav4bmix run
+  # 333 is the SAME number the 2B nav run used (2 GPUs x 8 x 2), because the annotation count
+  # and the EFFECTIVE batch are the same; only the student and the GPU/accum split differ.
+  warmup_steps: 333
+  num_train_epochs: 5
+
+  # STEP-based saving, every 500 steps. At 4 x 8 x 1 = 32 (1,563 steps/epoch, 7,815 total)
+  # that is ~15 checkpoints, so an EPOCH boundary is never itself a checkpoint -- quote the
+  # STEP, not the epoch, when reporting a number from this run.
+  # ⚠️ save_total_limit=10 prunes by step order, so with ~15 saves the EARLIEST checkpoints
+  # start disappearing around step 5,500. Raise the limit rather than the interval if early
+  # snapshots matter; 10 x ~17 GB is the disk cost of keeping them all.
+  save_strategy: steps
+  save_steps: 500
+  save_total_limit: 10
+
+paths:
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_qwen3_4b_nav_lcdrive
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_kd_qwen3_4b_nav_lcdrive
+run_name: kd_4b_nav_${now:%m%d-%H%M}
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-kd-qwen3-4b
+  group: kd_4b_nav_lcdrive_arms

@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_kd_train
-#SBATCH --partition=debug
+#SBATCH --partition=gpu
 #SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.out
 #SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.err
 #SBATCH --nodes=1
@@ -25,6 +25,9 @@
 #   ARM=kvband sbatch slurm_train_kd.sh  # KV alone with depth-banded layer weights
 #   ARM=blockonly sbatch slurm_train_kd.sh  # L_block alone (teacher-forced block match)
 #   ARM=blockrandt sbatch slurm_train_kd.sh # L_block with t sampled, not pinned to 0
+#   ARM=nav2bmix sbatch slurm_train_kd.sh   # 2B, nav-conditioned, block(m=1) + span(m=7)
+#   ARM=nav4bmix sbatch slurm_train_kd.sh   # 4B, same objective, span m=9 (36-layer expert)
+#   ARM=nav4bmix2cam sbatch slurm_train_kd.sh # 4B, span m=9, TWO front cameras
 #   SMOKE=1 ARM=kv sbatch slurm_train_kd.sh
 #   RESUME=<ckpt> EPOCHS=3 ARM=kvonly sbatch slurm_train_kd.sh   # continue for more epochs
 #
@@ -163,6 +166,49 @@ case "$ARM" in
                 ++model.kd.block_span_mix="${MIXM:-7}"
                 ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
         ARM="${ARM}_m${MIXM:-7}w${MIXW:-1.0}" ;;
+    nav4bmix)
+        # The 4B counterpart of nav2bmix: SAME objective (teacher-forced block loss m=1 mixed
+        # with the span loss at equal weight), SAME nav-conditioned annotations, SAME effective
+        # batch -- the ONLY intended difference is the student and the span length.
+        # ⚠️ m=9, not 7. The 2B student runs a PRUNED 28-layer expert, so its span of 7 covers
+        # a quarter of the depth; the 4B student keeps all 36 expert layers, and 36/4 = 9 is
+        # the span that holds that same fraction. Copying 7 across would silently change the
+        # objective's reach, which is the thing being held fixed.
+        # ⚠️ NO PRUNE_EXPERT_LAYERS here. The 4B student's text tower already matches the
+        # expert's 36 layers, so pruning would create the depth mismatch the 2B arm uses it
+        # to avoid.
+        # SPEED: m=9 is still < SPAN_CKPT_MIN=14, so the span chain is UNCHECKPOINTED, same
+        # regime as the 2B run -- but on 36 layers rather than 28, so budget ~1.3x its cost
+        # per step on top of the larger student.
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_nav_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-9}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        # RUN_TAG derives from ARM alone, so the mix parameters must be in the name or two
+        # configurations share an output_dir and a wandb id (job 493).
+        ARM="${ARM}_m${MIXM:-9}w${MIXW:-1.0}" ;;
+    nav4bmix2cam)
+        # nav4bmix restricted to the TWO FRONT cameras -- the corrected counterpart of the
+        # 4-camera run (job 20550), and the only 4B arm directly comparable to nav2bmix.
+        # Identical objective, annotations, warmup, epochs and EFFECTIVE batch; the camera
+        # set is the single difference from nav4bmix, and the student+span are the single
+        # difference from nav2bmix.
+        # ⚠️ The camera subsetting lives in the CONFIG (CameraSubsetPAIDataset), not here.
+        # nav4bmix's config targets PAIDatasetWithNav, which is a plain PAIDataset plus nav
+        # and therefore yields all four cameras -- that is exactly how job 20550 trained on
+        # 16 images while being described as 2-camera. Verify from the log: this arm MUST
+        # print "[camsubset] ... cameras [1, 3] (2 x 4 frames = 8 images)".
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_2cam_nav_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-9}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        ARM="${ARM}_m${MIXM:-9}w${MIXW:-1.0}" ;;
     field2b)
         # L_FIELD ALONE on the 2B/pruned-expert 2-camera stack: chain all 28 layers on the
         # STUDENT's own cache (no teacher forcing anywhere), take expert.norm +
@@ -338,7 +384,7 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam)" >&2; exit 1 ;;
 esac
 # INIT=<ckpt>: start from an existing student instead of the base VLM. Distinct from
 # RESUME, which also restores optimizer + scheduler state; INIT takes the WEIGHTS only,
