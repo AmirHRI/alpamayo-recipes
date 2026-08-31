@@ -129,6 +129,97 @@ def sample_rungs(batch: int, m: int, device, generator: torch.Generator | None =
     return n, tau_lo, tau_hi
 
 
+def sample_cached_teacher_transition(
+    states: torch.Tensor,
+    m: int,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample an adjacent transition from cached full-teacher rollouts.
+
+    Args:
+        states: ``[B,K,M+1,T,C]`` states in the repository sampler's native
+            order: index 0 is noise at ``s=0``, index M is data at ``s=1``.
+        m: number of Euler steps used to generate the cache.
+
+    Returns:
+        ``(s_index, noise_index, x_hi, x_lo, tau_lo, tau_hi)``.  ``x_hi``
+        is the state before the selected teacher step (the noisier endpoint);
+        ``x_lo`` is the state after it.  Since CM time runs opposite native
+        sampler time, ``tau_hi = 1-s_n`` and ``tau_lo = 1-s_{n+1}``.
+
+    Sampling a whole cached rollout first and then an adjacent edge preserves
+    the teacher's autoregressive denoising dependency: every edge after the
+    first starts from the output of the preceding full-teacher Euler step.
+    """
+    if states.ndim != 5:
+        raise ValueError(
+            f"cached teacher states must be [B,K,M+1,T,C], got {tuple(states.shape)}"
+        )
+    batch, num_noise, n_states = states.shape[:3]
+    if num_noise < 1:
+        raise ValueError("cached teacher states contain no noise samples")
+    if n_states != m + 1:
+        raise ValueError(
+            f"cached teacher states have {n_states - 1} steps but model.cd.m_rungs={m}"
+        )
+    device = states.device
+    s_index = torch.randint(0, m, (batch,), device=device, generator=generator)
+    noise_index = torch.randint(
+        0, num_noise, (batch,), device=device, generator=generator
+    )
+    batch_index = torch.arange(batch, device=device)
+    x_hi = states[batch_index, noise_index, s_index]
+    x_lo = states[batch_index, noise_index, s_index + 1]
+    tau_hi = (1.0 - s_index.to(torch.float32) / m).view(batch, 1, 1)
+    tau_lo = (1.0 - (s_index + 1).to(torch.float32) / m).view(batch, 1, 1)
+    return s_index, noise_index, x_hi, x_lo, tau_lo, tau_hi
+
+
+def cached_teacher_endpoint(
+    states: torch.Tensor,
+    noise_index: torch.Tensor,
+) -> torch.Tensor:
+    """``states[b, k, M]`` -- the teacher's FINAL action for the SAME noise draw.
+
+    The cache already holds, for every clip, ``K`` pairs of (initial noise, teacher's
+    answer).  That pair is the input/output signature of the object being distilled: a
+    1-NFE sampler IS a map from ``eps`` to a good action.  Supervising it directly needs
+    no EMA, no solver step and no bootstrap chain -- see
+    :func:`x0_reconstruction_loss`, which consumes this as its target.
+
+    ⚠️ ``noise_index`` MUST be the one :func:`sample_cached_teacher_transition` returned
+    for the same batch. Re-drawing it here would pair ``x_hi`` from one rollout with the
+    endpoint of a different one, which is not a target at all -- it is the conditional
+    mean over ``K``, i.e. exactly the diversity collapse this term exists to avoid, and
+    nothing about the loss curve would look wrong.
+    """
+    if states.ndim != 5:
+        raise ValueError(
+            f"cached teacher states must be [B,K,M+1,T,C], got {tuple(states.shape)}"
+        )
+    if noise_index.ndim != 1 or noise_index.shape[0] != states.shape[0]:
+        raise ValueError(
+            f"noise_index must be [B] with B={states.shape[0]}, got "
+            f"{tuple(noise_index.shape)}"
+        )
+    batch_index = torch.arange(states.shape[0], device=states.device)
+    return states[batch_index, noise_index, -1]
+
+
+def transition_velocity(
+    x_hi: torch.Tensor,
+    x_lo: torch.Tensor,
+    tau_lo: torch.Tensor,
+    tau_hi: torch.Tensor,
+) -> torch.Tensor:
+    """Exact native velocity whose Euler step maps cached ``x_hi -> x_lo``."""
+    dt = tau_hi.float() - tau_lo.float()
+    if bool((dt <= 0).any()):
+        raise ValueError("cached teacher transition requires tau_hi > tau_lo")
+    return (x_lo.float() - x_hi.float()) / dt
+
+
 def needs_target(tau_lo: torch.Tensor) -> torch.Tensor:
     """``[B]`` bool: does this sample's target term have a nonzero coefficient?
 
@@ -176,6 +267,52 @@ def blend_weight(tau_lo: torch.Tensor, tau_hi: torch.Tensor) -> torch.Tensor:
     dominates near the noise -- which is the direction information has to travel.
     """
     return (tau_hi - tau_lo) / tau_hi.clamp_min(torch.finfo(tau_hi.dtype).tiny)
+
+
+def x0_reconstruction_loss(
+    x_hi: torch.Tensor,
+    tau_hi: torch.Tensor,
+    v_online: torch.Tensor,
+    x0: torch.Tensor,
+    *,
+    normalizer: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Supervise the online consistency endpoint against a clean-action target.
+
+    ``f_theta(x_hi, tau_hi) = x_hi + tau_hi * v_online`` is the clean-action estimate a
+    one-step consistency sampler produces. Unlike ``cd_loss`` this term is a plain
+    regression: no EMA, no solver step, no bootstrap, so it converges on the horizon a
+    2-epoch run actually has. At ``tau_hi == 1`` it is bit-for-bit the expression
+    ``flow_matching._euler`` evaluates at ``inference_step=1``.
+
+    Two targets, and the choice is the whole experiment (``model.cd.x0_source``):
+
+    ``gt``
+        the dataset action. It is not paired with the noise that produced ``x_hi``, so all
+        ``K`` draws share one target and the minimiser at ``tau_hi = 1`` is the conditional
+        mean -- it buys sharpness by spending the sample diversity that best-of-K
+        ``min_ade`` rewards.
+    ``teacher``
+        :func:`cached_teacher_endpoint` for THIS noise draw. ``K`` draws keep ``K``
+        distinct targets, so the teacher's spread is what gets distilled, not averaged
+        away. This is the noise/output-pair form of policy distillation.
+
+    ⚠️ Weighted UNIFORMLY in ``x0`` space -- there is no ``tau**2`` here and there must not
+    be. ``cd_loss`` carries that factor because it works in velocity space; the residual
+    here is already in consistency-output space, and re-introducing it would starve the
+    data end by 100x on this 10-rung grid.
+
+    Arithmetic and reduction stay in fp32 so small data-end residuals are not lost to bf16
+    cancellation.
+
+    Returns ``(loss, per_sample)``. Per-sample values are detached for logging.
+    """
+    if normalizer <= 0:
+        raise ValueError(f"normalizer must be positive, got {normalizer}")
+    pred_x0 = consistency_fn(x_hi.float(), tau_hi.float(), v_online.float())
+    residual = pred_x0 - x0.detach().float()
+    per_sample = residual.pow(2).flatten(1).mean(1)
+    return per_sample.mean() / float(normalizer), per_sample.detach()
 
 
 def cd_target_velocity(

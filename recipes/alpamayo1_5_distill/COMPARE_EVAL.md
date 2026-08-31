@@ -230,7 +230,7 @@ correlate each candidate against the outcome. n=1200 (200 clips × 6 draws), Spe
 
 ---
 
-## 7. Denoising steps × navigation instruction
+## 7. Denoising steps — the nav sweep, and few-step distillation
 
 Teacher, **unpruned 36-layer** expert, 2 cameras, n=1000, event-anchored `t0`, paired per clip.
 Both arms carry `"route"` in `components_order`; they differ only in whether `nav_text` is
@@ -301,6 +301,186 @@ both `t0` choices — it is a property of the sampler, not of the conditioning.
 
 ---
 
+### 7e. Few-step distillation of the EoS-2B expert — 2 NFE beats 10
+
+2 cameras, nav, event-anchored `t0`, n=1000, `sft_eval_eos_2b_nav_lcdrive`. Every row is the
+SAME student VLM; only the expert's weights and the denoising step count change, so these are
+paired end to end. `diversity` is mean pairwise L2 between the 6 draws (§7a's definition);
+`coverage` is, per clip, the distance from each *teacher* draw to the nearest *student* draw —
+i.e. can the student produce what the teacher produces; `floor` is the ADE of the barycentre of
+the 6 draws, an estimate of what a conditional-mean predictor of this model reaches.
+
+| arm | NFE | `ade` | `min_ade` | diversity | coverage | floor |
+|---|---|---|---|---|---|---|
+| teacher 10B, 36-layer expert *(ceiling)* | 2 | 1.4460 | 0.9319 | 0.892 | **0.425** | 1.3382 |
+| **EoS-2B baseline ← the reference** | **10** | **2.4859** | **1.3974** | 1.609 | 1.2628 | 2.3015 |
+| EoS-2B baseline | 2 | 2.4661 | 1.8148 | 0.882 | 1.4980 | 2.4000 |
+| CD bootstrap + 0.1·gt (job 591) | 2 | 2.5304 | 1.5837 | 1.344 | 1.2946 | 2.3796 |
+| endpoint, `x0_gt_weight` 0.0 | 2 | 2.8433 | 1.3429 | 2.511 | 1.1678 | 2.3851 |
+| endpoint + 0.1·gt | 2 | 2.6996 | **1.3214** | 2.256 | 1.1366 | 2.3148 |
+| **endpoint + 0.3·gt** | **2** | 2.5141 | 1.3344 | 1.864 | **1.1173** | 2.2397 |
+| **endpoint + 0.5·gt** | **2** | **2.3726** | 1.4276 | 1.451 | 1.1699 | 2.1952 |
+| endpoint + 1.0·gt *(past the turn)* | 2 | 2.3107 | 1.5345 | 1.148 | 1.2825 | 2.1949 |
+| endpoint, 0.0 | 1 | 2.8598 | 1.5928 | 2.036 | 1.3224 | 2.5779 |
+| endpoint + 0.3·gt | 1 | 2.6968 | 1.6629 | 1.598 | 1.3524 | 2.5047 |
+| endpoint + 0.5·gt | 1 | 2.5720 | 1.7620 | 1.235 | 1.4136 | 2.4132 |
+| endpoint + 1.0·gt | 1 | 2.5182 | 1.8731 | 1.007 | 1.5211 | 2.3916 |
+
+Paired per-clip against the 10-step reference:
+
+| arm (2 NFE) | Δ`min_ade` | z | Δ`ade` | z |
+|---|---|---|---|---|
+| endpoint + 0.0·gt | −0.0545 | −2.12 | +0.3574 | +9.34 |
+| endpoint + 0.1·gt | **−0.0760** | **−3.14** | +0.2137 | +6.04 |
+| **endpoint + 0.3·gt** | −0.0630 | **−2.63** | +0.0282 | **+0.84 (n.s.)** |
+| **endpoint + 0.5·gt** | +0.0302 | **+1.11 (n.s.)** | **−0.1133** | **−3.23** |
+| endpoint + 1.0·gt | +0.1371 | +4.53 | −0.1752 | −4.62 |
+
+**Two operating points, each a PARETO IMPROVEMENT on the 10-step sampler at 1/5 the denoising
+cost** — at 2 epochs; §7e-i shows both were still improving when training stopped.
+`0.3·gt` beats the reference on `min_ade` and ties `ade`; `0.5·gt` beats it on `ade` and
+ties `min_ade`. Neither wins both with significance, and that is the shape of the problem, not a
+shortfall — `ade` and `min_ade` trade through diversity, the same tension §7a documents across
+step count. Choose by deliverable: a single-draw planner takes 0.5, an oracle benchmark 0.3.
+
+⚠️ **1 NFE never gets there.** Best rows are `min_ade` 1.5928 (gt 0.0) and `ade` 2.5182
+(gt 1.0), both worse than the 10-step reference on the other metric. 2 NFE is the operating
+point; do not quote a 1-NFE row as the result.
+
+### 7e-i. The `x0_gt` damper sweep, one variable at a time
+
+All rows: `x0_teacher_weight` 1.0, `cd_weight` 0.0, 2 epochs (`checkpoint-3126`), same student
+init, same schedule. Only `model.cd.x0_gt_weight` changes. Reference is this student's own
+10-step sampler: `ade` **2.4859** / `min_ade` **1.3974**.
+
+| `x0_gt_weight` | 1 NFE `ade` | 1 NFE `min_ade` | 2 NFE `ade` | 2 NFE `min_ade` |
+|---|---|---|---|---|
+| 0.0 *(endpoint only)* | 2.8598 | 1.5928 | 2.8433 | **1.3429** |
+| 0.1 | 2.7896 | 1.6094 | 2.6996 | **1.3214** |
+| 0.3 | 2.6968 | 1.6629 | 2.5141 | **1.3344** |
+| 0.5 | 2.5720 | 1.7620 | **2.3726** | 1.4276 |
+| 1.0 | 2.5182 | 1.8731 | **2.3107** | 1.5345 |
+| *reference: 10 NFE, no CD* | — | — | 2.4859 | 1.3974 |
+
+Read down the two 2-NFE columns: `ade` falls monotonically with the damper while `min_ade`
+turns between 0.3 and 0.5. **At 1 NFE both columns are monotone in the same direction and
+nothing beats the reference** — do not quote a 1-NFE row as the result.
+
+Two diagnostics locate the turn more sharply than either headline metric:
+
+* **Coverage is U-SHAPED, with its minimum at 0.3** (1.1678 → 1.1366 → **1.1173** → 1.1699 →
+  1.2825). At gt 1.0 it has reverted to the UNTRAINED baseline's 1.2628 — the GT term is now
+  pulling the student AWAY from the teacher's trajectory set toward the conditional mean, i.e.
+  job 591's failure mode arriving from the other direction, and it shows up here while `ade` is
+  still improving.
+* **Diversity tracks it monotonically** (2.511 → 2.256 → 1.864 → 1.451 → 1.148 against the
+  teacher's 0.892), which is the mechanism: `ade` and `min_ade` trade through spread.
+
+⚠️ **THIS SWEEP IS CONVERGED IN WEIGHT, NOT IN TRAINING TIME.** An earlier revision of this
+section claimed the barycentre floor "bottoms at ~2.195" and that the sweep was complete. That
+was wrong, and the error is worth recording because it is easy to repeat: 2.1952 (gt 0.5) and
+2.1949 (gt 1.0) are two weights at the SAME epoch, which says nothing about convergence in
+epochs. Measured ep1 → ep2, paired, n=1000:
+
+| run | Δ`ade` | z | Δ`min_ade` | z | floor ep1 → ep2 |
+|---|---|---|---|---|---|
+| gt=0.5 | −0.0240 | −3.64 | −0.0314 | −5.88 | 2.2268 → 2.1952 |
+| gt=1.0 | −0.0686 | −7.53 | −0.0688 | −9.34 | 2.2729 → 2.1949 |
+
+Both metrics were still falling together at 3126 steps, and so was the floor. So the asymptote
+is BELOW 2.195 and its location is unknown.
+
+⚠️ **The action-space training loss is NOT a convergence signal for these metrics, and this
+tree has now been fooled by it twice.** `x0_gt_loss` is statistically flat across the whole of
+epoch 2 at every weight (Spearman rho −0.002 / −0.004 / −0.009, p = 0.97 / 0.95 / 0.87;
+Theil-Sen CIs straddling zero) while `ade` and `min_ade` improved by up to 0.069 with z beyond
+7. The loss is a mean squared residual on (accel, curvature) dominated by irreducible
+conditional variance (~0.45 at gt 1.0), so the reducible part is buried; the metric depends on
+those actions INTEGRATED over 6.4 s, where small systematic gains compound. Judge convergence
+by evaluating successive checkpoints, never by the loss curve.
+
+A third epoch on gt=0.5 (true resume: optimizer + scheduler state restored, LR continuing
+mid-cosine at 6.1e-6, world size held at 2 because `rng_state_*.pth` is per-rank) is running at
+the time of writing.
+
+### 7f. The CD bootstrap does not work on this budget — the endpoint pair does
+
+Job 591 ran the textbook consistency objective (one teacher solver step, EMA target, M=10) and
+it went the WRONG WAY on the band that matters. Per-band `x0` loss, first vs last 10% of the run:
+
+| band | job 591 (cached 10B teacher) | job 580 (online teacher) |
+|---|---|---|
+| anchor (τ≈0.1) | 3.7e-4 → 4.4e-4 *(flat)* | 1.3e-5 → 7.7e-5 |
+| mid | 3.0e-3 → 1.8e-3 | 7.2e-4 → 4.5e-4 |
+| **noise (τ≥0.8, what 1 NFE evaluates)** | **4.0e-2 → 5.3e-2 (+32%)** | 1.8e-2 → 1.3e-2 (−25%) |
+
+Three compounding causes, all measurable:
+
+* **The anchor is unreachable.** With an *online* teacher the frozen reference IS the student's
+  initialisation, so the last rung is exact (1e-5) and the chain propagates from it. With the
+  10B cache the anchor asks a 28-layer expert on a 2B cache to reproduce the 36-layer expert's
+  transition velocity: 28x larger, and flat for 3126 steps. A bootstrap anchored on a rung the
+  student cannot fit propagates error instead of signal.
+* **The anchor gets ~0.3% of the gradient.** `cd_loss` weights the residual by `tau**2`
+  (correct for a uniform f-space objective), so the anchor rung carries 1/100 the per-sample
+  gradient of the noise rung and is 1/10 of samples. The only teacher-anchored rung in the
+  objective is ~300x underweighted relative to the purely bootstrapped one.
+* **The EMA cannot cross the grid in time.** `decay: 0.999` is a 1000-step horizon; information
+  travels roughly one rung per horizon, so M=10 rungs needs ~10k optimizer steps. The run had
+  3126.
+
+The fix is not to tune the bootstrap. The cache already stores, for every clip, `K` pairs of
+(initial noise `states[k,0]`, the teacher's answer for that noise `states[k,M]`) — the exact
+input/output signature of a 1-NFE sampler. Regressing on it directly,
+
+    L = || x + tau*v_theta(x, tau) - states[k, M] ||^2
+
+removes the EMA, the solver step and the chain at once, converges on a 2-epoch budget, and runs
+ONE expert forward per step instead of two. `model.cd.cd_weight: 0.0` + `x0_teacher_weight: 1.0`.
+
+⚠️ **The two `x0` targets are not interchangeable, and the difference is diversity.**
+`x0_source: gt` is the dataset action, SHARED by all `K` draws, so its minimiser at `tau=1` is
+the conditional mean — alone it collapses the spread. `x0_teacher_weight` uses the cached
+endpoint of *this* noise draw, so `K` draws keep `K` distinct targets — alone it OVERSHOOTS,
+to diversity 2.511 against the teacher's 0.892. Blending them is what lands the answer, and the
+two turn out complementary rather than antagonistic: 0 → 0.1 improved `ade` AND `min_ade`
+together; only 0.1 → 0.3 traded, and cheaply (−0.0130 `min_ade` for −0.1855 `ade`).
+
+⚠️ The GT residual means something DIFFERENT in the two teacher modes and is not a controlled
+variable across them. Online: `x_hi = interpolate(x0_gt, eps, tau)` is built from the GT action,
+so the term is near self-fulfilling (0.148). Cached: `x_hi` sits on the 10B's path toward the
+10B's endpoint while the term demands the GT one (0.617, and RISING). Job 591's config comment
+claiming it "changes only the teacher reference" was wrong.
+
+### 7g. What few-step distillation cannot fix
+
+`ade` **< 1.5 is unreachable for this student on this axis**, and the floor column is why: strip
+all sampling variance and the EoS-2B still scores ~2.30. The residual is conditioning error, not
+sampler error. Two independent measurements agree:
+
+* **Coverage.** The teacher's own mode scale (leave-one-out NN among its 6 draws) is **0.425 m**.
+  The student's *closest* proposal to a teacher trajectory is 1.12–1.50 m — ~3x that, and nearly
+  the size of the teacher's entire `ade`. Distillation moves it monotonically
+  (1.2946 → 1.1678 → 1.1173) and closes maybe 10% of a gap that must reach 0.425.
+* **Diversity is not the explanation.** The baseline at k=2 matches the teacher's spread almost
+  exactly (0.882 vs 0.892) and still has the WORST coverage in the table, 1.4980.
+
+⚠️ **A capacity-matched intermediate teacher does not help — already tested.** `nav_cdp28_e2_s3126`
+is the 8B VLM with 28 active expert layers (36 slots, 8 identity-bypassed so the cache pairing
+survives), consistency-trained: **min_ade 1.4703 / `ade` 2.4730** at 1 NFE. That is no better
+than the 2B student it would teach (1.3974 / 2.4859). CD recovered it from the raw ablation
+(2.1363 → 1.4703 min_ade) and it still lands below where we already are, so there is nothing to
+distil. Two independent 28-active-expert configurations — one on an 8B tower, one on a 2B tower
+with a natively trained expert — converge to `ade` 2.47 vs 2.49 and `min_ade` 1.47 vs 1.40.
+
+⚠️ **Expert depth is NOT a free parameter.** The expert self-attends over the VLM's cache and
+expert layer `l` reads cache layer `l` (`_SkippedExpertLayer`'s docstring), so its depth is
+welded to the tower's: Cosmos-Reason2-2B has 28 text layers, Qwen3-VL-4B has 36. "Give the 2B a
+36-layer expert" is not an available intervention. The only sub-1.5 rows in this tree run a
+36-layer expert — including consistency-distilled ones: `nav_cd1563` reaches **`ade` 1.4983 at
+1 NFE** and **1.4886 at 2 NFE** (vs the undistilled teacher's best of 1.4459 at k=2). The method
+delivers sub-1.5 `ade` at 1–2 steps; the depth cap is what stops the 2B.
+
 ## 8. Reproducing
 
 ```bash
@@ -316,6 +496,15 @@ TAG=teachernav STEPS='[1,2,3,4,5,6,7,8,9,10]' CAMERAS='[1,3]' \
   sbatch --gpus=4 slurm_eval_step_sweep.sh
 # ...and the matched control: same command with nav_lcdrive_val_mysubset_1k_nonav.json
 
+# few-step distillation of the EoS-2B expert (§7e-7g). The rollout cache is built ONCE;
+# every arm below reuses it. K=6 noises x M=10 Euler states per clip, 50k clips.
+python -m alpamayo1_5_distill.scripts.generate_teacher_trajectories \
+  config=cache_full_teacher_trajectories_2cam_nav_lcdrive cache_root=<dir on /data>
+GT_W=0.3 GPUS=0,1 ./run_cd_eos2b_endpoint_gt.sh          # the winning arm
+GT_W=0.0 ./run_cd_eos2b_endpoint.sh                      # endpoint only (no damper)
+# eval at 1 and 2 NFE; ARM=eos points BOTH model paths at the CD checkpoint
+EOS_DIR=<run dir> TAG_BASE=<tag> CKPT=checkpoint-3126 NFE=2 ./slurm_eval_eos.sh
+
 # cache ladder / signal probe -- eval only, teacher and student on separate cards
 CUDA_VISIBLE_DEVICES=0,3 python -m alpamayo1_5_distill.scripts.cache_ladder   ...  # §5
 CUDA_VISIBLE_DEVICES=0,3 python -m alpamayo1_5_distill.scripts.signal_probe   ...  # §6
@@ -327,8 +516,15 @@ Artefacts: `training/stitch_*.json` (§1–4), `training/stepsweep/` (§7),
 ## 9. Open
 
 * **Multi-`t` block loss** — the one deficiency §6 identified and §2 corroborates. Untried.
-* **Ground-truth trajectory error in the objective.** Everything here optimises teacher
-  agreement, which caps at `ade` 2.78 (§6).
+* ~~**Ground-truth trajectory error in the objective.**~~ Addressed in §7e: `x0_gt_weight`
+  puts the dataset action in the objective alongside teacher agreement, and the blend is what
+  lands 2 NFE at the 10-step model's `ade`. Note it is a DIVERSITY control, not just an
+  accuracy term — see the ⚠️ in §7f.
+* ~~**The `x0_gt` weight is not swept out.**~~ Swept 0 / 0.1 / 0.3 / 0.5 / 1.0 in §7e; the
+  frontier turns between 0.3 and 0.5 and the floor saturates at 0.5. Closed.
+* **Multi-rung sampling per prefill.** τ=1.0 is 1 of 10 rungs, so only ~10% of samples train
+  the point 1 NFE actually evaluates. The VLM prefill dominates cost and is shared, so several
+  (noise, τ) draws per prefill are nearly free — untried, and the obvious 1-NFE lever.
 * **Nav-conditioned student** — data ready, never trained; needs `"route"` in the *training*
   config's `components_order` too, or it will train on nav data with the instruction invisible.
 * **`--horizon-start` variant** of the val annotations, for a leak-free nav number.

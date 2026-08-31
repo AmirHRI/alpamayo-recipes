@@ -54,6 +54,9 @@ from typing import Any
 import torch
 from hydra.utils import instantiate
 
+from alpamayo1_5_distill.data import teacher_trajectory_io
+from alpamayo1_5_distill.data.distill_dataset import sample_key
+
 #: Keys whose leading dimension is the camera axis, as ``load_physical_aiavdataset`` returns
 #: them: ``image_frames`` is [N_cam, num_frames, 3, H, W] and the rest are [N_cam, num_frames].
 #: ⚠️ ``reshape_tensors_for_rl`` would flatten that axis away; it defaults False and must stay
@@ -82,8 +85,16 @@ class CameraSubsetPAIDataset(torch.utils.data.Dataset):
             ``clip_uuid_filter``, ``use_default_keyframe``, ...).
     """
 
-    def __init__(self, cameras, vla_preprocess_args=None, model_config=None,
-                 annotations_path: str | None = None, **pai_kwargs: Any) -> None:
+    def __init__(
+        self,
+        cameras,
+        vla_preprocess_args=None,
+        model_config=None,
+        annotations_path: str | None = None,
+        teacher_trajectory_cache_root: str | None = None,
+        teacher_trajectory_cached_only: bool = False,
+        **pai_kwargs: Any,
+    ) -> None:
         from alpamayo.data.pai import PAIDataset
         from alpamayo.data.pai_nav import PAIDatasetWithNav
 
@@ -101,8 +112,31 @@ class CameraSubsetPAIDataset(torch.utils.data.Dataset):
         else:
             self.base = PAIDataset(**pai_kwargs, model_config=None, vla_preprocess_args=None)
         self.pre = instantiate(vla_preprocess_args, model_config=model_config)
+        self.teacher_trajectory_cache_root = teacher_trajectory_cache_root
+        if teacher_trajectory_cached_only and teacher_trajectory_cache_root is None:
+            raise ValueError(
+                "teacher_trajectory_cached_only=true requires "
+                "teacher_trajectory_cache_root"
+            )
+        self._indices = list(range(len(self.base)))
+        if teacher_trajectory_cached_only:
+            self._indices = [
+                i for i in self._indices
+                if teacher_trajectory_io.has_entry(
+                    teacher_trajectory_cache_root, self._base_sample_key(i)
+                )
+            ]
+            if not self._indices:
+                raise RuntimeError(
+                    f"no cached teacher trajectories found under "
+                    f"{teacher_trajectory_cache_root}"
+                )
         kind = "nav samples" if annotations_path is not None else "clips"
-        print(f"[camsubset] {len(self.base)} {kind}, cameras {self.cameras} "
+        cached_note = (
+            f", cached-only={len(self._indices)}/{len(self.base)}"
+            if teacher_trajectory_cached_only else ""
+        )
+        print(f"[camsubset] {len(self.base)} {kind}{cached_note}, cameras {self.cameras} "
               f"({len(self.cameras)} x 4 frames = {len(self.cameras) * 4} images)", flush=True)
         if annotations_path is not None:
             order = (vla_preprocess_args or {}).get("components_order") or []
@@ -115,10 +149,28 @@ class CameraSubsetPAIDataset(torch.utils.data.Dataset):
                     "[image, traj_history, route, prompt, traj_future].")
 
     def __len__(self) -> int:
-        return len(self.base)
+        return len(self._indices)
+
+    def _base_sample_key(self, i: int) -> str:
+        """Canonical ``clip::t0`` key shared with the offline cache builder."""
+        if hasattr(self.base, "_samples"):
+            entry = self.base._samples[i]
+            return sample_key(entry["clip_id"], entry["t0_relative"])
+        clip_id = self.base.clip_ids[i]
+        t0_us = (
+            self.base.DEFAULT_T0_US
+            if self.base.use_default_keyframe
+            else self.base.avdi.get_clip_key_frame(clip_id)
+        )
+        return sample_key(clip_id, t0_us)
+
+    def _sample_key(self, i: int) -> str:
+        """Public-index key; honors the cached-only subset used by smoke runs."""
+        return self._base_sample_key(self._indices[i])
 
     def __getitem__(self, i: int) -> dict[str, Any] | None:
-        s = self.base[i]
+        base_i = self._indices[i]
+        s = self.base[base_i]
         if s is None:
             return None
         s = dict(s)
@@ -130,4 +182,8 @@ class CameraSubsetPAIDataset(torch.utils.data.Dataset):
             if k in s and torch.is_tensor(s[k]):
                 s[k] = s[k][self.cameras]
         s["tokenized_data"] = self.pre(data=s)
+        if self.teacher_trajectory_cache_root is not None:
+            s["teacher_trajectory_states"] = teacher_trajectory_io.load_states(
+                self.teacher_trajectory_cache_root, self._base_sample_key(base_i)
+            )
         return s

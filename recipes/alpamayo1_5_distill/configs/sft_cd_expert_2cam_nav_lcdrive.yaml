@@ -1,4 +1,4 @@
-# Consistency distillation of the FULL 36-layer action expert, teacher VLM frozen.
+# Consistency distillation of an action expert against a FULL 36-layer frozen teacher.
 # TWO CAMERAS (front-wide + front-telephoto) + NAV text on event-anchored t0.
 #
 # Cuts the sampler from 10 Euler steps to 1-2. Denoising is 51-77% of end-to-end latency and
@@ -24,9 +24,10 @@
 # per annotation, its own t0_relative), so the conditioning distribution differs and Gate E
 # needs its own nav-anchored teacher baseline before any comparison is meaningful.
 #
-# ⚠️ NO PRUNING. `PRUNE_EXPERT_LAYERS` must be unset -- `_apply_expert_pruning` is a silent
-# no-op when empty, so a stray export would train the set-C ablation under this arm's name.
-# `init_cd` raises if it is set, and the launcher refuses before that.
+# ⚠️ PRUNING IS EXPLICIT. The default arm is full depth and requires the environment to be
+# unset. A pruned arm must set BOTH `student_prune_layers` and `PRUNE_EXPERT_LAYERS` to the
+# exact same indices; init_cd also verifies those slots were actually replaced. The frozen
+# target is constructed separately and asserted to remain a real 36-layer expert.
 #
 # Launch:
 #   sbatch slurm_train_cd.sh
@@ -55,6 +56,8 @@ model:
     x0_source: gt         # `teacher` needs the cached-sample build first
     metric: mse           # `pseudo_huber` needs huber_c calibrated for THIS action space
     normalizer: 1.0
+    student_prune_layers: null  # explicit opt-in; see slurm_train_cd_pruned.sh
+    teacher_num_layers: 36      # separately constructed frozen target, never pruned
 
 data:
   # ⚠️ The teacher's config.json declares include_camera_ids / include_frame_nums TRUE and

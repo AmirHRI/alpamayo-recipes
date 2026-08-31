@@ -38,9 +38,10 @@ VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
 OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 # MODEL selects which EOS run to score. The 2B arm stays the default so every previously
 # recorded invocation of this script keeps its exact meaning; 4b is opt-in.
-# ⚠️ RUN_DIR, CONFIG and the TAG prefix must move TOGETHER. Mixing a 4B checkpoint into the
+# ⚠️ EOS_DIR, CONFIG and the TAG prefix must move TOGETHER. Mixing a 4B checkpoint into the
 # 2B config loads a 28-layer expert config against 36-layer weights, and reusing the 2B TAG
-# would overwrite the 2B per-clip JSON with 4B numbers under a 2B name.
+# would overwrite the 2B per-clip JSON with 4B numbers under a 2B name. That is why MODEL is
+# a single switch rather than three independent env vars.
 MODEL="${MODEL:-2b}"
 case "$MODEL" in
     2b) EOS_DIR="$OUT_DIR/output_eos_2b_nav_lcdrive"
@@ -51,6 +52,10 @@ case "$MODEL" in
         TAG_PREFIX=eos_4b_2cam_nav ;;
     *)  echo "[slurm] unknown MODEL=$MODEL (want 2b|4b)" >&2; exit 1 ;;
 esac
+# Escape hatches for one-off run dirs; they default to whatever MODEL selected. Overriding
+# EOS_DIR alone is fine (same architecture, different run); overriding it across
+# architectures without also setting CONFIG/TAG_BASE is the failure described above.
+EOS_DIR="${EOS_DIR_OVERRIDE:-$EOS_DIR}"
 TEACHER=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 
 ARM="${ARM:-eos}"                       # eos | control
@@ -63,6 +68,7 @@ BS="${BS:-4}"
 # SAME checkpoint otherwise write the SAME per-clip JSON and the second silently overwrites
 # the first -- destroying exactly the paired comparison the run exists to produce.
 NFE="${NFE:-10}"
+TAG_BASE="${TAG_BASE:-$TAG_PREFIX}"
 
 # ⚠️ REFUSE if the pin is set. The expert in the EOS checkpoint is ALREADY 28 layers, so
 # n_ckpt == n_have and the DEPTH REMAP must not run. A stray export from a stitched-eval
@@ -109,7 +115,7 @@ MASTER_PORT=$((29900 + ${SLURM_JOB_ID:-$$} % 20000))
 
 # ⚠️ nproc_per_node MUST stay 1. evaluate_hf collects per-clip records on the main process
 # only, so the per-clip JSON is complete only in a single-process run.
-TAG="${TAG_PREFIX}_${ARM}_$(basename "$CKPT")"
+TAG="${TAG_BASE}_${ARM}_$(basename "$CKPT")"
 [[ "$NFE" != "10" ]] && TAG="${TAG}_nfe${NFE}"
 [[ "$MAX_EVAL_STEPS" != "-1" ]] && TAG="${TAG}_smoke${MAX_EVAL_STEPS}"
 echo "[slurm] ARM=$ARM student<-$CKPT expert<-$EXPERT_SRC bs=$BS nfe=$NFE steps=$MAX_EVAL_STEPS"
@@ -125,7 +131,7 @@ srun "$VENV/torchrun" --nproc_per_node 1 --master_port "$MASTER_PORT" \
     ++model.teacher_checkpoint_path="$EXPERT_SRC" \
     ++evaluate.max_eval_steps="$MAX_EVAL_STEPS" \
     ++evaluate.per_clip_output="$OUT_DIR/$TAG.json" \
-    ++evaluate.traj_output="$OUT_DIR/$TAG.npz" \
+    ++evaluate.trajectory_output="$OUT_DIR/$TAG.npz" \
     ++evaluate.metric_runner.metrics.0.diffusion_kwargs.inference_step="$NFE" \
     ++trainer.per_device_eval_batch_size="$BS" \
     paths.output_dir="$OUT_DIR/$TAG" \
@@ -146,7 +152,7 @@ recs = json.load(open(sys.argv[1])); n = len(recs)
 print(f"per-clip records: {n}" + ("" if n == 1000 else "   <-- expected 1000 on a full run"))
 bad = int(sys.argv[2])
 print(f"malformed warnings: {bad}" + (f" = {100*bad/n:.1f}% of clips" if n else ""))
-for m in ("ade", "min_ade"):
+for m in ("ade", "min_ade", "max_ade"):
     v = [r[m] for r in recs if m in r]
     if v:
         print(f"  {m:<8} {st.mean(v):.4f}  (se {st.stdev(v)/len(v)**0.5:.4f})")

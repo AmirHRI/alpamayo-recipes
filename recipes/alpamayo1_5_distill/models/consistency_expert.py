@@ -13,20 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-r"""Consistency distillation of the full 36-layer action expert, teacher VLM frozen.
+r"""Consistency distillation of an action expert against online or cached teacher steps.
 
 Replaces ``TrainableAlpamayoR1.forward``'s flow-matching loss with the consistency objective
-in :mod:`alpamayo1_5_distill.models.consistency_losses`. Everything else about the arm --
-frozen 8B VLM, registered trainable expert, ``deepspeed: null`` -- is the
-``sft_prunedexpert_10b_lcdrive`` shape, which already trains.
+in :mod:`alpamayo1_5_distill.models.consistency_losses`.
 
-**Exactly one teacher NFE per training iteration.** Three expert forwards run per step:
+``teacher_source="online"`` runs three expert forwards per step:
 
     v_teacher(x_hi, tau_hi)   frozen pretrained expert, no grad   <- the 1 teacher NFE
     v_target(x_lo, tau_lo)    EMA of the trainable expert, no grad   (skipped on the anchor)
     v_online(x_hi, tau_hi)    trainable expert, WITH grad
 
 plus one frozen VLM prefill, whose KV cache all three share.
+
+``teacher_source="cached_full"`` replaces the first line with an exact adjacent
+transition cached from the full Alpamayo-1.5 8B-VLM + 36-layer expert rollout.  The
+teacher velocity is recovered as ``(x_lo - x_hi) / delta_tau``, so the existing
+stable endpoint CD algebra is unchanged. Only the student's frozen 2B VLM is
+prefilled online, and its cache is consumed only by its own online/EMA expert.
+This is output-level policy distillation across architectures; it neither assumes
+nor attempts position-wise compatibility between the full and student VLM caches.
 
 ⚠️ TIME CONVENTION. This file speaks ``tau`` (0 = data, 1 = noise) because that is how the
 objective is written; the expert speaks ``s = 1 - tau``. Every call into ``action_in_proj``
@@ -53,13 +59,17 @@ from transformers.modeling_outputs import ModelOutput
 
 from alpamayo1_5_distill.models.consistency_losses import (
     DEFAULT_M,
+    cached_teacher_endpoint,
     cd_loss,
     consistency_fn,
     interpolate,
     needs_target,
+    sample_cached_teacher_transition,
     sample_rungs,
     tau_to_s,
     teacher_step,
+    transition_velocity,
+    x0_reconstruction_loss,
 )
 from alpamayo1_5_distill.models.expert_conditioning import (
     ExpertConditioning,
@@ -75,6 +85,75 @@ from alpamayo1_5_distill.models.expert_teacher import KaVaExpertTeacher
 logger = logging.getLogger(__name__)
 
 
+def _layer_indices(value, *, name: str, n_layers: int) -> tuple[int, ...]:
+    """Parse and validate a layer-index list from Hydra or the environment."""
+    if value is None:
+        raw = []
+    elif isinstance(value, str):
+        raw = [x.strip() for x in value.split(",") if x.strip()]
+    else:
+        raw = list(value)
+    try:
+        indices = [int(x) for x in raw]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must contain integer layer indices, got {value!r}") from exc
+    if len(indices) != len(set(indices)):
+        raise ValueError(f"{name} contains duplicate layer indices: {indices}")
+    indices = sorted(indices)
+    bad = [i for i in indices if not 0 <= i < n_layers]
+    if bad:
+        raise ValueError(f"{name} out of range for {n_layers} layers: {bad}")
+    return tuple(indices)
+
+
+def _skipped_expert_layer_indices(layers) -> tuple[int, ...]:
+    """Return identity-pruned slots without importing the stitched model (avoids a cycle)."""
+    return tuple(
+        i for i, layer in enumerate(layers)
+        if type(layer).__name__ == "_SkippedExpertLayer"
+    )
+
+
+def _validate_student_pruning(layers, configured, env_spec: str) -> tuple[int, ...]:
+    """Require config, environment, and the materialized student to name the same cuts."""
+    n_layers = len(layers)
+    requested = _layer_indices(
+        configured, name="model.cd.student_prune_layers", n_layers=n_layers
+    )
+    exported = _layer_indices(
+        env_spec, name="PRUNE_EXPERT_LAYERS", n_layers=n_layers
+    )
+    actual = _skipped_expert_layer_indices(layers)
+    if not requested:
+        if exported or actual:
+            raise RuntimeError(
+                "PRUNE_EXPERT_LAYERS is set or the expert is already pruned, but "
+                "model.cd.student_prune_layers is empty. Refusing an accidental ablation."
+            )
+        return ()
+    if exported != requested:
+        raise RuntimeError(
+            "pruned consistency student mismatch: "
+            f"config={list(requested)} PRUNE_EXPERT_LAYERS={list(exported)}"
+        )
+    if actual != requested:
+        raise RuntimeError(
+            "pruned consistency student was not materialized as configured: "
+            f"config={list(requested)} actual_skipped={list(actual)}"
+        )
+    return requested
+
+
+def _validate_full_teacher(layers, expected_layers: int) -> None:
+    """Fail before training if the frozen target has reduced depth or identity slots."""
+    skipped = _skipped_expert_layer_indices(layers)
+    if len(layers) != expected_layers or skipped:
+        raise RuntimeError(
+            "consistency teacher must be full depth: "
+            f"expected={expected_layers} slots={len(layers)} skipped={list(skipped)}"
+        )
+
+
 @dataclass
 class CDVLAOutput(ModelOutput):
     """Everything but ``loss`` is detached, for ``KaVaTrainer`` to log.
@@ -87,33 +166,48 @@ class CDVLAOutput(ModelOutput):
 
     loss: torch.FloatTensor | None = None
     cd_loss: torch.FloatTensor | None = None
+    x0_gt_loss: torch.FloatTensor | None = None
+    x0_teacher_loss: torch.FloatTensor | None = None
     cd_loss_anchor: torch.FloatTensor | None = None
     cd_loss_mid: torch.FloatTensor | None = None
     cd_loss_noise: torch.FloatTensor | None = None
+    x0_loss_anchor: torch.FloatTensor | None = None
+    x0_loss_mid: torch.FloatTensor | None = None
+    x0_loss_noise: torch.FloatTensor | None = None
 
 
 class ConsistencyExpertVLA(KaVaExpertTeacher):
-    """Teacher VLM (frozen) + full 36-layer action expert trained by consistency distillation."""
+    """Frozen teacher VLM + optionally pruned expert trained by consistency distillation."""
 
     # ------------------------------------------------------------------ setup
     def init_cd(
         self,
         *,
         teacher_checkpoint_path: str,
+        teacher_source: str = "online",
         m_rungs: int = DEFAULT_M,
         cd_weight: float = 1.0,
+        x0_gt_weight: float = 0.0,
+        x0_teacher_weight: float = 0.0,
+        x0_gt_normalizer: float = 1.0,
         x0_source: str = "gt",
         metric: str = "mse",
         huber_c: float | None = None,
         normalizer: float = 1.0,
         seed: int | None = None,
+        student_prune_layers: list[int] | tuple[int, ...] | str | None = None,
+        teacher_num_layers: int = 36,
     ) -> None:
         self.m_rungs = int(m_rungs)
         self.cd_weight = float(cd_weight)
+        self.x0_gt_weight = float(x0_gt_weight)
+        self.x0_teacher_weight = float(x0_teacher_weight)
+        self.x0_gt_normalizer = float(x0_gt_normalizer)
         self.x0_source = x0_source
         self.cd_metric = metric
         self.cd_huber_c = huber_c
         self.cd_normalizer = float(normalizer)
+        self.teacher_source = str(teacher_source)
         self._cd_ckpt = teacher_checkpoint_path
         self.keep_loss_terms = False
         self.last_loss_terms: dict[str, torch.Tensor] | None = None
@@ -122,19 +216,79 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         # and every 14 GB checkpoint. The cost is that nothing moves it -- see _ensure_teacher.
         self._teacher_expert_holder: list = []
         self._cd_seed = seed
+        self._teacher_num_layers = int(teacher_num_layers)
+        if self.x0_gt_weight < 0:
+            raise ValueError(f"x0_gt_weight must be non-negative, got {self.x0_gt_weight}")
+        if self.x0_teacher_weight < 0:
+            raise ValueError(
+                f"x0_teacher_weight must be non-negative, got {self.x0_teacher_weight}"
+            )
+        if self.x0_gt_normalizer <= 0:
+            raise ValueError(
+                f"x0_gt_normalizer must be positive, got {self.x0_gt_normalizer}"
+            )
+        if self.teacher_source not in ("online", "cached_full"):
+            raise ValueError(
+                "teacher_source must be 'online' or 'cached_full', got "
+                f"{self.teacher_source!r}"
+            )
         if x0_source not in ("gt", "teacher"):
             raise ValueError(f"x0_source must be 'gt' or 'teacher', got {x0_source!r}")
-        if os.environ.get("PRUNE_EXPERT_LAYERS", "").strip():
-            raise RuntimeError(
-                "PRUNE_EXPERT_LAYERS is set. This arm distils the FULL 36-layer expert; "
-                "stacking sampler compression on top of layer pruning makes a regression "
-                "unattributable. Unset it."
+        # ⚠️ LEGACY SHIM, kept so `sft_cd_eos_2b_fullteacher_endpoint_nav_lcdrive`
+        # (the Arm A run) still reproduces bit-for-bit. That config expresses the endpoint
+        # objective as `x0_source: teacher` + `x0_gt_weight: 1.0`, from before the two
+        # targets became independently weightable. Route it, loudly -- a silent
+        # reinterpretation of a weight is exactly the class of bug this file is full of
+        # warnings about. New configs should set `x0_teacher_weight` directly and leave
+        # `x0_source` at its default.
+        if x0_source == "teacher" and self.x0_teacher_weight == 0.0:
+            self.x0_teacher_weight = self.x0_gt_weight
+            self.x0_gt_weight = 0.0
+            logger.warning(
+                "[cd] legacy x0_source=teacher: moved x0_gt_weight=%.3g to "
+                "x0_teacher_weight; set x0_teacher_weight explicitly instead",
+                self.x0_teacher_weight,
             )
-        logger.warning("[cd] M=%d weight=%.3g x0=%s metric=%s expert=%d layers",
-                       self.m_rungs, self.cd_weight, self.x0_source, self.cd_metric,
-                       len(self.expert.layers))
-        print(f"[cd] M={self.m_rungs} weight={self.cd_weight} x0={self.x0_source} "
-              f"metric={self.cd_metric} expert={len(self.expert.layers)} layers", flush=True)
+            print(f"[cd] LEGACY x0_source=teacher -> x0_teacher_weight="
+                  f"{self.x0_teacher_weight}, x0_gt_weight=0", flush=True)
+        # The noise-PAIRED endpoint states[k, M] only exists in cached_full mode; an online
+        # teacher would have to be rolled out for M steps per iteration to produce one,
+        # which is the cost this arm exists to avoid.
+        if self.x0_teacher_weight > 0.0 and self.teacher_source != "cached_full":
+            raise ValueError(
+                "x0_teacher_weight needs the cached rollout endpoint; set "
+                "teacher_source='cached_full'"
+            )
+        if (self.cd_weight == 0.0 and self.x0_gt_weight == 0.0
+                and self.x0_teacher_weight == 0.0):
+            raise ValueError("every loss weight is zero -- nothing to train")
+        if len(self.expert.layers) != self._teacher_num_layers:
+            raise RuntimeError(
+                "the cache-aligned pruning path requires the student to retain the teacher's "
+                f"{self._teacher_num_layers} layer slots; got {len(self.expert.layers)}"
+            )
+        self._student_prune_layers = _validate_student_pruning(
+            self.expert.layers,
+            student_prune_layers,
+            os.environ.get("PRUNE_EXPERT_LAYERS", ""),
+        )
+        n_active = len(self.expert.layers) - len(self._student_prune_layers)
+        teacher_label = (
+            "offline full Alpamayo rollout"
+            if self.teacher_source == "cached_full"
+            else f"{self._teacher_num_layers}-layer online expert"
+        )
+        logger.warning(
+            "[cd] M=%d cd_w=%.3g x0_teacher_w=%.3g x0_gt_w=%.3g metric=%s "
+            "student=%d/%d active teacher=%s",
+            self.m_rungs, self.cd_weight, self.x0_teacher_weight, self.x0_gt_weight,
+            self.cd_metric, n_active, len(self.expert.layers), teacher_label,
+        )
+        print(f"[cd] M={self.m_rungs} cd_w={self.cd_weight} "
+              f"x0_teacher_w={self.x0_teacher_weight} x0_gt_w={self.x0_gt_weight} "
+              f"metric={self.cd_metric} student={n_active}/{len(self.expert.layers)} active "
+              f"skipped={list(self._student_prune_layers)}; "
+              f"teacher={teacher_label}", flush=True)
 
     @classmethod
     def from_pretrained(cls, *args: Any, **kwargs: Any):
@@ -144,6 +298,58 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         )
         model = super().from_pretrained(*args, **kwargs)
         model.init_cd(teacher_checkpoint_path=str(teacher_ckpt), **cd_cfg)
+        return model
+
+    @classmethod
+    def from_eos_checkpoint(
+        cls,
+        *,
+        eos_checkpoint_path: str,
+        vlm_name_or_path: str,
+        alpamayo_config_path: str,
+        cd: dict[str, Any] | None = None,
+        cotrain_vlm: bool = False,
+        stop_grad_from_vlm: bool = True,
+    ):
+        """Start CD from an expert already trained on the student VLM (EoS).
+
+        The Stage-2/EoS checkpoint contains both the frozen student VLM and its
+        cache-adapted expert and always initializes the online model. In the default
+        ``teacher_source="online"`` mode, the same checkpoint also supplies the
+        unregistered frozen CD teacher, so all three branches consume one shared
+        student-VLM cache. In ``teacher_source="cached_full"`` mode, no frozen
+        expert is constructed; the target transitions come from offline full-model
+        rollouts while the online and EMA branches use the student-VLM cache.
+
+        ``cotrain_vlm`` is intentionally forbidden here. Updating the cache producer
+        while either teacher reference remains fixed would make the student expert's
+        conditioning distribution move during CD.
+        """
+        if cotrain_vlm:
+            raise ValueError(
+                "EoS consistency training requires a frozen student VLM; "
+                "set model.cotrain_vlm=false"
+            )
+        cd_cfg = dict(cd or {})
+        cd_cfg.setdefault("teacher_num_layers", 28)
+        teacher_layers = int(cd_cfg["teacher_num_layers"])
+        model = super().from_pretrained_vlm(
+            vlm_name_or_path=vlm_name_or_path,
+            alpamayo_config_path=alpamayo_config_path,
+            stage2_checkpoint_path=eos_checkpoint_path,
+            cotrain_vlm=False,
+            stop_grad_from_vlm=stop_grad_from_vlm,
+            expert_num_layers=teacher_layers,
+        )
+        # Be explicit after assign=True checkpoint loading: the cache producer must
+        # remain fixed for the whole CD run.
+        model.cotrain_vlm = False
+        model.stop_grad_from_vlm = True
+        model._set_vlm_trainability()
+        model.init_cd(
+            teacher_checkpoint_path=str(eos_checkpoint_path),
+            **cd_cfg,
+        )
         return model
 
     @property
@@ -157,6 +363,11 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         ⚠️ Unregistered means ``Trainer``, ``.to()`` and accelerate all skip it. Left on CPU
         it dies at the first matmul with "Expected all tensors to be on the same device".
         """
+        if self.teacher_source != "online":
+            raise RuntimeError(
+                "_ensure_teacher_expert called in cached_full mode; the full teacher "
+                "must remain offline"
+            )
         if not self._teacher_expert_holder:
             self._teacher_expert_holder.append(
                 FrozenExpert(self._cd_ckpt, self.vlm.config.text_config)
@@ -164,7 +375,9 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         e = self._teacher_expert_holder[0]
         if next(e.parameters()).device != device:
             self._teacher_expert_holder[0] = e.to(device=device, dtype=dtype)
-        return self._teacher_expert_holder[0]
+        e = self._teacher_expert_holder[0]
+        _validate_full_teacher(e.expert.layers, self._teacher_num_layers)
+        return e
 
     # ------------------------------------------------------------------ velocity
     def _velocity(
@@ -230,7 +443,16 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         same = torch.allclose(
             next(self.expert.parameters()).float(),
             next(teacher.expert.parameters()).float(), atol=0, rtol=0)
-        print(f"[cd-selftest] online expert == frozen teacher at init: {same}", flush=True)
+        if self._student_prune_layers:
+            print(
+                "[cd-selftest] first surviving student weight == teacher at init: "
+                f"{same}; architectures differ "
+                f"({len(self.expert.layers) - len(self._student_prune_layers)} active vs "
+                f"{len(teacher.expert.layers)} full layers)",
+                flush=True,
+            )
+        else:
+            print(f"[cd-selftest] online expert == frozen teacher at init: {same}", flush=True)
 
         eps = torch.randn(x0.shape, device=device, dtype=torch.float32)
         v = lambda mod, x, tau: self._velocity(
@@ -296,6 +518,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         ego_future_xyz: torch.Tensor | None = None,
         ego_future_rot: torch.Tensor | None = None,
         labels_mask: torch.Tensor | None = None,
+        teacher_trajectory_states: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> CDVLAOutput:
         input_ids = tokenized_data.pop("input_ids")
@@ -332,35 +555,81 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
             layer.keys = layer.keys.detach()
             layer.values = layer.values.detach()
 
-        # 2) x0. The CD fixed point is set entirely by the teacher's field; x0 only chooses
-        #    WHERE the constraint is evaluated and supplies no supervision of its own. Which
-        #    is also why 0.7185 min_ade (the 10-step teacher) is a hard ceiling for this
-        #    objective -- nothing here can beat the model it distils.
+        # 2) x0. Pure CD uses x0 only to choose where the constraint is evaluated. When
+        #    x0_gt_weight > 0, the same dataset action also directly supervises the online
+        #    one-step endpoint. This aligns the objective with one-step ADE, at the cost of
+        #    encouraging the conditional mean and potentially reducing sample diversity.
         with _Phase.t("traj_to_action"):
             x0 = self.action_space.traj_to_action(
                 traj_history_xyz=ego_history_xyz, traj_history_rot=ego_history_rot,
                 traj_future_xyz=ego_future_xyz, traj_future_rot=ego_future_rot,
             ).reshape(b, n_act, 2).to(device=device, dtype=torch.float32)
 
-        if os.environ.get("CD_SELFTEST") == "1" and not getattr(self, "_cd_selftested", False):
-            self._cd_selftested = True
-            self._cd_selftest(x0, cache, conditioning, dtype, device)
-
         gen = None
+        x0_teacher = None
         if self._cd_seed is not None:
             gen = torch.Generator(device=device).manual_seed(self._cd_seed)
-        _, tau_lo, tau_hi = sample_rungs(b, self.m_rungs, device, generator=gen)
-        eps = torch.randn(x0.shape, device=device, dtype=torch.float32, generator=gen)
-        x_hi = interpolate(x0, eps, tau_hi).to(dtype)
-
-        teacher = self._ensure_teacher_expert(device, dtype)
-
-        # 3) the single teacher NFE, and the backward solver step it drives.
-        with torch.no_grad(), _Phase.t("expert_teacher"):
-            v_teacher = self._velocity(
-                teacher, x_hi, tau_hi, cache, conditioning, dtype
-            )
-            x_lo = teacher_step(x_hi.float(), v_teacher.float(), (tau_hi - tau_lo)).to(dtype)
+        if self.teacher_source == "cached_full":
+            if teacher_trajectory_states is None:
+                raise ValueError(
+                    "teacher_source='cached_full' requires teacher_trajectory_states in "
+                    "every batch; set data.train_dataset.teacher_trajectory_cache_root"
+                )
+            with torch.no_grad(), _Phase.t("teacher_cache"):
+                states = teacher_trajectory_states.to(device=device)
+                _, noise_index, x_hi_fp32, x_lo_fp32, tau_lo, tau_hi = (
+                    sample_cached_teacher_transition(
+                        states,
+                        self.m_rungs,
+                        generator=gen,
+                    )
+                )
+                # Same rollout as x_hi/x_lo, so (eps, x0_teacher) stays a matched pair.
+                x0_teacher = cached_teacher_endpoint(states, noise_index).float()
+                if x_hi_fp32.shape[1:] != (n_act, 2):
+                    raise ValueError(
+                        f"cached action shape must be [B,{n_act},2], got "
+                        f"{tuple(x_hi_fp32.shape)}"
+                    )
+                v_teacher = transition_velocity(
+                    x_hi_fp32, x_lo_fp32, tau_lo, tau_hi
+                )
+                x_hi = x_hi_fp32.to(dtype)
+                x_lo = x_lo_fp32.to(dtype)
+            if (
+                os.environ.get("CD_SELFTEST") == "1"
+                and not getattr(self, "_cd_selftested", False)
+            ):
+                self._cd_selftested = True
+                recovered = teacher_step(
+                    x_hi_fp32, v_teacher, tau_hi - tau_lo
+                )
+                err = float((recovered - x_lo_fp32).abs().max())
+                print(
+                    f"[cd-selftest] cached full-teacher Euler endpoint error={err:.3e} "
+                    "(must be ~0)",
+                    flush=True,
+                )
+                print("DONE_CD_SELFTEST", flush=True)
+        else:
+            if (
+                os.environ.get("CD_SELFTEST") == "1"
+                and not getattr(self, "_cd_selftested", False)
+            ):
+                self._cd_selftested = True
+                self._cd_selftest(x0, cache, conditioning, dtype, device)
+            _, tau_lo, tau_hi = sample_rungs(b, self.m_rungs, device, generator=gen)
+            eps = torch.randn(x0.shape, device=device, dtype=torch.float32, generator=gen)
+            x_hi = interpolate(x0, eps, tau_hi).to(dtype)
+            teacher = self._ensure_teacher_expert(device, dtype)
+            # One online teacher NFE and the backward-in-tau Euler step it drives.
+            with torch.no_grad(), _Phase.t("expert_teacher"):
+                v_teacher = self._velocity(
+                    teacher, x_hi, tau_hi, cache, conditioning, dtype
+                )
+                x_lo = teacher_step(
+                    x_hi.float(), v_teacher.float(), tau_hi - tau_lo
+                ).to(dtype)
 
         # 4) the EMA target, theta^- = stopgrad(EMA(theta)). Skipped entirely when every
         #    sample is on the anchor rung, where its coefficient (1 - lam) is exactly zero.
@@ -371,8 +640,12 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         # different fixed point, and nothing about the loss curve would look wrong.
         # try/finally because an exception between swap_in and swap_out would leave EMA
         # weights in the model and corrupt training from that step on.
+        # ⚠️ `cd_weight == 0` (the endpoint-only arm) must skip this ENTIRELY, not just
+        # multiply it by zero: with no `callbacks.ema` block there is no `_ema_ref`, and the
+        # forward below would then silently build the mu=0 self-target -- a different
+        # objective, at the cost of a second expert forward, for a term weighted zero.
         v_target = None
-        if bool(needs_target(tau_lo).any()):
+        if self.cd_weight != 0.0 and bool(needs_target(tau_lo).any()):
             ema = getattr(self, "_ema_ref", None)
             with torch.no_grad(), _Phase.t("expert_ema_target"):
                 if ema is not None:
@@ -391,27 +664,69 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
                 self, x_hi, tau_hi, cache, conditioning, dtype
             )
 
-        loss_cd, per_sample = cd_loss(
-            v_online, v_teacher, v_target, tau_lo, tau_hi,
-            metric=self.cd_metric, huber_c=self.cd_huber_c, normalizer=self.cd_normalizer,
-        )
-        total = self.cd_weight * loss_cd
+        if self.cd_weight == 0.0:
+            loss_cd = v_online.new_zeros(())
+            per_sample = v_online.new_zeros(b)
+        else:
+            loss_cd, per_sample = cd_loss(
+                v_online, v_teacher, v_target, tau_lo, tau_hi,
+                metric=self.cd_metric, huber_c=self.cd_huber_c,
+                normalizer=self.cd_normalizer,
+            )
+        # THE TWO ENDPOINT TARGETS PULL IN OPPOSITE DIRECTIONS ON DIVERSITY, which is the
+        # whole point of blending them. `teacher` is the cached endpoint of THIS noise draw,
+        # so the K draws keep K distinct targets -- alone it overshot the teacher's spread
+        # 2.8x (diversity 2.51 vs 0.89) and cost 0.36 of ade. `gt` is the dataset action,
+        # shared by all K draws, so its minimiser at tau=1 is the conditional mean -- alone
+        # it collapses diversity. Measured brackets: teacher-only 2.51, cd+0.1*gt 1.34,
+        # teacher 0.89. A small gt weight on top of the endpoint term should land between.
+        zero = v_online.new_zeros(())
+        loss_x0_teacher, per_x0 = zero, v_online.new_zeros(b)
+        if self.x0_teacher_weight > 0.0:
+            if x0_teacher is None:
+                raise RuntimeError(
+                    "x0_teacher_weight > 0 but no cached endpoint was lifted this step"
+                )
+            loss_x0_teacher, per_x0 = x0_reconstruction_loss(
+                x_hi, tau_hi, v_online, x0_teacher, normalizer=self.x0_gt_normalizer,
+            )
+        loss_x0_gt, per_gt = zero, v_online.new_zeros(b)
+        if self.x0_gt_weight > 0.0:
+            loss_x0_gt, per_gt = x0_reconstruction_loss(
+                x_hi, tau_hi, v_online, x0, normalizer=self.x0_gt_normalizer,
+            )
+        if self.x0_teacher_weight == 0.0:
+            per_x0 = per_gt          # bands always describe the dominant endpoint term
+        total = (self.cd_weight * loss_cd
+                 + self.x0_teacher_weight * loss_x0_teacher
+                 + self.x0_gt_weight * loss_x0_gt)
 
-        attached = {"cd": loss_cd}
+        attached = {"cd": loss_cd, "x0_gt": loss_x0_gt}
         self.last_loss_terms = attached if self.keep_loss_terms else None
 
         t = tau_hi.flatten()
-        bands = {}
-        for name, sel in (("anchor", t <= 1.5 / self.m_rungs),
-                          ("mid", (t > 1.5 / self.m_rungs) & (t < 0.8)),
-                          ("noise", t >= 0.8)):
-            bands[name] = per_sample[sel].mean().detach() if bool(sel.any()) else None
+        selectors = (("anchor", t <= 1.5 / self.m_rungs),
+                     ("mid", (t > 1.5 / self.m_rungs) & (t < 0.8)),
+                     ("noise", t >= 0.8))
+
+        def split(per: torch.Tensor) -> dict[str, torch.Tensor | None]:
+            return {name: (per[sel].mean().detach() if bool(sel.any()) else None)
+                    for name, sel in selectors}
+
+        # The endpoint arm optimises x0, so ITS bands are the instrument there: `noise`
+        # (tau >= 0.8) is what a 1-NFE sampler evaluates and is the number to watch.
+        cd_bands, x0_bands = split(per_sample), split(per_x0)
 
         _Phase.report()
         return CDVLAOutput(
             loss=total,
             cd_loss=loss_cd.detach(),
-            cd_loss_anchor=bands["anchor"],
-            cd_loss_mid=bands["mid"],
-            cd_loss_noise=bands["noise"],
+            x0_gt_loss=loss_x0_gt.detach(),
+            x0_teacher_loss=loss_x0_teacher.detach(),
+            cd_loss_anchor=cd_bands["anchor"],
+            cd_loss_mid=cd_bands["mid"],
+            cd_loss_noise=cd_bands["noise"],
+            x0_loss_anchor=x0_bands["anchor"],
+            x0_loss_mid=x0_bands["mid"],
+            x0_loss_noise=x0_bands["noise"],
         )
