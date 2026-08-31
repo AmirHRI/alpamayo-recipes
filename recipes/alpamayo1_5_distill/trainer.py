@@ -61,9 +61,15 @@ AUX_LOSS_KEYS = (
     # noise) from a collapse to the conditional mean (the noise end falls fastest).
     "cd_loss",
     "x0_gt_loss",
+    "x0_teacher_loss",
     "cd_loss_anchor",
     "cd_loss_mid",
     "cd_loss_noise",
+    # Same three bands for the ENDPOINT term. In the `x0_source=teacher` arm the CD term is
+    # off and these are the only live diagnostic; `x0_loss_noise` is the 1-NFE number.
+    "x0_loss_anchor",
+    "x0_loss_mid",
+    "x0_loss_noise",
     "ema_dist",
 )
 

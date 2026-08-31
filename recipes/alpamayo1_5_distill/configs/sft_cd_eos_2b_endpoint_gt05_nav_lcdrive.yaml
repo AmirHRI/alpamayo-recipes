@@ -1,0 +1,153 @@
+# ARM A'' -- endpoint distillation + a GT damper at weight 0.5.
+#
+# Measured at 2 NFE against the 10-step baseline (ade 2.4859 / min_ade 1.3974 / div 1.609):
+#   gt=0.0   ade 2.8433  min_ade 1.3429  div 2.511  floor 2.3851
+#   gt=0.1   ade 2.6996  min_ade 1.3214  div 2.256  floor 2.3148
+#   gt=0.3   ade 2.5141  min_ade 1.3344  div 1.864  floor 2.2397   <- ade ties the REF (z=+0.84)
+# ade falls monotonically with the damper while min_ade barely moves, diversity is still
+# 2x the teacher's 0.892, and gt=0.3's own floor (2.2397) is already BELOW the reference's
+# ade. This run tests whether more damping takes ade decisively under 2.4859 while holding
+# min_ade near 1.33 -- i.e. beating the 10-step sampler on BOTH metrics at 5x fewer NFE.
+#
+# Diversity brackets measured on this val set (2 NFE): teacher 0.892, job591 (cd+0.1gt)
+# 1.344, baseline@10 1.609, Arm A endpoint-only 2.511. Target is 0.9-1.6.
+#
+# Same student, same cache, same schedule as
+# `sft_cd_eos_2b_fullteacher_cache_nav_lcdrive` (job 591). ONE variable changes: the
+# objective. That run's bands say why:
+#
+#     band     job 591 start -> end        online-teacher CD (job 580)
+#     anchor   3.7e-4 -> 4.4e-4  (flat)    1.3e-5 -> 7.7e-5
+#     mid      3.0e-3 -> 1.8e-3            7.2e-4 -> 4.5e-4
+#     noise    4.0e-2 -> 5.3e-2  (+32%)    1.8e-2 -> 1.3e-2  (-25%)
+#
+# The noise band -- exactly what a 1-NFE sampler evaluates -- got WORSE, because the CD
+# bootstrap is anchored on a rung the 2B student cannot fit (the 10B's transition
+# velocity), that rung carries ~0.3% of the gradient (tau^2 = 0.01 x 1/10 of samples),
+# and the EMA horizon (1/(1-0.999) = 1000 steps) needs ~10x this run's 3126 steps to
+# cross ten rungs.
+#
+# So: drop the bootstrap. The cache already holds, for every clip, K pairs of
+# (initial noise, the teacher's answer for that noise). Regress on them directly:
+#
+#     L = || x_hi + tau_hi * v_theta(x_hi, tau_hi)  -  states[k, M] ||^2
+#
+# no EMA, no solver step, no chain -- and the target is noise-PAIRED, so the teacher's
+# six-way spread is distilled rather than averaged into the conditional mean (which is
+# what `x0_source: gt` did, at 4x the residual and rising: 0.564 -> 0.617).
+#
+# Reference to beat: this student at 10 steps, min_ade 1.3974 / ade 2.4859 / diversity
+# 1.609. Job 591 reached min_ade 1.8028 (nfe1) and 1.5837 (nfe2).
+defaults:
+  - sft_base
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.consistency_expert.ConsistencyExpertVLA.from_eos_checkpoint
+  eos_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_eos_2b_nav_e3_clean_maskfix_e2_lcdrive/checkpoint-4168
+  vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+  alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  cotrain_vlm: false
+  stop_grad_from_vlm: true
+  cd:
+    teacher_source: cached_full
+    # Still 10: it is the cache's grid, and it sets which tau values x_hi is drawn from
+    # (tau_hi = 1 - s/10, so {0.1 ... 1.0}). It no longer defines a bootstrap chain.
+    m_rungs: 10
+    # THE CHANGE. cd_weight 0 turns off the bootstrap term AND skips the EMA target
+    # forward, so this arm runs ONE expert forward per step instead of two.
+    cd_weight: 0.0
+    # Endpoint term, unchanged from Arm A: the cached states[k, M] for the SAME noise
+    # draw. Now named explicitly rather than via the legacy `x0_source: teacher` shim.
+    x0_teacher_weight: 1.0
+    # THE DAMPER. Arm A ep2 reached min_ade 1.3429 at 2 NFE (beating the 10-step
+    # baseline's 1.3974, z=-2.12) but ade 2.8433 vs 2.4859, because diversity ran to
+    # 2.511 against the teacher's 0.892 at the same step count. The GT action is shared
+    # by all K draws, so this term pulls the spread back in. Its own barycentre already
+    # scores ade 2.3851 -- better than the baseline's 2.4859 -- so the accuracy is in the
+    # sample set and only needs concentrating.
+    x0_gt_weight: 0.5
+    x0_gt_normalizer: 1.0
+    x0_source: gt
+    metric: mse
+    normalizer: 1.0
+    student_prune_layers: null
+    teacher_num_layers: 28
+
+data:
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]
+    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    teacher_trajectory_cache_root: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_action_rollouts_full10b_2cam_nav_k6_m10
+    teacher_trajectory_cached_only: false
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]
+    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  ddp_find_unused_parameters: false
+  deepspeed: null
+  gradient_checkpointing: false
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  dataloader_num_workers: 5   # two runs share 24 cores
+  # Unchanged from job 591 on purpose: the objective is the only variable. Adam largely
+  # normalises away the 10x larger term weight, so the step size stays comparable.
+  learning_rate: 2e-5
+  warmup_steps: 200
+  num_train_epochs: 2
+  save_strategy: epoch
+  save_total_limit: 3
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_cd_eos2b_endpoint_gt05_nav_e2_bs32_20260830
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-consistency-distill
+  group: cd_eos_student_2b_endpoint_gt05
+
+# ⚠️ NO `callbacks.ema` block, and that is the point. With cd_weight=0 there is no target
+# network to build, so an EMA would only burn 7.1 GB and make the saved checkpoint a
+# lagging average of the weights that were actually trained. `sft_base` defaults to `{}`.
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_cd_eos2b_endpoint_gt05
+run_name: cd_eos2b_endpoint_gt05_${now:%m%d-%H%M}

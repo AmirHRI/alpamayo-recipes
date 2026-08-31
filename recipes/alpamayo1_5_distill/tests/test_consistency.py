@@ -32,6 +32,7 @@ from alpamayo1_5_distill.models.consistency_losses import (
     consistency_fn,
     interpolate,
     needs_target,
+    cached_teacher_endpoint,
     sample_cached_teacher_transition,
     sample_rungs,
     tau_to_s,
@@ -188,6 +189,67 @@ def test_cached_teacher_transition_preserves_rollout_order_and_time_orientation(
     v = transition_velocity(x_hi, x_lo, tau_lo, tau_hi)
     recovered = teacher_step(x_hi, v, tau_hi - tau_lo)
     torch.testing.assert_close(recovered, x_lo)
+
+
+def test_cached_endpoint_is_the_last_state_of_the_SAME_noise_draw():
+    """The pairing is the whole point: eps and x0_teacher must come from one rollout."""
+    batch, noises, m, tokens, channels = 3, 4, 10, 2, 2
+    states = torch.empty(batch, noises, m + 1, tokens, channels)
+    for bi in range(batch):
+        for ki in range(noises):
+            for si in range(m + 1):
+                states[bi, ki, si].fill_(100 * bi + 10 * ki + si)
+
+    gen = torch.Generator().manual_seed(11)
+    _, k_idx, _, _, _, _ = sample_cached_teacher_transition(states, m, generator=gen)
+    end = cached_teacher_endpoint(states, k_idx)
+    rows = torch.arange(batch)
+    torch.testing.assert_close(end, states[rows, k_idx, m])
+    # ...and it really is per-row, not a broadcast of row 0's rollout.
+    for bi in range(batch):
+        assert float(end[bi].flatten()[0]) == 100 * bi + 10 * int(k_idx[bi]) + m
+
+
+def test_cached_endpoint_rejects_a_mismatched_noise_index():
+    states = torch.randn(4, 3, 11, T, C)
+    for bad in (torch.zeros(3, dtype=torch.long), torch.zeros(4, 1, dtype=torch.long)):
+        try:
+            cached_teacher_endpoint(states, bad)
+        except ValueError as ex:
+            assert "noise_index" in str(ex)
+        else:
+            raise AssertionError("a mismatched noise_index must not pair silently")
+
+
+def test_endpoint_loss_is_zero_when_one_euler_step_lands_on_the_teacher():
+    """At tau=1 the term IS the nfe=1 sampler: x + 1.0*v must equal the cached answer."""
+    eps = torch.randn(5, T, C)
+    x0_teacher = torch.randn(5, T, C)
+    tau = torch.ones(5, 1, 1)
+    v_exact = x0_teacher - eps                       # the one-step velocity, by definition
+    loss, _ = x0_reconstruction_loss(eps, tau, v_exact, x0_teacher)
+    assert float(loss) < 1e-12
+
+    off, _ = x0_reconstruction_loss(eps, tau, v_exact + 0.1, x0_teacher)
+    assert float(off) > 1e-3
+
+
+def test_endpoint_loss_is_uniform_in_tau_not_tau_squared():
+    """A fixed velocity error must cost tau**2 -- i.e. the x0-space MSE, unweighted.
+
+    The CD term carries an EXTRA tau**2 (velocity space); if that factor were duplicated
+    here the data end would be starved by 100x on the 10-rung grid.
+    """
+    x = torch.randn(4, T, C)
+    x0 = torch.randn(4, T, C)
+    delta = torch.randn(4, T, C)
+    got = []
+    for tau_val in (0.25, 0.5, 1.0):
+        tau = torch.full((4, 1, 1), tau_val)
+        v = (x0 - x) / tau_val + delta
+        loss, _ = x0_reconstruction_loss(x, tau, v, x0)
+        got.append(float(loss) / tau_val ** 2)
+    assert max(got) - min(got) < 1e-5 * max(got)
 
 
 def test_cached_teacher_transition_rejects_wrong_grid():

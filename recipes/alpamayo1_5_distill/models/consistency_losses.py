@@ -176,6 +176,37 @@ def sample_cached_teacher_transition(
     return s_index, noise_index, x_hi, x_lo, tau_lo, tau_hi
 
 
+def cached_teacher_endpoint(
+    states: torch.Tensor,
+    noise_index: torch.Tensor,
+) -> torch.Tensor:
+    """``states[b, k, M]`` -- the teacher's FINAL action for the SAME noise draw.
+
+    The cache already holds, for every clip, ``K`` pairs of (initial noise, teacher's
+    answer).  That pair is the input/output signature of the object being distilled: a
+    1-NFE sampler IS a map from ``eps`` to a good action.  Supervising it directly needs
+    no EMA, no solver step and no bootstrap chain -- see
+    :func:`x0_reconstruction_loss`, which consumes this as its target.
+
+    ⚠️ ``noise_index`` MUST be the one :func:`sample_cached_teacher_transition` returned
+    for the same batch. Re-drawing it here would pair ``x_hi`` from one rollout with the
+    endpoint of a different one, which is not a target at all -- it is the conditional
+    mean over ``K``, i.e. exactly the diversity collapse this term exists to avoid, and
+    nothing about the loss curve would look wrong.
+    """
+    if states.ndim != 5:
+        raise ValueError(
+            f"cached teacher states must be [B,K,M+1,T,C], got {tuple(states.shape)}"
+        )
+    if noise_index.ndim != 1 or noise_index.shape[0] != states.shape[0]:
+        raise ValueError(
+            f"noise_index must be [B] with B={states.shape[0]}, got "
+            f"{tuple(noise_index.shape)}"
+        )
+    batch_index = torch.arange(states.shape[0], device=states.device)
+    return states[batch_index, noise_index, -1]
+
+
 def transition_velocity(
     x_hi: torch.Tensor,
     x_lo: torch.Tensor,
@@ -246,12 +277,33 @@ def x0_reconstruction_loss(
     *,
     normalizer: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Supervise the online consistency endpoint against the ground-truth action.
+    """Supervise the online consistency endpoint against a clean-action target.
 
-    ``f_theta(x_hi, tau_hi) = x_hi + tau_hi * v_online`` is the clean-action estimate
-    used by a one-step consistency sampler. Unlike ``cd_loss``, this term is anchored to
-    the dataset target rather than to the teacher/EMA bootstrap. Arithmetic and reduction
-    stay in fp32 so small data-end residuals are not lost to bf16 cancellation.
+    ``f_theta(x_hi, tau_hi) = x_hi + tau_hi * v_online`` is the clean-action estimate a
+    one-step consistency sampler produces. Unlike ``cd_loss`` this term is a plain
+    regression: no EMA, no solver step, no bootstrap, so it converges on the horizon a
+    2-epoch run actually has. At ``tau_hi == 1`` it is bit-for-bit the expression
+    ``flow_matching._euler`` evaluates at ``inference_step=1``.
+
+    Two targets, and the choice is the whole experiment (``model.cd.x0_source``):
+
+    ``gt``
+        the dataset action. It is not paired with the noise that produced ``x_hi``, so all
+        ``K`` draws share one target and the minimiser at ``tau_hi = 1`` is the conditional
+        mean -- it buys sharpness by spending the sample diversity that best-of-K
+        ``min_ade`` rewards.
+    ``teacher``
+        :func:`cached_teacher_endpoint` for THIS noise draw. ``K`` draws keep ``K``
+        distinct targets, so the teacher's spread is what gets distilled, not averaged
+        away. This is the noise/output-pair form of policy distillation.
+
+    ⚠️ Weighted UNIFORMLY in ``x0`` space -- there is no ``tau**2`` here and there must not
+    be. ``cd_loss`` carries that factor because it works in velocity space; the residual
+    here is already in consistency-output space, and re-introducing it would starve the
+    data end by 100x on this 10-rung grid.
+
+    Arithmetic and reduction stay in fp32 so small data-end residuals are not lost to bf16
+    cancellation.
 
     Returns ``(loss, per_sample)``. Per-sample values are detached for logging.
     """
