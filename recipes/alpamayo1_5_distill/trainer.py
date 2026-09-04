@@ -56,6 +56,12 @@ AUX_LOSS_KEYS = (
     "roll_loss",
     "kv_ratio_k",
     "kv_ratio_v",
+    # Normalised entropy of the block-convex layer mix (models/layer_mix.py). The tent init
+    # reads ~0.228 for the shipped 7 -> 9 geometry; flat there means the LR multiplier is too
+    # low for P to move at all, and a climb toward 1.0 is a collapse to a plain block average
+    # -- which shrinks ||K||, so it must be read next to kv_ratio_k / kv_ratio_v.
+    "mix_entropy_k",
+    "mix_entropy_v",
     # Consistency distillation. `cd_loss` is the total; the per-rung terms are what
     # distinguish a healthy bootstrap (the anchor rung falls first, then propagates toward
     # noise) from a collapse to the conditional mean (the noise end falls fastest).
@@ -78,7 +84,13 @@ AUX_LOSS_KEYS = (
 #: origin and directly fights the measured vocabulary initialisation
 #: (``reasoning-setup-2b.md`` §9.1 C3), which is the whole reason those values start
 #: where they do.
-NO_DECAY_PARAMS = ("slot_embeddings",)
+#:
+#: ``layer_mix`` is the same argument in a sharper form: those parameters are SOFTMAX LOGITS,
+#: and decaying a logit toward 0 is decaying the mix toward UNIFORM. That would actively
+#: dismantle the depth-matched tent initialisation -- the one thing making step 0 a known
+#: quantity -- and it would do so silently, since a uniform mix produces a perfectly healthy
+#: loss curve at a shrunken ||K||.
+NO_DECAY_PARAMS = ("slot_embeddings", "layer_mix")
 
 #: How often to re-measure each loss term's share of the backbone gradient. 0 disables.
 #: Cheap at this interval (three partial backwards over one layer, on the graph the

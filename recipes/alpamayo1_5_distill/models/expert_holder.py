@@ -26,6 +26,12 @@ safe and was verified against the teacher's: every field the expert inherits mat
 (36 layers, 8 kv-heads, head_dim 128, rope_theta 5e6, mrope_section [24,20,20]) and the two
 that differ (hidden_size, intermediate_size) are both overridden by ``expert_cfg``.  So the
 expert comes out identical either way and the teacher's 397 tensors load unchanged.
+
+⚠️ That inheritance is what makes DEPTH the one field a shallower student changes: a 28-layer
+2B yields a 28-layer expert, and the teacher's 36 layers arrive through the load-time remap in
+:meth:`FrozenExpert._load`.  ``expert_num_layers`` overrides it, so the expert can stay 36 deep
+on a 28-layer student -- with the caller then owing it 36 cache slots.  See
+``models/layer_mix.py``.
 """
 
 from __future__ import annotations
@@ -73,13 +79,33 @@ class FrozenExpert(nn.Module):
     ~2 B params to every saved checkpoint and to the optimizer state.
     """
 
-    def __init__(self, checkpoint_path: str, student_text_config) -> None:
+    def __init__(
+        self,
+        checkpoint_path: str,
+        student_text_config,
+        expert_num_layers: int | None = None,
+    ) -> None:
+        """Build the teacher's expert on the STUDENT's text config.
+
+        Args:
+            expert_num_layers: override the depth the expert would otherwise inherit from
+                ``student_text_config``.  ⚠️ This is the escape hatch from the pruning
+                pathway, not a tuning knob.  Depth is normally pinned because expert layer
+                *l* reads cache layer *l*, so a 28-layer student forces a 28-layer expert and
+                the teacher's 36 layers load through the DEPTH REMAP below.  Passing 36 keeps
+                the expert whole and makes the caller responsible for SYNTHESISING 36 cache
+                slots from the student's 28 -- which is what
+                ``layer_mix.LayerMixer`` does.  With the depths equal the remap never fires,
+                ``_pi`` stays ``None``, and the teacher's 397 expert tensors load 1:1.
+        """
         super().__init__()
         cfg = _read_config(checkpoint_path)
 
         expert_config = copy.deepcopy(student_text_config)
         for key, value in (cfg.get("expert_cfg") or {}).items():
             setattr(expert_config, key, value)
+        if expert_num_layers is not None:
+            expert_config.num_hidden_layers = int(expert_num_layers)
         self.expert = AutoModel.from_config(expert_config)
         # The expert never embeds tokens -- it consumes projected actions. AlpamayoR1 deletes
         # this too (alpamayo_r1.py:98); keeping it would waste a 155k x 2048 table.

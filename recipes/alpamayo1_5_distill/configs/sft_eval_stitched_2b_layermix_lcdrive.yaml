@@ -1,0 +1,110 @@
+# 2B student VLM -> the teacher's FULL 36-LAYER action expert, via the learned cache mix.
+#
+# The counterpart of sft_eval_stitched_2b_prunedexpert_lcdrive for ARM=mix2bnav. What differs:
+#
+#  1. The expert is 36 layers, not 28. `layer_mix: true` injects `num_hidden_layers: 36` into
+#     expert_cfg, overriding the depth the expert would otherwise inherit from the 2B's text
+#     config, so the teacher's 36-layer expert loads 1:1 and _load_teacher_non_vlm's depth
+#     remap never fires. ⚠️ PRUNE_EXPERT_LAYERS MUST NOT BE SET -- from_stitch raises if it is.
+#  2. The student's 28-layer prefill cache is expanded to 36 slots by the trained P_K / P_V
+#     before the expert reads it (sample_trajectories_prefill_only). The mix is applied to the
+#     POST-RoPE cache here and to PRE-RoPE tensors in training; a layer mix commutes with RoPE,
+#     so the two agree exactly (tests/test_layer_mix.py::test_mix_commutes_with_rope).
+#  3. ⚠️ The mixing matrices are loaded EXPLICITLY by _load_layer_mix, because
+#     load_alpamayo1_vlm keeps only `vlm.*` keys and would otherwise drop them silently,
+#     evaluating the untrained tent init while reporting a trained result. It raises if the
+#     checkpoint has no `layer_mixer.*` -- so a student trained WITHOUT the mix cannot be
+#     evaluated through this config, which is correct: its cache has no meaning here.
+#
+# References to read this against: the teacher through its full 36-layer expert (min_ade
+# 0.5776) -- now the true ceiling, not the set-C ablation's 0.7893 -- and the matched
+# nav2bmix 28-layer number on the SAME nav annotations.
+
+defaults:
+  - sft_base
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.stitched_model.StitchedAlpamayoR1.from_stitch
+  # The student's base tower: Cosmos-Reason2-2B, 28 text layers / 2048 hidden / kv 8 x 128.
+  # kv_heads x head_dim = 1024 matches the teacher and expert_cfg, which is what lets the
+  # teacher's expert read this cache at all.
+  vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+  # Supplies traj tokenizer AND expert_cfg / diffusion_cfg / action_*_cfg -- this is what
+  # makes the skeleton an AlpamayoR1 with an expert rather than a bare VLA.
+  alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  # Left null: evaluate_hf.py:70 overwrites it with `evaluate.eval_ckpt`, which is how the
+  # per-arm student checkpoint gets in. Setting it here would be silently discarded.
+  checkpoint_path: null
+  # Where the frozen expert + action projections come from (397 + 12 tensors). All 36 layers
+  # load 1:1 here -- there is no remap, because there is no pruning.
+  teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+
+  # ⚠️ MUST MATCH THE TRAINING ARM. These four reconstruct the exact mixer the checkpoint's
+  # `layer_mixer.*` tensors were saved from; a mismatch raises on load rather than reshaping.
+  layer_mix: true
+  layer_mix_expert_layers: 36
+  layer_mix_blocks: 4
+  layer_mix_gain: false
+  layer_mix_sharpen: 0.75
+
+data:
+  # ⚠️ include_camera_ids / include_frame_nums MUST stay true. The teacher declares both in
+  # its own config.json, and evaluating it without them moved min_ade 1.116 -> 0.626 -- a 44%
+  # swing that produced two retracted findings. Here it matters twice over: the student was
+  # TRAINED in this format, and the expert is the teacher's, so a format change desynchronises
+  # both halves of the stitch at once.
+  val_dataset:
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: true
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  # No optimizer exists at eval, and both of these break it: the ZeRO-2 json expects an
+  # optimizer to shard, and checkpointing forces use_cache=False -- which would disable the
+  # very KV cache the expert reads.
+  deepspeed: null
+  gradient_checkpointing: false
+  report_to: none
+  # Match the token-head runs so any comparison is not confounded by the RNG stream
+  # (generation is do_sample=True, hardcoded at sft_base_model.py:612, seeded only by
+  # Trainer.__init__'s global set_seed(42)).
+  per_device_eval_batch_size: 4
+
+evaluate:
+  eval_ckpt: null
+  trajectory_output: null
+  max_eval_steps: -1
+  torch_dtype: bfloat16
+  metric_runner:
+    _target_: alpamayo.metrics.metric_runner.MetricRunner
+    metrics:
+      - _target_: alpamayo.metrics.metric_api.ReasoningSampler
+        num_traj_sets: 1
+        top_p: 0.98
+        temperature: 0.6
+        traj_only_generation: false
+        max_generation_length: 256
+      - _target_: alpamayo.metrics.metric_api.DistanceMetrics
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/evalstitch
+
+task_name: alpamayo_1_5_kd_stitched_eval
+run_name: stitch_4b_${now:%m%d-%H%M}

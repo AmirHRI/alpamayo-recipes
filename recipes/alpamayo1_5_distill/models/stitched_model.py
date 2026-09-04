@@ -67,6 +67,7 @@ from safetensors.torch import load_file
 from alpamayo1_5_sft.models.sft_alpamayo_r1 import TrainableAlpamayoR1
 from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA, load_alpamayo1_vlm
 from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
+from alpamayo1_5_distill.models.layer_mix import LAYER_MIX_SHARPEN, LayerMixer
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +221,75 @@ def _load_teacher_non_vlm(checkpoint_path: str, model: torch.nn.Module) -> None:
     )
 
 
+def _layer_mix_keys(checkpoint_path: str) -> dict[str, torch.Tensor]:
+    """``layer_mixer.*`` tensors in a checkpoint, across the sharded and single-file layouts."""
+    index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
+    single_path = os.path.join(checkpoint_path, "model.safetensors")
+    state: dict[str, torch.Tensor] = {}
+    if os.path.exists(index_path):
+        with open(index_path) as fh:
+            weight_map = json.load(fh)["weight_map"]
+        wanted = [k for k in weight_map if k.startswith("layer_mixer.")]
+        for shard in sorted({weight_map[k] for k in wanted}):
+            shard_sd = load_file(os.path.join(checkpoint_path, shard))
+            state.update({k: v for k, v in shard_sd.items() if k.startswith("layer_mixer.")})
+    elif os.path.exists(single_path):
+        shard_sd = load_file(single_path)
+        state = {k: v for k, v in shard_sd.items() if k.startswith("layer_mixer.")}
+    else:
+        raise FileNotFoundError(f"no model.safetensors[.index.json] under {checkpoint_path}")
+    return state
+
+
+def _refuse_orphaned_layer_mix(checkpoint_path: str) -> None:
+    """Raise if a checkpoint carries mixing matrices that this stitch would ignore."""
+    if not checkpoint_path:
+        return
+    try:
+        found = _layer_mix_keys(checkpoint_path)
+    except FileNotFoundError:
+        return                      # not a checkpoint dir; from_pretrained_vlm will say so
+    if found:
+        raise RuntimeError(
+            f"{checkpoint_path} carries {len(found)} `layer_mixer.*` tensors but this config "
+            "has layer_mix=False. Its VLM was trained to feed a FULL-depth expert through "
+            "those matrices; evaluated without them the expert is built shallow and the "
+            "matrices are silently dropped, which scores a model that was never trained. "
+            "Use configs/sft_eval_stitched_2b_layermix_lcdrive.yaml."
+        )
+
+
+def _load_layer_mix(checkpoint_path: str, model: torch.nn.Module) -> None:
+    """Load the trained ``layer_mixer.*`` from the student checkpoint. Raises if absent.
+
+    ⚠️ THIS FUNCTION EXISTS BECAUSE OF A SILENT-REVERT TRAP. ``load_alpamayo1_vlm`` filters
+    the checkpoint down to keys starting with ``vlm.`` (``sft_base_model.py:96,117``), so
+    every non-VLM parameter a training arm learned is DROPPED without a word. For the mixing
+    matrices that would mean evaluating the untrained tent init while the log says the
+    checkpoint loaded fine -- a number that is finite, plausible, and about a model nobody
+    trained. Hence the explicit load, and the hard failure when nothing is found.
+
+    (``kv_projector`` has the same latent bug today. It has never bitten only because the
+    shipped configs use ``kv_align: direct``, which allocates no parameters at all.)
+    """
+    directory = checkpoint_path
+    state = _layer_mix_keys(directory)
+    if not state:
+        raise RuntimeError(
+            f"layer_mix is enabled but {directory} contains no `layer_mixer.*` tensors. "
+            "Either this checkpoint came from an arm trained WITHOUT layer_mix (in which case "
+            "its 28-layer cache cannot drive this 36-layer expert at all), or the mixing "
+            "matrices were dropped on save. Refusing to evaluate the untrained tent init "
+            "while reporting it as a trained result."
+        )
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    bad = [k for k in unexpected if k.startswith("layer_mixer.")]
+    if bad:
+        raise RuntimeError(f"layer_mixer tensors do not match this mixer: {bad[:5]}")
+    print(f"[stitch] loaded {len(state)} layer_mixer tensors from {directory}", flush=True)
+    print(model.layer_mixer.describe(), flush=True)
+
+
 class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
     """``AlpamayoR1`` whose VLM is the distilled student and whose expert is the teacher's.
 
@@ -254,6 +324,12 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         alpamayo_config_path: str,
         checkpoint_path: str,
         teacher_checkpoint_path: str,
+        layer_mix: bool = False,
+        layer_mix_expert_layers: int = 36,
+        layer_mix_blocks: int = 4,
+        layer_mix_gain: bool = False,
+        layer_mix_sharpen: float = LAYER_MIX_SHARPEN,
+        layer_mix_init: str = "checkpoint",
         **kwargs: Any,
     ) -> "StitchedAlpamayoR1":
         """Build student-VLM + teacher-expert.
@@ -273,6 +349,18 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
                 TrainableReasoningVLA subclass, so this name is what lets --eval_ckpt
                 reach the student without patching the shared eval entry point.
             teacher_checkpoint_path: the 10B checkpoint to take the expert from.
+            layer_mix: keep the expert at its FULL depth and synthesise its cache slots from
+                the student's shallower stack, instead of pruning it to match. Must be set
+                exactly as the training arm set it -- a student trained with the mix produces
+                a cache that only means anything through that same mix, and one trained
+                without it has no `layer_mixer.*` to load. See ``models/layer_mix.py``.
+            layer_mix_init: where the mixing matrices come from. ``"checkpoint"`` (the
+                default, and the only correct setting for scoring a trained arm) loads them
+                from ``checkpoint_path`` and RAISES if they are absent. ``"tent"`` builds them
+                fresh at the depth-matched init and loads nothing -- for probes that supply
+                their own P (``scripts/layer_mix_oracle.py``) and for the zero-shot sanity
+                eval of an arm trained WITHOUT the mix. ⚠️ ``"tent"`` silently ignores any
+                trained matrices in the checkpoint, so it must never be the default.
         """
         # `from_pretrained_vlm` builds its config via the hard-coded target string
         # f"alpamayo_r1.models.base_model.{cls.config_class.__name__}"
@@ -305,6 +393,20 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         )
         teacher_cfg = cls._read_raw_config(alpamayo_config_path)
         expert_kwargs = {k: teacher_cfg[k] for k in expert_keys if k in teacher_cfg}
+        if layer_mix:
+            if os.environ.get("PRUNE_EXPERT_LAYERS", "").strip():
+                raise ValueError(
+                    "layer_mix=True with PRUNE_EXPERT_LAYERS set. These are alternatives: "
+                    "mixing exists so the expert need NOT be pruned. Unset the env var."
+                )
+            # ⚠️ `num_hidden_layers` is deliberately ABSENT from the teacher's `expert_cfg`,
+            # which is exactly why expert depth follows the VLM (AlpamayoR1.__init__ copies
+            # text_config then overlays expert_cfg). Adding it here is the whole mechanism
+            # that keeps the expert 36 deep on a 28-layer student.
+            expert_kwargs["expert_cfg"] = {
+                **(expert_kwargs.get("expert_cfg") or {}),
+                "num_hidden_layers": int(layer_mix_expert_layers),
+            }
         absent = [k for k in ("expert_cfg", "diffusion_cfg", "action_space_cfg") if k not in expert_kwargs]
         if absent:
             raise ValueError(
@@ -319,7 +421,40 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
             **expert_kwargs,
             **kwargs,
         )
+        if not layer_mix:
+            # ⚠️ THE SYMMETRIC TRAP. A checkpoint from a layer_mix arm evaluated with
+            # layer_mix=False builds a 28-layer expert, drops the trained `layer_mixer.*`
+            # silently (load_alpamayo1_vlm keeps only `vlm.`), and produces a perfectly
+            # finite min_ade for a model that was never trained. Cheap to detect: the
+            # tensors are right there in the checkpoint.
+            _refuse_orphaned_layer_mix(checkpoint_path)
+        if layer_mix:
+            n_student = len(model.vlm.model.language_model.layers)
+            ref = next(model.vlm.parameters())
+            model.layer_mixer = LayerMixer(
+                n_student=n_student,
+                n_expert=int(layer_mix_expert_layers),
+                n_blocks=int(layer_mix_blocks),
+                gain=bool(layer_mix_gain),
+                sharpen=float(layer_mix_sharpen),
+            ).to(device=ref.device, dtype=ref.dtype)
+            # BEFORE the teacher load, so a mixer-shape mismatch surfaces on its own terms
+            # rather than inside the teacher loader's strict-key accounting.
+            if layer_mix_init == "checkpoint":
+                _load_layer_mix(checkpoint_path, model)
+            elif layer_mix_init == "tent":
+                print("[stitch] ⚠️ layer_mix_init=tent: mixing matrices left at the "
+                      "depth-matched init; anything trained in the checkpoint is IGNORED. "
+                      "Valid only for a probe that supplies its own P.", flush=True)
+            else:
+                raise ValueError(
+                    f"layer_mix_init must be checkpoint|tent, got {layer_mix_init!r}")
         _load_teacher_non_vlm(teacher_checkpoint_path, model)
+        if layer_mix and len(model.expert.layers) != int(layer_mix_expert_layers):
+            raise RuntimeError(
+                f"expert built {len(model.expert.layers)} deep, expected "
+                f"{layer_mix_expert_layers}; the expert_cfg depth override did not take"
+            )
         return model
 
     @classmethod
@@ -533,6 +668,17 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         prompt_cache, prefill_seq_len, rope_deltas = self._prefill_prompt_cache(
             input_ids, tokenized_data
         )
+        # ⚠️ 28 VLM layers -> 36 expert slots, BEFORE cache_hook and _expand_cache. Before the
+        # hook so a caller substituting teacher K/V per expert slot sees a cache whose depth
+        # already matches the expert; before the expansion so the mix runs once per clip
+        # rather than once per trajectory sample.
+        # The keys here are POST-RoPE while training mixes PRE-RoPE ones. That is not a
+        # discrepancy: cos/sin are per-position and shared across layers, and rotation is
+        # linear in K, so a LAYER mix commutes with it exactly (models/layer_mix.py, and
+        # tests/test_layer_mix.py::test_mix_commutes_with_rope).
+        mixer = getattr(self, "layer_mixer", None)
+        if mixer is not None:
+            prompt_cache = mixer.mix_cache(prompt_cache)
         if cache_hook is not None:
             # BEFORE _expand_cache: the hook sees one row per clip, not one per traj sample.
             prompt_cache = cache_hook(prompt_cache, input_ids, tokenized_data)
@@ -665,6 +811,13 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         for dead in ("last_component", "traj_only_generation", "return_extra"):
             kwargs.pop(dead, None)
         if os.environ.get("STITCH_ROLLOUT") == "1":
+            if getattr(self, "layer_mixer", None) is not None:
+                raise RuntimeError(
+                    "STITCH_ROLLOUT=1 is incompatible with layer_mix: that path builds its "
+                    "cache inside `generate` and would hand the expert the student's raw "
+                    f"{self.layer_mixer.n_student}-layer cache for "
+                    f"{len(self.expert.layers)} slots, unmixed."
+                )
             return self.sample_trajectories_from_data_with_vlm_rollout(data=data, **kwargs)
         if os.environ.get("STITCH_PREFILL_SELFTEST") == "1" and not getattr(
             self, "_prefill_selftested", False

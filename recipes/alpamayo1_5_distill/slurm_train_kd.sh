@@ -144,6 +144,47 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    mix2bnav)
+        # THE UNPRUNED EXPERT. Same 2-camera nav stack as nav2bmix, but the teacher's action
+        # expert keeps all 36 layers and its cache slots are SYNTHESISED from the student's 28
+        # VLM layers by learned block-convex matrices, 4 blocks of 7 -> 9.
+        # WHY: pruning to 28 costs 0.2117 min_ade of CEILING before the student is involved --
+        # teacher through its full expert 0.5776, through the set-C ablation 0.7893
+        # (PRUNING.md). Every 2B block/span arm so far has been optimising toward the lower one.
+        # ⚠️ PRUNE_EXPERT_LAYERS IS DELIBERATELY NOT EXPORTED, and must not be inherited from a
+        # previous shell: kd_model._init_layer_mix raises if it is set, because pruning and
+        # mixing are alternatives. Unset it here so an interactive re-launch cannot leak it in.
+        unset PRUNE_EXPERT_LAYERS
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_nav_layermix_lcdrive
+        # ⚠️ MIXM defaults to 9, not nav2bmix's 7: 9 is one block's worth of expert layers, so
+        # _span_sweep's disjoint spans land on [0,9,18,27] and each one grades exactly one
+        # block's 9-from-7 reconstruction. Other values straddle blocks (kd_model warns).
+        # SPEED: m=9 < SPAN_CKPT_MIN=14 so the span chain is UNCHECKPOINTED; set SPAN_CKPT_MIN=9
+        # if the +29% from 28 -> 36 expert layers pushes it into OOM, and expect ~4x slower.
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.layer_mix=true
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-9}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        # RUN_TAG derives from ARM alone, so the mix parameters must be in the name or two
+        # configurations would share an output_dir and a wandb id (job 493).
+        ARM="${ARM}_m${MIXM:-9}w${MIXW:-1.0}"
+        # PLR overrides the mixing matrices' LR multiplier (config ships 10.0).
+        # ⚠️ MEASURED: at 10.0 P is effectively FROZEN -- over a full 5-epoch run the most
+        # active weight moved 3.3 percentage points (0.871 -> 0.838) and the two banks stayed
+        # identical, so job 602's -27.1% min_ade came from a FIXED sharpened tent, not from a
+        # learned mixture. Adam steps ~lr per parameter regardless of gradient magnitude, and
+        # the oracle's logit-travel estimate put the multiplier needed to actually move P at
+        # 80-110x. Nothing else may change alongside it, or the comparison against 602 stops
+        # isolating what learning P is worth.
+        # ⚠️ The tag is appended ONLY when PLR is set, so ARM=mix2bnav keeps resolving to
+        # job 602's output_dir and its checkpoints stay evaluable.
+        if [[ -n "${PLR:-}" ]]; then
+            EXTRA+=(++trainer.lr_multiplier.layer_mixer="$PLR")
+            ARM="${ARM}_plr${PLR}"
+        fi ;;
     nav2bmix)
         # 2B student, 2 front cameras, NAV-CONDITIONED, on the teacher-forced block loss (m=1)
         # AND the m=7 span loss at EQUAL weight (block_span_mix=7, weight 1.0 -> weighted mean).
