@@ -193,21 +193,40 @@ class LayerMixer(nn.Module):
         n_blocks: int = 4,
         gain: bool = False,
         sharpen: float = LAYER_MIX_SHARPEN,
+        pin_head: int = 0,
+        pin_tail: int = 0,
     ) -> None:
         super().__init__()
         if n_blocks < 1:
             raise ValueError(f"n_blocks must be >= 1, got {n_blocks}")
-        if n_student % n_blocks or n_expert % n_blocks:
+        pin_head, pin_tail = int(pin_head), int(pin_tail)
+        if pin_head < 0 or pin_tail < 0:
+            raise ValueError(f"pins must be >= 0, got {pin_head}, {pin_tail}")
+        # A pinned layer is wired STRAIGHT THROUGH: student layer i becomes expert slot i at
+        # the head, and student layer n_student-1-k becomes expert slot n_expert-1-k at the
+        # tail. No parameters, no mixing, and the slot count consumed is identical on both
+        # sides -- so every extra expert slot is absorbed by the learned middle.
+        mid_src = n_student - pin_head - pin_tail
+        mid_dst = n_expert - pin_head - pin_tail
+        if mid_src < n_blocks or mid_dst < n_blocks:
             raise ValueError(
-                f"n_blocks={n_blocks} must divide BOTH depths, but {n_student} % {n_blocks} "
-                f"= {n_student % n_blocks} and {n_expert} % {n_blocks} = {n_expert % n_blocks}. "
-                "Ragged blocks would make the span loss compare across block boundaries."
+                f"pins leave {mid_src} student / {mid_dst} expert layers for {n_blocks} "
+                "blocks; nothing to mix"
+            )
+        if mid_src % n_blocks or mid_dst % n_blocks:
+            raise ValueError(
+                f"n_blocks={n_blocks} must divide the UNPINNED middle, but {mid_src} % "
+                f"{n_blocks} = {mid_src % n_blocks} and {mid_dst} % {n_blocks} = "
+                f"{mid_dst % n_blocks}. Ragged blocks would make the span loss compare across "
+                "block boundaries."
             )
         self.n_student = int(n_student)
         self.n_expert = int(n_expert)
         self.n_blocks = int(n_blocks)
-        self.g_in = n_student // n_blocks
-        self.g_out = n_expert // n_blocks
+        self.pin_head = pin_head
+        self.pin_tail = pin_tail
+        self.g_in = mid_src // n_blocks
+        self.g_out = mid_dst // n_blocks
 
         self.sharpen = float(sharpen)
         init = (init_logits(self.g_in, self.g_out, self.sharpen)
@@ -273,18 +292,25 @@ class LayerMixer(nn.Module):
                 f"expected {self.n_student} source layers on dim 1, got {x.shape[1]}"
             )
         p = self.weights(which).to(x.dtype)
-        out = [
-            torch.einsum(
-                "bihtd,io->bohtd",
-                x[:, b * self.g_in : (b + 1) * self.g_in],
-                p[b],
-            )
-            for b in range(self.n_blocks)
-        ]
+        out = []
+        if self.pin_head:
+            out.append(x[:, : self.pin_head])            # straight through, no parameters
+        for b in range(self.n_blocks):
+            lo = self.pin_head + b * self.g_in
+            out.append(torch.einsum("bihtd,io->bohtd", x[:, lo : lo + self.g_in], p[b]))
+        if self.pin_tail:
+            out.append(x[:, self.n_student - self.pin_tail :])
         mixed = torch.cat(out, dim=1)
         g = self._gain(which)
         if g is not None:
-            mixed = mixed * g.to(mixed.dtype).view(1, -1, 1, 1, 1)
+            # ⚠️ NOT applied to pinned slots: a pin means "this cache layer reaches the expert
+            # unaltered", and a learned scale would quietly make that false.
+            gg = g.to(mixed.dtype).clone()
+            if self.pin_head:
+                gg[: self.pin_head] = 1.0
+            if self.pin_tail:
+                gg[self.n_expert - self.pin_tail :] = 1.0
+            mixed = mixed * gg.view(1, -1, 1, 1, 1)
         return mixed
 
     def mix_dict(
@@ -345,29 +371,41 @@ class LayerMixer(nn.Module):
     # ------------------------------------------------------------------ reporting
     def describe(self) -> str:
         """The full P, for the log.  What actually drove a number must be recoverable."""
+        pins = (f", pinned head {self.pin_head} tail {self.pin_tail} (identity)"
+                if (self.pin_head or self.pin_tail) else "")
         lines = [
-            f"[layer-mix] {self.n_student} -> {self.n_expert} in {self.n_blocks} blocks "
-            f"({self.g_in} -> {self.g_out} each), sharpen={self.sharpen}, "
+            f"[layer-mix] {self.n_student} -> {self.n_expert} in {self.n_blocks} learned blocks "
+            f"({self.g_in} -> {self.g_out} each){pins}, sharpen={self.sharpen}, "
             f"gain={'on' if self.gain_k is not None else 'off'}",
             f"[layer-mix] entropy k={float(self.entropy('k')):.4f} "
             f"v={float(self.entropy('v')):.4f}  (0=one-hot, 1=uniform)",
         ]
+        if self.pin_head:
+            lines.append(f"[layer-mix] PINNED head: student 0..{self.pin_head - 1} -> "
+                         f"slots 0..{self.pin_head - 1}, identity")
         for which in _WHICH:
             p = self.weights(which).detach()
             for b in range(self.n_blocks):
-                src = f"{b * self.g_in}..{(b + 1) * self.g_in - 1}"
-                dst = f"{b * self.g_out}..{(b + 1) * self.g_out - 1}"
+                s0 = self.pin_head + b * self.g_in
+                d0 = self.pin_head + b * self.g_out
+                src = f"{s0}..{s0 + self.g_in - 1}"
+                dst = f"{d0}..{d0 + self.g_out - 1}"
                 for q in range(self.g_out):
                     row = " ".join(f"{float(x):5.3f}" for x in p[b, :, q])
                     lines.append(
-                        f"[layer-mix] P_{which.upper()} block{b} slot{b * self.g_out + q:>2} "
+                        f"[layer-mix] P_{which.upper()} block{b} slot{d0 + q:>2} "
                         f"<- [{src}] {row}   (block {src} -> {dst})"
                     )
+        if self.pin_tail:
+            lines.append(f"[layer-mix] PINNED tail: student "
+                         f"{self.n_student - self.pin_tail}..{self.n_student - 1} -> slots "
+                         f"{self.n_expert - self.pin_tail}..{self.n_expert - 1}, identity")
         return "\n".join(lines)
 
     def extra_repr(self) -> str:
         return (
             f"n_student={self.n_student}, n_expert={self.n_expert}, "
             f"n_blocks={self.n_blocks}, g_in={self.g_in}, g_out={self.g_out}, "
+            f"pin_head={self.pin_head}, pin_tail={self.pin_tail}, "
             f"sharpen={self.sharpen}, gain={self.gain_k is not None}"
         )

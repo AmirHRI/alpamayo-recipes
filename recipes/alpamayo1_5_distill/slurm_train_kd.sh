@@ -144,6 +144,28 @@ case "$ARM" in
         CONFIG_NAME=sft_kd_cosmos2b_prunedexpert_lcdrive
         EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
                 ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta) ;;
+    mixpin2bnav)
+        # PINNED-ENDS layer mix. Same 36-layer expert and same objective as mix2bnav; the only
+        # difference is WHICH cache slots are synthesised. Student 0..3 -> slots 0..3 and
+        # 26..27 -> 34..35 are wired straight through (deepstack/ViT-injection at the head,
+        # and the deep layers the causal ladder measured at ~95% of the recoverable gap at the
+        # tail); only slots 4..33 are mixed, from student 4..25, in 2 blocks of 11 -> 15.
+        # ⚠️ Read this against the mix2bnav arm at the SAME PLR, not against a different one --
+        # the mapping is the variable, the multiplier must be held fixed.
+        unset PRUNE_EXPERT_LAYERS
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_nav_layermix_pinned_lcdrive
+        EXTRA+=(++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.layer_mix=true
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix="${MIXM:-9}"
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
+        ARM="${ARM}_m${MIXM:-9}w${MIXW:-1.0}"
+        if [[ -n "${PLR:-}" ]]; then
+            EXTRA+=(++trainer.lr_multiplier.layer_mixer="$PLR")
+            ARM="${ARM}_plr${PLR}"
+        fi ;;
     mix2bnav)
         # THE UNPRUNED EXPERT. Same 2-camera nav stack as nav2bmix, but the teacher's action
         # expert keeps all 36 layers and its cache slots are SYNTHESISED from the student's 28

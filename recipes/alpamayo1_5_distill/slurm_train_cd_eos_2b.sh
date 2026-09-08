@@ -53,8 +53,18 @@ if [[ "$SMOKE" == "1" ]]; then
             ++trainer.eval_strategy=no ++trainer.warmup_steps=0
             ++trainer.gradient_accumulation_steps=1
             ++data.train_dataset.chunk_ids=0-120
-            ++trainer.dataloader_num_workers=2
-            ++callbacks.ema.liveness_check_at=2 ++callbacks.ema.warmup_steps=1)
+            ++trainer.dataloader_num_workers=2)
+    # ⚠️ The ema overrides apply ONLY if the chosen config actually declares that callback.
+    # sft_base ships `callbacks: {}` and train_hf.py instantiates whatever is under it, so a
+    # `++callbacks.ema.*` force-add on a config WITHOUT an ema block creates a bare dict with
+    # no _target_ -- hydra returns the dict unchanged and the trainer dies on
+    # "'dict' object has no attribute 'on_init_end'", ~2 minutes in and nowhere near the real
+    # cause. sft_cd_eos_2b_nav_lcdrive declares one; the gt* endpoint family does not.
+    if grep -qE "^[[:space:]]+ema:" "$RECIPE_DIR/configs/${CONFIG:-sft_cd_eos_2b_nav_lcdrive}.yaml" 2>/dev/null; then
+        EXTRA+=(++callbacks.ema.liveness_check_at=2 ++callbacks.ema.warmup_steps=1)
+    else
+        echo "[slurm] SMOKE: config declares no callbacks.ema, skipping its overrides"
+    fi
     echo "[slurm] SMOKE: 2 optimizer steps"
 fi
 [[ -n "${EXTRA_ARGS:-}" ]] && EXTRA+=(${EXTRA_ARGS})
@@ -69,6 +79,6 @@ nvidia-smi -L
 srun "$VENV/torchrun" --nproc_per_node 2 --master_port "$MASTER_PORT" \
     -m alpamayo1_5_distill.train_kd \
     --config-path pkg://alpamayo1_5_distill/configs \
-    --config-name sft_cd_eos_2b_nav_lcdrive \
+    --config-name "${CONFIG:-sft_cd_eos_2b_nav_lcdrive}" \
     "run_name=cd_eos2b_$(date +%m%d-%H%M)" \
     "${EXTRA[@]}"

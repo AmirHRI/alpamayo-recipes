@@ -60,7 +60,16 @@ fi
 #   - the config, or the eval builds a 28-layer expert and _refuse_orphaned_layer_mix fires;
 #   - PRUNE_EXPERT_LAYERS must be UNSET, because from_stitch raises when layer_mix is on and
 #     it is set -- pruning and mixing are alternatives, never companions.
-if [[ "$ARM" == mix2b* ]]; then
+# ⚠️ The PINNED-ENDS variant needs its own eval config: the mixer geometry (2 blocks of
+# 11 -> 15 with 4/2 pinned) must match what the checkpoint's layer_mixer.* was saved from, or
+# load_state_dict reports a size mismatch. Checked BEFORE the mix2b* branch, since
+# "mixpin2bnav..." does not match "mix2b*" but the ordering should not be load-bearing.
+if [[ "$ARM" == mixpin2b* ]]; then
+    MODEL_TAG=2b
+    CONFIG_NAME=sft_eval_stitched_2b_layermix_pinned_lcdrive
+    unset PRUNE_EXPERT_LAYERS
+    echo "[slurm] pinned layer-mix arm: 36-layer expert, head/tail identity, pin unset"
+elif [[ "$ARM" == mix2b* ]]; then
     MODEL_TAG=2b
     CONFIG_NAME=sft_eval_stitched_2b_layermix_lcdrive
     unset PRUNE_EXPERT_LAYERS

@@ -329,6 +329,8 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
         layer_mix_blocks: int = 4,
         layer_mix_gain: bool = False,
         layer_mix_sharpen: float = LAYER_MIX_SHARPEN,
+        layer_mix_pin_head: int = 0,
+        layer_mix_pin_tail: int = 0,
         layer_mix_init: str = "checkpoint",
         **kwargs: Any,
     ) -> "StitchedAlpamayoR1":
@@ -437,6 +439,8 @@ class StitchedAlpamayoR1(AlpamayoR1, TrainableReasoningVLA):
                 n_blocks=int(layer_mix_blocks),
                 gain=bool(layer_mix_gain),
                 sharpen=float(layer_mix_sharpen),
+                pin_head=int(layer_mix_pin_head),
+                pin_tail=int(layer_mix_pin_tail),
             ).to(device=ref.device, dtype=ref.dtype)
             # BEFORE the teacher load, so a mixer-shape mismatch surfaces on its own terms
             # rather than inside the teacher loader's strict-key accounting.
@@ -940,6 +944,36 @@ class TrainableStitchedAlpamayoR1(StitchedAlpamayoR1):
         model.stop_grad_from_vlm = True
         for prm in model.vlm.parameters():
             prm.requires_grad_(cotrain_vlm)
+
+        mixer = getattr(model, "layer_mixer", None)
+        if mixer is not None:
+            # ⚠️ THE TRAINING FORWARD DOES NOT MIX ON ITS OWN. `forward` here is borrowed from
+            # TrainableAlpamayoR1, which reads `vlm_outputs.past_key_values`, crops it, and
+            # hands it straight to the expert -- it never touches
+            # sample_trajectories_prefill_only, which is where the EVAL path applies the mix.
+            # Left alone, a 28-layer cache would reach a 36-layer expert and DynamicCache
+            # would AUTO-EXTEND: slots 28..35 created on demand holding only the 64 action
+            # tokens, no VLM prefix. That runs clean, reports finite losses, and trains a
+            # model nobody intended -- verified against a real Qwen3-VL decoder.
+            #
+            # A pre-hook rather than a copy of the forward: duplicating ~80 lines of borrowed
+            # method is exactly how the two paths drift apart.
+            def _mix_pre(_mod, args, kwargs, _m=mixer):
+                cache = kwargs.get("past_key_values")
+                # Self-guarding on depth: the inference path has ALREADY mixed by the time it
+                # reaches here, and re-mixing a 36-layer cache would raise. This makes the
+                # hook a no-op there instead.
+                if cache is not None and len(getattr(cache, "layers", [])) == _m.n_student:
+                    kwargs["past_key_values"] = _m.mix_cache(cache)
+                return args, kwargs
+
+            model.expert.register_forward_pre_hook(_mix_pre, with_kwargs=True)
+            # P belongs to the FROZEN student's cache pipeline here: this arm adapts the
+            # EXPERT to the cache the student actually produces, so the cache must hold still.
+            for prm in mixer.parameters():
+                prm.requires_grad_(False)
+            print(f"[stitch-train] layer mix ACTIVE in the training forward "
+                  f"({mixer.n_student} -> {mixer.n_expert}), P frozen", flush=True)
         n_tr = sum(q.numel() for q in model.parameters() if q.requires_grad)
         logger.warning("[stitch-train] VLM %s, trainable params %.2f B",
                        "TRAINABLE" if cotrain_vlm else "frozen", n_tr / 1e9)

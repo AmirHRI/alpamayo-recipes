@@ -28,8 +28,16 @@
 # ⚠️ --mem is REQUIRED. Without it slurm hands over the node's entire RAM and every other job
 # queues on (Resources) with GPUs idle. 170G is half the node, matching the 2-of-4 GPU share.
 set -euo pipefail
-: "${PRUNE_EXPERT_LAYERS:?set PRUNE_EXPERT_LAYERS=comma,separated,indices}"
-export PRUNE_EXPERT_LAYERS
+# MIX=1 -> the LAYER-MIX student: the expert keeps all 36 layers and its cache slots are
+# synthesised by P, so there is nothing to prune and from_stitch RAISES if the pin is set.
+# Pruning and mixing are alternatives; this is the one arm that must not carry the pin.
+if [[ "${MIX:-0}" == "1" ]]; then
+    unset PRUNE_EXPERT_LAYERS
+    echo "[slurm] MIX=1: 36-layer expert, PRUNE_EXPERT_LAYERS unset"
+else
+    : "${PRUNE_EXPERT_LAYERS:?set PRUNE_EXPERT_LAYERS=comma,separated,indices (or MIX=1)}"
+    export PRUNE_EXPERT_LAYERS
+fi
 CONFIG="${CONFIG:?set CONFIG=<config name under configs/>}"
 SMOKE="${SMOKE:-0}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill

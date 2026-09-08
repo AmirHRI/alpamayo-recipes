@@ -256,6 +256,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
     layer_mix_blocks: int = 4
     layer_mix_gain: bool = False
     layer_mix_sharpen: float = LAYER_MIX_SHARPEN
+    layer_mix_pin_head: int = 0
+    layer_mix_pin_tail: int = 0
 
     #: When True, ``forward`` also stashes the loss terms **with their graph attached** in
     #: :attr:`last_loss_terms`, so ``KaVaTrainer`` can take ``autograd.grad`` of each term
@@ -297,6 +299,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
         layer_mix_blocks: int = 4,
         layer_mix_gain: bool = False,
         layer_mix_sharpen: float = LAYER_MIX_SHARPEN,
+        layer_mix_pin_head: int = 0,
+        layer_mix_pin_tail: int = 0,
     ) -> None:
         """Attach the frozen teacher and the (optional) K/V projector bank.
 
@@ -403,6 +407,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
         self.layer_mix_blocks = int(layer_mix_blocks)
         self.layer_mix_gain = bool(layer_mix_gain)
         self.layer_mix_sharpen = float(layer_mix_sharpen)
+        self.layer_mix_pin_head = int(layer_mix_pin_head)
+        self.layer_mix_pin_tail = int(layer_mix_pin_tail)
         if self.layer_mix:
             self._init_layer_mix(n_student)
 
@@ -448,6 +454,8 @@ class KDReasoningVLA(TrainableReasoningVLA):
             n_blocks=self.layer_mix_blocks,
             gain=self.layer_mix_gain,
             sharpen=self.layer_mix_sharpen,
+            pin_head=self.layer_mix_pin_head,
+            pin_tail=self.layer_mix_pin_tail,
         )
         self.layer_mixer = mixer.to(device=ref.device, dtype=ref.dtype)
         # (5) The span loss is the term that grades "9 expert slots from 7 student layers".

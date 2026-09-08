@@ -243,7 +243,7 @@ def test_describe_names_every_slot():
 
 
 def test_ragged_blocks_raise():
-    with pytest.raises(ValueError, match="must divide BOTH depths"):
+    with pytest.raises(ValueError, match="must divide the UNPINNED middle"):
         LayerMixer(28, 36, 5)
 
 
@@ -286,6 +286,8 @@ class _Stub(torch.nn.Module):
         self.layer_mix_blocks = N_BLOCKS
         self.layer_mix_gain = False
         self.layer_mix_sharpen = LAYER_MIX_SHARPEN
+        self.layer_mix_pin_head = 0
+        self.layer_mix_pin_tail = 0
         for k, v in over.items():
             setattr(self, k, v)
 
@@ -315,7 +317,7 @@ def test_guard_no_block_family_term_means_p_never_learns(monkeypatch):
 
 def test_guard_ragged_blocks_reach_the_mixer(monkeypatch):
     monkeypatch.delenv("PRUNE_EXPERT_LAYERS", raising=False)
-    with pytest.raises(ValueError, match="must divide BOTH depths"):
+    with pytest.raises(ValueError, match="must divide the UNPINNED middle"):
         _Stub(layer_mix_blocks=5).go()
 
 
@@ -654,3 +656,118 @@ def test_train_and_eval_agree_on_sharpen():
     ev = _yaml(EVAL_CFG)["model"]
     assert kd.get("layer_mix_sharpen", LAYER_MIX_SHARPEN) == ev.get(
         "layer_mix_sharpen", LAYER_MIX_SHARPEN)
+
+
+# ------------------------------------------------------------------ pinned head/tail
+#
+# The deepstack/ViT-injection layers at the head and the final layers at the tail are wired
+# STRAIGHT THROUGH; only the middle is mixed. PRUNING.md protects layers 0-2 structurally and
+# its ladder measured layers 19-27 as carrying ~95% of the recoverable gap, so those are the
+# two regions where substituting a blend is most likely to cost something.
+
+PIN_H, PIN_T = 4, 2
+MID_IN, MID_OUT, MID_BLOCKS = 22, 30, 2          # 28-4-2 -> 36-4-2, in 2 blocks of 11 -> 15
+
+
+def _pinned(**kw):
+    kw.setdefault("pin_head", PIN_H)
+    kw.setdefault("pin_tail", PIN_T)
+    return LayerMixer(N_STUDENT, N_EXPERT, MID_BLOCKS, **kw)
+
+
+def test_pinned_geometry():
+    m = _pinned()
+    assert (m.g_in, m.g_out) == (MID_IN // MID_BLOCKS, MID_OUT // MID_BLOCKS) == (11, 15)
+    assert m.logit_k.shape == (MID_BLOCKS, 11, 15)
+    assert m.pin_head + m.n_blocks * m.g_in + m.pin_tail == N_STUDENT
+    assert m.pin_head + m.n_blocks * m.g_out + m.pin_tail == N_EXPERT
+
+
+def test_pinned_slots_are_bit_exact_passthrough():
+    """A pin must mean the cache layer reaches the expert UNALTERED."""
+    m = _pinned()
+    with torch.no_grad():                       # even with an arbitrary learned middle
+        m.logit_k.add_(torch.randn_like(m.logit_k) * 3.0)
+    x = _kv()
+    out = m.mix_stacked(x, "k")
+    torch.testing.assert_close(out[:, :PIN_H], x[:, :PIN_H])
+    torch.testing.assert_close(out[:, N_EXPERT - PIN_T:], x[:, N_STUDENT - PIN_T:])
+
+
+def test_gain_never_touches_pinned_slots():
+    m = _pinned(gain=True)
+    with torch.no_grad():
+        m.gain_k.fill_(7.0)                     # would be glaring if it leaked through
+    x = _kv()
+    out = m.mix_stacked(x, "k")
+    torch.testing.assert_close(out[:, :PIN_H], x[:, :PIN_H])
+    torch.testing.assert_close(out[:, N_EXPERT - PIN_T:], x[:, N_STUDENT - PIN_T:])
+    assert not torch.allclose(out[:, PIN_H], x[:, PIN_H]), "the middle SHOULD be scaled"
+
+
+def test_pinned_block_locality():
+    """Head slot j reads only student j; middle slots read only their own block."""
+    m = _pinned()
+    x = _kv(b=1, h=2, t=3, d=4).requires_grad_(True)
+    out = m.mix_stacked(x, "k")
+    for j in range(PIN_H):                                   # head is 1:1
+        x.grad = None
+        out[:, j].sum().backward(retain_graph=True)
+        assert {int(i) for i in (x.grad.abs().sum(dim=(0,2,3,4)) > 0).nonzero()} == {j}
+    for k in range(PIN_T):                                   # tail is 1:1
+        x.grad = None
+        out[:, N_EXPERT - 1 - k].sum().backward(retain_graph=True)
+        assert {int(i) for i in (x.grad.abs().sum(dim=(0,2,3,4)) > 0).nonzero()} == \
+               {N_STUDENT - 1 - k}
+    for b in range(MID_BLOCKS):                              # middle is block-local
+        j = PIN_H + b * m.g_out
+        x.grad = None
+        out[:, j].sum().backward(retain_graph=True)
+        lo = PIN_H + b * m.g_in
+        assert {int(i) for i in (x.grad.abs().sum(dim=(0,2,3,4)) > 0).nonzero()} == \
+               set(range(lo, lo + m.g_in))
+
+
+def test_pinned_still_commutes_with_rope():
+    m = _pinned()
+    with torch.no_grad():
+        m.logit_k.add_(torch.randn_like(m.logit_k) * 2.0)
+    b, h, t, d = 2, 8, 5, 8
+    k = _kv(b, h, t, d)
+    g = torch.Generator().manual_seed(11)
+    ang = torch.randn(b, t, d, generator=g); cos, sin = ang.cos(), ang.sin()
+    rot_then_mix = m.mix_stacked(
+        torch.stack([rotate_keys(k[:, i], cos, sin) for i in range(N_STUDENT)], 1), "k")
+    mixed = m.mix_stacked(k, "k")
+    mix_then_rot = torch.stack([rotate_keys(mixed[:, j], cos, sin) for j in range(N_EXPERT)], 1)
+    torch.testing.assert_close(rot_then_mix, mix_then_rot, rtol=1e-5, atol=1e-5)
+
+
+def test_pinned_paths_agree_and_carry_gradient():
+    m = _pinned()
+    with torch.no_grad():
+        m.logit_v.add_(torch.randn_like(m.logit_v))
+    k, v = _kv(seed=5), _kv(seed=6)
+    as_dict = m.mix_dict({i: (k[:, i], v[:, i]) for i in range(N_STUDENT)})
+    cache = DynamicCache()
+    for i in range(N_STUDENT):
+        cache.update(k[:, i], v[:, i], i, {})
+    as_cache = m.mix_cache(cache)
+    for j in range(N_EXPERT):
+        torch.testing.assert_close(as_dict[j][0], as_cache.layers[j].keys)
+        torch.testing.assert_close(as_dict[j][1], as_cache.layers[j].values)
+
+
+def test_unpinned_default_is_unchanged():
+    """The committed 4x(7->9) arms must keep loading: same shape, same values."""
+    m = LayerMixer(N_STUDENT, N_EXPERT, N_BLOCKS)
+    assert (m.pin_head, m.pin_tail) == (0, 0)
+    assert m.logit_k.shape == (N_BLOCKS, G_IN, G_OUT)
+    assert (m.g_in, m.g_out) == (G_IN, G_OUT)
+
+
+def test_pins_that_leave_nothing_to_mix_raise():
+    with pytest.raises(ValueError, match="nothing to mix"):
+        LayerMixer(N_STUDENT, N_EXPERT, 4, pin_head=26, pin_tail=1)
+    with pytest.raises(ValueError, match="pins must be >= 0"):
+        LayerMixer(N_STUDENT, N_EXPERT, 4, pin_head=-1)

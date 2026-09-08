@@ -36,7 +36,18 @@ set -euo pipefail
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
 OUT_DIR=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
-EOS_DIR="${EOS_DIR:-$OUT_DIR/output_eos_2b_nav_lcdrive}"
+# MIX=1 -> the LAYER-MIX student: its own output dir, its own eval config (the mixer geometry
+# has to match what the checkpoint's layer_mixer.* was saved from), and its own tag so the
+# per-clip JSON cannot collide with a pruned-student run.
+if [[ "${MIX:-0}" == "1" ]]; then
+    EOS_DIR="${EOS_DIR:-$OUT_DIR/output_eos_2b_mix_nav_lcdrive}"
+    EVAL_CONFIG="${EVAL_CONFIG:-sft_eval_eos_2b_mix_nav_lcdrive}"
+    TAG_BASE_DEFAULT=eos_2b_mix_nav
+else
+    EOS_DIR="${EOS_DIR:-$OUT_DIR/output_eos_2b_nav_lcdrive}"
+    EVAL_CONFIG="${EVAL_CONFIG:-sft_eval_eos_2b_nav_lcdrive}"
+    TAG_BASE_DEFAULT=eos_2b_nav
+fi
 TEACHER=/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 
 ARM="${ARM:-eos}"                       # eos | control
@@ -49,7 +60,7 @@ BS="${BS:-4}"
 # SAME checkpoint otherwise write the SAME per-clip JSON and the second silently overwrites
 # the first -- destroying exactly the paired comparison the run exists to produce.
 NFE="${NFE:-10}"
-TAG_BASE="${TAG_BASE:-eos_2b_nav}"
+TAG_BASE="${TAG_BASE:-$TAG_BASE_DEFAULT}"
 
 # ⚠️ REFUSE if the pin is set. The expert in the EOS checkpoint is ALREADY 28 layers, so
 # n_ckpt == n_have and the DEPTH REMAP must not run. A stray export from a stitched-eval
@@ -81,7 +92,11 @@ fi
 EXPERT_SRC="$CKPT"
 [[ "$ARM" == "control" ]] && EXPERT_SRC="$TEACHER"
 # ...and the control DOES need the remap, because the 10B expert is 36 layers deep.
-[[ "$ARM" == "control" ]] && export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+# ⚠️ EXCEPT under MIX=1, where the expert is kept at 36 and the cache is synthesised instead.
+# Pruning and mixing are alternatives; from_stitch raises if the pin is set with layer_mix on.
+if [[ "$ARM" == "control" && "${MIX:-0}" != "1" ]]; then
+    export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
+fi
 
 cd "$RECIPE_DIR"
 export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
@@ -102,7 +117,7 @@ nvidia-smi -L
 srun "$VENV/torchrun" --nproc_per_node 1 --master_port "$MASTER_PORT" \
     -m alpamayo1_5_sft.evaluate_hf \
     --config-path pkg://alpamayo1_5_distill/configs \
-    --config-name sft_eval_eos_2b_nav_lcdrive \
+    --config-name "$EVAL_CONFIG" \
     ++evaluate.eval_ckpt="$CKPT" \
     ++model.teacher_checkpoint_path="$EXPERT_SRC" \
     ++evaluate.max_eval_steps="$MAX_EVAL_STEPS" \
