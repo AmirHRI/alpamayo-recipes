@@ -1,0 +1,72 @@
+# Offline exact action rollouts from the released full Alpamayo-1.5 model, over ALL 110k
+# anchors. The all-data counterpart of cache_full_teacher_trajectories_2cam_nav_lcdrive.
+#
+# The cache builder uses the full 8B VLM and full 36-layer action expert with the
+# same two cameras, nav text, t0 anchors, prompt formatting, and 10-step Euler
+# sampler used by evaluation.  Per sample it stores K complete action-state paths:
+# [noise at s=0, state after step 1, ..., state after step 10 at s=1].
+#
+# WHY THIS EXISTS. The existing cache holds 49,992 keys and covers 100% of the 50k manifest
+# but only 45.4% of the 110k. Endpoint-CD reads it with `teacher_trajectory_cached_only:
+# false`, which does NOT fail on a miss -- an uncached anchor silently contributes no target
+# signal -- so training CD on the 110k against the 50k cache would quietly train ~55% of
+# samples against nothing. This config closes that gap.
+#
+# ⚠️ RESUMABLE AND ADDITIVE, not a rebuild. generate_teacher_trajectories skips any anchor
+# that already has an entry (`if not teacher_trajectory_io.has_entry(...)`), and each scene's
+# seed depends only on (clip, t0), so re-running over the superset recomputes nothing and
+# leaves the existing 49,992 entries byte-identical. Only the missing 59,997 are generated.
+# The 50k manifest is a strict SUBSET of the 110k -- verified, overlap is exactly 50,000.
+#
+# ⚠️ NO strip_nav_turn_distance, deliberately, even though the student that will consume
+# these targets was trained on stripped text. The existing 49,992 entries were generated from
+# UNSTRIPPED nav text, and a cache half-generated each way would be inhomogeneous in a way
+# nothing downstream could detect. Consistency within the artifact wins; the measured effect
+# of stripping on scores is negligible anyway (t=+0.20, n=79).
+#
+# ⚠️ /temp paths throughout. The sibling config points at /data/achahe and /data/datasets,
+# which is the OTHER cluster's layout -- nothing resolves there from this checkout.
+#
+# ⚠️ frame_cache_root, unlike the sibling: the teacher reads the same 8 images per anchor the
+# student does, and the cache holds exactly the 110k manifest's anchors for cameras [1,3].
+# Without it this job re-streams whole multi-GB chunk ZIPs from NFS for every clip.
+
+defaults:
+  - sft_base
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.stitched_model.StitchedAlpamayoR1.from_teacher
+  checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  teacher_checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  vlm_name_or_path: /temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+  attn_implementation: sdpa
+
+data:
+  cache_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    _recursive_: false
+    cameras: [1, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+    frame_cache_root: /temp/achahe/physical_ai_av/framecache_nav2cam_1080p
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: true
+
+paths:
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+
+task_name: alpamayo_1_5_full_teacher_action_rollout_cache

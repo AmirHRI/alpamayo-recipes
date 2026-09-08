@@ -48,6 +48,18 @@ SMOKE="${SMOKE:-0}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
 cd "$RECIPE_DIR"
+# Same guard slurm_train_kd.sh carries: sbatch inherits the submit shell's env, so a shell
+# that never sourced .env produces a run that loads the model and only THEN dies in
+# wandb.init with "No API key configured" (job 20721, ~6 min wasted per attempt). Read the
+# key from the repo .env when the submit env did not carry one; ~/.netrc remains the fallback.
+if [[ -z "${WANDB_API_KEY:-}" && -r /home/achahe/alpamayo-recipes/.env ]]; then
+    WANDB_API_KEY=$(sed -n 's/^[[:space:]]*WANDB_API_KEY[[:space:]]*=[[:space:]]*//p' \
+                    /home/achahe/alpamayo-recipes/.env | tail -1 | tr -d '"'\''[:space:]')
+    [[ -n "$WANDB_API_KEY" ]] && export WANDB_API_KEY
+fi
+[[ -n "${WANDB_API_KEY:-}" ]] \
+    && echo "[slurm] WANDB_API_KEY set (len ${#WANDB_API_KEY})" \
+    || echo "[slurm] WANDB_API_KEY not set; falling back to ~/.netrc for W&B auth."
 export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 MASTER_PORT=$((29880 + SLURM_JOB_ID % 20000))

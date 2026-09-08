@@ -15,14 +15,18 @@
 
 """Local interface for loading PAI data from a local directory."""
 
-import os
-import json
+import fcntl
 import io
+import json
+import os
 import pathlib
+import shutil
+import time
 import zipfile
-from typing import Any, Iterable
-import pandas as pd
+from typing import Any, BinaryIO, Iterable
+
 import numpy as np
+import pandas as pd
 
 from physical_ai_av import egomotion, video
 from physical_ai_av.dataset import Features
@@ -52,6 +56,8 @@ class PhysicalAIAVDatasetLocalInterface:
         start_safe_margin_seconds: float = 1.6,
         end_safe_margin_seconds: float = 6.4,
         reasoning_metadata: str | None = None,
+        zip_cache_dir: str | pathlib.Path | None = None,
+        zip_cache_max_gb: float = 0,
     ) -> None:
         """Initialize the local PAI dataset interface.
 
@@ -77,6 +83,20 @@ class PhysicalAIAVDatasetLocalInterface:
             logger.info("Loading all chunks")
 
         logger.info(f"Loading from {local_dir} with chunk_ids: {self.chunk_ids}")
+
+        self.zip_cache_dir = (
+            None if zip_cache_dir is None else os.path.abspath(os.fspath(zip_cache_dir))
+        )
+        self._zip_cache_max_bytes = int(float(zip_cache_max_gb) * 1024**3)
+        if self.zip_cache_dir is not None:
+            if self._zip_cache_max_bytes <= 0:
+                raise ValueError("zip_cache_max_gb must be positive when zip_cache_dir is set")
+            os.makedirs(self.zip_cache_dir, exist_ok=True)
+            logger.info(
+                "Using shared ZIP cache %s (max %.1f GiB)",
+                self.zip_cache_dir,
+                self._zip_cache_max_bytes / 1024**3,
+            )
 
         self.start_safe_margin_seconds = start_safe_margin_seconds
         self.end_safe_margin_seconds = end_safe_margin_seconds
@@ -244,6 +264,120 @@ class PhysicalAIAVDatasetLocalInterface:
         else:
             return None
 
+    def _zip_cache_path(self, source_path: str) -> str:
+        """Map one immutable dataset ZIP to a collision-free cache path."""
+        relative = os.path.relpath(source_path, os.fspath(self.local_dir))
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            raise ValueError(f"ZIP path is outside dataset root: {source_path}")
+        assert self.zip_cache_dir is not None
+        return os.path.join(self.zip_cache_dir, relative)
+
+    def _evict_zip_cache(self, keep_path: str) -> None:
+        """Bound the node-shared cache, safely unlinking files already open by readers."""
+        assert self.zip_cache_dir is not None
+        eviction_lock_path = os.path.join(self.zip_cache_dir, ".eviction.lock")
+        with open(eviction_lock_path, "a+b") as eviction_lock:
+            fcntl.flock(eviction_lock.fileno(), fcntl.LOCK_EX)
+            cached: list[tuple[int, int, str]] = []
+            total_bytes = 0
+            for root, _dirs, filenames in os.walk(self.zip_cache_dir):
+                for filename in filenames:
+                    if filename.endswith(".lock") or ".partial." in filename:
+                        continue
+                    path = os.path.join(root, filename)
+                    try:
+                        stat = os.stat(path)
+                    except FileNotFoundError:
+                        continue
+                    if not os.path.isfile(path):
+                        continue
+                    total_bytes += stat.st_size
+                    cached.append((stat.st_mtime_ns, stat.st_size, path))
+
+            if total_bytes <= self._zip_cache_max_bytes:
+                return
+            for _last_used, size, path in sorted(cached):
+                if total_bytes <= self._zip_cache_max_bytes:
+                    break
+                if os.path.abspath(path) == os.path.abspath(keep_path):
+                    continue
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    continue
+                total_bytes -= size
+
+    def _open_chunk_file(self, source_path: str) -> BinaryIO:
+        """Open a chunk, copying ZIPs once to a bounded rank/worker-shared cache.
+
+        A per-file lock guarantees that the 16 training workers do not copy the same
+        multi-GB shard concurrently. The returned descriptor is opened before eviction can
+        unlink the path, so an in-flight reader remains valid under normal Unix semantics.
+        Non-ZIP features continue to use the source filesystem directly.
+        """
+        if self.zip_cache_dir is None or not source_path.endswith(".zip"):
+            return open(source_path, "rb")
+
+        cache_path = self._zip_cache_path(source_path)
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        lock_path = cache_path + ".lock"
+        copied = False
+        with open(lock_path, "a+b") as cache_lock:
+            fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
+            source_size = os.path.getsize(source_path)
+            try:
+                cache_valid = os.path.getsize(cache_path) == source_size
+            except FileNotFoundError:
+                cache_valid = False
+
+            if not cache_valid:
+                partial_path = "{}.partial.{}".format(cache_path, os.getpid())
+                try:
+                    copy_started = time.monotonic()
+                    logger.info(
+                        "[zip-cache] copying %.2f GiB: %s",
+                        source_size / 1024**3,
+                        source_path,
+                    )
+                    shutil.copyfile(source_path, partial_path)
+                    copied_size = os.path.getsize(partial_path)
+                    if copied_size != source_size:
+                        raise OSError(
+                            f"incomplete ZIP cache copy for {source_path}: "
+                            f"expected {source_size} bytes, got {copied_size}"
+                        )
+                    os.replace(partial_path, cache_path)
+                    copied = True
+                    # The durable copy is now in tmpfs; retaining the NFS source pages would
+                    # double the cache footprint inside Slurm's memory cgroup.
+                    if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                        try:
+                            with open(source_path, "rb") as source_file:
+                                os.posix_fadvise(
+                                    source_file.fileno(), 0, 0, os.POSIX_FADV_DONTNEED
+                                )
+                        except OSError:
+                            pass
+                    logger.info(
+                        "[zip-cache] ready in %.2fs: %s",
+                        time.monotonic() - copy_started,
+                        source_path,
+                    )
+                finally:
+                    try:
+                        os.unlink(partial_path)
+                    except FileNotFoundError:
+                        pass
+
+            # Open while holding the per-file lock. Eviction may unlink this pathname after
+            # the lock is released, but this descriptor will continue to reference the data.
+            cached_file = open(cache_path, "rb")
+            os.utime(cache_path, None)
+
+        if copied:
+            self._evict_zip_cache(keep_path=cache_path)
+        return cached_file
+
     def get_clip_feature(self, clip_id: str, feature: str, maybe_stream: bool = False) -> Any:
         """Load a feature for ``clip_id`` from the on-disk parquet/zip chunk file.
 
@@ -260,7 +394,7 @@ class PhysicalAIAVDatasetLocalInterface:
             self.get_clip_chunk(clip_id), feature
         )
         chunk_filename = os.path.join(self.local_dir, chunk_filename)
-        with open(chunk_filename, "rb") as f:
+        with self._open_chunk_file(chunk_filename) as f:
             if chunk_filename.endswith(".parquet"):
                 return pd.read_parquet(f).loc[clip_id]
             elif chunk_filename.endswith(".zip"):

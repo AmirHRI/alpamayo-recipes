@@ -1,16 +1,17 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_kd_train
 #SBATCH --partition=gpu
+#SBATCH --nodelist=amhrisvh200b
 #SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.out
 #SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/kdtrain_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus=2
-#SBATCH --cpus-per-task=16
-# 120G: host RAM is only for the frame-decoding dataloader workers (the models live on
-# the GPUs). Asking 160G left the KAVA job PENDING on (Resources) when co-tenants held
-# 368G of the node's 503 GiB — a memory limit, not a GPU one.
-#SBATCH --mem=120G
+#SBATCH --gpus=4
+#SBATCH --cpus-per-task=96
+# Host RAM covers parallel decoding, prefetch, and the production arm's 96 GiB ZIP cache.
+# The model weights stay on GPUs; 640G leaves reclaim headroom after every 320G run saturated
+# its Slurm memory cgroup (see nav4bspan2camall below).
+#SBATCH --mem=640G
 #SBATCH --time=48:00:00
 #SBATCH --mail-type=END
 #SBATCH --mail-user=amirhosein_chahe@honda-ri.com
@@ -28,6 +29,9 @@
 #   ARM=nav2bmix sbatch slurm_train_kd.sh   # 2B, nav-conditioned, block(m=1) + span(m=7)
 #   ARM=nav4bmix sbatch slurm_train_kd.sh   # 4B, same objective, span m=9 (36-layer expert)
 #   ARM=nav4bmix2cam sbatch slurm_train_kd.sh # 4B, span m=9, TWO front cameras
+#   bash slurm_train_kd.sh                    # print requested sample; does NOT train
+#   APPROVED=1 sbatch slurm_train_kd.sh       # 4B, 2cam, all-data, m=1/9/18/36
+#
 #   SMOKE=1 ARM=kv sbatch slurm_train_kd.sh
 #   RESUME=<ckpt> EPOCHS=3 ARM=kvonly sbatch slurm_train_kd.sh   # continue for more epochs
 #
@@ -53,7 +57,7 @@ set -euo pipefail
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
 OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
-GPUS="${GPUS:-2}"
+GPUS="${GPUS:-4}"
 # PIN_GPUS=1,2 -> run on those PHYSICAL devices while still under slurm.
 # ⚠️ Needs `--gpus=4` on the sbatch line (or `sbatch --gpus=4`): slurm sets
 # CUDA_VISIBLE_DEVICES to the devices it allocated, so pinning to a global index is only
@@ -91,11 +95,13 @@ if [[ -n "${PIN_GPUS:-}" ]]; then
     echo "[slurm] PIN_GPUS=$PIN_GPUS -> CUDA_VISIBLE_DEVICES=$PIN_GPUS, nproc=$GPUS, no srun"
 fi
 SMOKE="${SMOKE:-0}"
-ARM="${ARM:-kv}"
+ARM="${ARM:-nav4bspan2camall}"
 MODEL_TAG=4b          # overridden per-arm below; part of output_dir and run_name
 BS="${BS:-}"              # per-device batch; ZeRO-2 shards only ACROSS ranks, so bs>1 needs >=2
-ACCUM="${ACCUM:-}"        # effective batch = GPUS x BS x ACCUM; the config ships 2 x 1 x 12 = 24
+ACCUM="${ACCUM:-}"        # effective batch = GPUS x per-device BS x ACCUM
 WARMUP="${WARMUP:-}"
+AUTO_RESUME_LATEST="${AUTO_RESUME_LATEST:-}"
+MAX_RESTARTS="${MAX_RESTARTS:-}"
 # Continue a finished run for more epochs, preserving Adam moments and the dataloader
 # position. RESUME is a checkpoint-* dir; EPOCHS is the TOTAL including epochs already
 # trained (so a 1-epoch run continued by 2 needs EPOCHS=3).
@@ -103,6 +109,18 @@ RESUME="${RESUME:-}"
 EPOCHS="${EPOCHS:-}"
 
 cd "$RECIPE_DIR"
+# sbatch inherits the submit shell's env, so a shell that never sourced .env produced a run
+# that loaded both models, then died in wandb.init with "No API key configured" -- and each
+# of the 3 restarts repeated the ~6 min load before failing the same way. Read the key from
+# the repo .env when the submit env did not carry one; ~/.netrc still works as the fallback.
+if [[ -z "${WANDB_API_KEY:-}" && -r /home/achahe/alpamayo-recipes/.env ]]; then
+    WANDB_API_KEY=$(sed -n 's/^[[:space:]]*WANDB_API_KEY[[:space:]]*=[[:space:]]*//p' \
+                    /home/achahe/alpamayo-recipes/.env | tail -1 | tr -d '"'\''[:space:]')
+    [[ -n "$WANDB_API_KEY" ]] && export WANDB_API_KEY
+fi
+[[ -n "${WANDB_API_KEY:-}" ]] \
+    && echo "[slurm] WANDB_API_KEY set (len ${#WANDB_API_KEY})" \
+    || echo "[slurm] WANDB_API_KEY not set; falling back to ~/.netrc for W&B auth."
 export PYTHONPATH=/home/achahe/alpamayo-recipes/recipes
 # ⚠️ the venv's bin on PATH: DeepSpeed's CPUAdam is built by torch.utils.cpp_extension,
 # which shells out to the `ninja` BINARY. Installing the python package is not enough --
@@ -115,9 +133,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Off by design, not by oversight — see the header. A nonzero value costs a crash at
 # step 0 (best case) or gradients silently double-reduced into the step (worst case).
 export KAVA_GRAD_PROBE_STEPS=0
-MASTER_PORT=$((29560 + SLURM_JOB_ID % 20000))
 
 EXTRA=()
+REQUIRE_APPROVAL=0
+PREFLIGHT_MANIFEST=""
+ZIP_CACHE_GB=0
 case "$ARM" in
     ce)
         # ⚠️ teacher_checkpoint_path=null, not "weights at 0". Zeroing the weights would
@@ -209,6 +229,122 @@ case "$ARM" in
                 ++model.kd.block_span_mix="${MIXM:-9}"
                 ++model.kd.block_span_mix_weight="${MIXW:-1.0}")
         ARM="${ARM}_m${MIXM:-9}w${MIXW:-1.0}" ;;
+    nav4bspan2camall)
+        # Requested production run: Qwen3-VL-4B, front-wide + front-telephoto, every anchor,
+        # direction-only route text, and one span objective per epoch. This is ONE four-epoch
+        # Trainer run so Adam and the cosine LR schedule remain continuous across stage changes.
+        # Random t is one Beta-schedule draw per sample; the loss evaluates one noisy state,
+        # never a multi-step denoising rollout. The VLM prompt uses inference/generation mode:
+        # it ends at <traj_future_start> and never contains ground-truth future tokens. The raw
+        # future trajectory remains in the batch only to construct the noisy denoising state.
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_2cam_nav_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        ZIP_CACHE_GB=96
+        [[ -n "$BS" ]] || BS=8        # proven by completed H200 job 20600 on this exact stack
+        [[ -n "$ACCUM" ]] || ACCUM=1 # global/effective batch = 4 x 8 = 32
+        [[ -n "$WARMUP" ]] || WARMUP=733  # 21.3% of 3438 steps/epoch for 109,997 rows
+        # /temp is NFS. Job 20687 used 8 workers/rank with prefetch_factor=4: 128 batches
+        # were eligible to be fetched concurrently and 7-8 workers/rank sat in D-state.
+        # Reducing job 20688 to 4x2 removed that NFS storm, but ordered delivery exposed one
+        # slow worker every fourth step: three ~3 s iterations followed by a 33-42 s stall.
+        # Grouping chunk -> clip -> anchor lets one worker copy each immutable ZIP sequentially
+        # into the job-scoped RAM cache; every rank then decodes its anchors locally. Per-file
+        # locks prevent the 16 workers from duplicating a cache miss, while a 96 GiB LRU bound
+        # keeps enough prefetched chunks hot without filling /dev/shm. Four workers/rank remains
+        # the measured non-thrashing point; the cache removes NFS reads from their hot path.
+        [[ -n "${WORKERS:-}" ]] || WORKERS=4
+        export KAVA_DATALOADER_IN_ORDER=0
+        # A transient NFS read wedged one rank in jobs 20700 and 20706. Fail the empty
+        # DataLoader queue after two minutes, then let the bounded launcher loop restore the
+        # newest complete checkpoint. Neither setting changes the successful-batch hot path.
+        export KAVA_DATALOADER_TIMEOUT_SECONDS="${KAVA_DATALOADER_TIMEOUT_SECONDS:-120}"
+        export KAVA_IO_GROUPED_SAMPLER=1
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=0
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                # Eight evenly spaced saves over four epochs: one at each midpoint and one
+                # at each epoch boundary. A ratio keeps this cadence correct if batch size
+                # changes; for the default 13,752-step run it resolves to every 1,719 steps.
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=2
+                ++trainer.dataloader_persistent_workers=true)
+        # The I/O policy is part of the run identity. Cancelled jobs 20687/20688 left W&B
+        # state in the older directories; a new namespace guarantees a clean run at step 0.
+        ARM="${ARM}_m1-9-18-36_io4x2ooo_locality_ramcache96" ;;
+    nav4bspan2camallfc)
+        # nav4bspan2camall again, reading the PRE-MATERIALISED frame cache instead of the
+        # dataset ZIPs. Same student, cameras, manifest, objective, batch and schedule -- ONLY
+        # where the pixels come from changes, which is what keeps the two comparable.
+        #
+        # WHY. Job 20710 measured the live loader at 1.64 TiB of NFS per EPOCH to deliver
+        # 879,976 images: whole 1.2 GiB chunk ZIPs for the ~49% of clips the manifest wants,
+        # whole 604-frame clips for the ~27 frames it uses, at 1920x1080 for a ViT that sees
+        # 576x320. /temp gives ~120 MB/s (already nconnect=8), so that IS ~4 h/epoch of wire
+        # time -- a 3.0 s median step against a 2.0 s GPU floor, and three crashes when a 1 GiB
+        # copy outran the 120 s dataloader timeout. scripts/build_frame_cache.py wrote those
+        # 879,976 images once (~84 GiB, x264 crf18); a step now reads ~2.7 MB.
+        # tests/test_frame_cache_equivalence.py holds the substitution honest: prompt text and
+        # image_grid_thw identical to the live loader, ego tensors identical, pixels within
+        # 0.011 mean |delta| of the source after the processor's downscale.
+        #
+        # So everything the old arm needed to SURVIVE NFS is gone, not retuned: no ZIP cache,
+        # no locality sampler, no out-of-order delivery, no dataloader timeout. Shuffling is
+        # free now, and mixes batches strictly better than chunk-grouped sampling did.
+        #
+        # Deliberately NOT staged into /dev/shm: at ~84 GiB the page cache holds the whole
+        # working set inside the 640 GiB cgroup, reclaimably, and warms itself during epoch 1.
+        # Staging would spend the same bytes on UNRECLAIMABLE tmpfs -- the accounting that made
+        # the old arm fragile in the first place.
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_2cam_nav_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav2cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            echo "        Then:      build_frame_cache.py --out $FRAME_CACHE --finalize" >&2
+            exit 1; }
+        [[ -n "$BS" ]] || BS=8          # unchanged from nav4bspan2camall, so steps line up
+        [[ -n "$ACCUM" ]] || ACCUM=1    # global/effective batch = 4 x 8 = 32
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        # Decoding two 4-frame mini-clips is far cheaper than seeking 1080p video inside a
+        # multi-GB ZIP, and there is no NFS storm left to provoke, so workers are cheap.
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=0
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                # Every 500 steps, not the old 0.125 ratio (1,719). Each crash on the old arm
+                # rolled back 1,116 steps; with saves this cheap a restart costs minutes.
+                ++trainer.save_strategy=steps ++trainer.save_steps=500
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36_framecache1080p" ;;
     field2b)
         # L_FIELD ALONE on the 2B/pruned-expert 2-camera stack: chain all 28 layers on the
         # STUDENT's own cache (no teacher forcing anywhere), take expert.norm +
@@ -384,8 +520,43 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam|nav4bspan2camall|nav4bspan2camallfc)" >&2; exit 1 ;;
 esac
+
+# The requested run has a deliberate human gate. Running this file directly prints a real turn
+# from the manifest after normalization and exits before touching CUDA. Submit only after the
+# user has approved that exact model-visible route component.
+if [[ "$REQUIRE_APPROVAL" == "1" ]]; then
+    "$VENV/python" -m alpamayo1_5_distill.scripts.preview_nav_instruction "$PREFLIGHT_MANIFEST"
+    if [[ "${APPROVED:-0}" != "1" ]]; then
+        echo "[preflight] NOT STARTING TRAINING. After approval: APPROVED=1 sbatch $0"
+        exit 0
+    fi
+fi
+[[ -n "${SLURM_JOB_ID:-}" ]] || {
+    echo "[slurm] training must be launched with sbatch" >&2
+    exit 1
+}
+MASTER_PORT=$((29560 + SLURM_JOB_ID % 20000))
+
+ZIP_CACHE_DIR=""
+if [[ "$ZIP_CACHE_GB" != "0" ]]; then
+    ZIP_CACHE_DIR="/dev/shm/alpamayo-kd-${SLURM_JOB_ID}"
+    mkdir -p "$ZIP_CACHE_DIR"
+    cleanup_zip_cache() {
+        # Only remove the job-scoped path constructed immediately above.
+        if [[ "${ZIP_CACHE_DIR:-}" == "/dev/shm/alpamayo-kd-${SLURM_JOB_ID}" ]]; then
+            rm -rf -- "$ZIP_CACHE_DIR"
+        else
+            echo "[cache] refusing to remove unexpected path: ${ZIP_CACHE_DIR:-<unset>}" >&2
+        fi
+    }
+    trap cleanup_zip_cache EXIT
+    EXTRA+=(++data.train_dataset.zip_cache_dir="$ZIP_CACHE_DIR"
+            ++data.train_dataset.zip_cache_max_gb="$ZIP_CACHE_GB")
+    echo "[cache] shared ZIP cache=$ZIP_CACHE_DIR max=${ZIP_CACHE_GB}GiB"
+fi
+
 # INIT=<ckpt>: start from an existing student instead of the base VLM. Distinct from
 # RESUME, which also restores optimizer + scheduler state; INIT takes the WEIGHTS only,
 # so a new objective gets a fresh schedule with warmup rather than a decayed LR.
@@ -413,20 +584,22 @@ fi
 # ⚠️ MODEL_TAG, not a hard-coded 4b: block2b trains the 2B student, and naming its output
 # output_kd_4b_* would file it with the 4B arms it must never be compared against directly
 # (different student, different expert depth).
-EXTRA+=(paths.output_dir="$OUT_DIR/output_kd_${MODEL_TAG}_${RUN_TAG}_lcdrive"
-        "run_name=kd_${MODEL_TAG}_${RUN_TAG}_$(date +%m%d-%H%M)")
-echo "[slurm] ARM=$ARM -> $OUT_DIR/output_kd_${MODEL_TAG}_${RUN_TAG}_lcdrive"
-
 if [[ "$SMOKE" == "1" ]]; then
     # Short, self-contained proof the path runs: teacher loads, sequences match, and all
     # three terms are finite AND falling. A term that is finite but flat is the failure
     # this recipe has to catch.
+    RUN_TAG="${RUN_TAG}_smoke"
     EXTRA+=(++trainer.max_steps=20 ++trainer.logging_steps=2
             ++trainer.save_strategy=no ++trainer.eval_strategy=no
             ++trainer.warmup_steps=0 ++trainer.gradient_accumulation_steps=1
             ++data.train_dataset.chunk_ids="0-120" ++data.val_dataset.chunk_ids="0-120")
     echo "[slurm] SMOKE mode: 20 steps"
 fi
+
+RUN_OUTPUT_DIR="$OUT_DIR/output_kd_${MODEL_TAG}_${RUN_TAG}_lcdrive"
+EXTRA+=(paths.output_dir="$RUN_OUTPUT_DIR"
+        "run_name=kd_${MODEL_TAG}_${RUN_TAG}_$(date +%m%d-%H%M)")
+echo "[slurm] ARM=$ARM -> $OUT_DIR/output_kd_${MODEL_TAG}_${RUN_TAG}_lcdrive"
 
 [[ -n "$BS"     ]] && EXTRA+=(trainer.per_device_train_batch_size="$BS")
 [[ -n "$ACCUM"  ]] && EXTRA+=(trainer.gradient_accumulation_steps="$ACCUM")
@@ -453,10 +626,67 @@ for i in range(torch.cuda.device_count()):
 " 2>/dev/null || true
 nvidia-smi -L | sed 's/^/[slurm] /' 
 
-"${LAUNCH[@]}" "$VENV/torchrun" \
-    --nproc_per_node "$GPUS" \
-    --master_port "$MASTER_PORT" \
-    -m alpamayo1_5_distill.train_kd \
-    --config-path pkg://alpamayo1_5_distill/configs \
-    --config-name "${CONFIG_NAME:-sft_kd_qwen3_4b_lcdrive}" \
-    "${EXTRA[@]}"
+latest_complete_checkpoint() {
+    local checkpoint name step
+    local latest=""
+    local latest_step=-1
+
+    shopt -s nullglob
+    for checkpoint in "$RUN_OUTPUT_DIR"/checkpoint-*; do
+        [[ -d "$checkpoint" ]] || continue
+        name="${checkpoint##*/}"
+        step="${name#checkpoint-}"
+        [[ "$step" =~ ^[0-9]+$ ]] || continue
+        [[ -f "$checkpoint/trainer_state.json" ]] || continue
+        [[ -d "$checkpoint/global_step${step}" ]] || continue
+        if (( step > latest_step )); then
+            latest="$checkpoint"
+            latest_step=$step
+        fi
+    done
+    shopt -u nullglob
+    printf '%s\n' "$latest"
+}
+
+run_training() {
+    local resume_checkpoint="$1"
+    local -a run_extra=("${EXTRA[@]}")
+    if [[ -n "$resume_checkpoint" ]]; then
+        run_extra+=(++trainer.resume_from_checkpoint="$resume_checkpoint")
+        echo "[restart] resuming latest complete checkpoint: $resume_checkpoint"
+    elif [[ "$AUTO_RESUME_LATEST" == "1" ]]; then
+        echo "[restart] no complete checkpoint found; starting from configured initialization"
+    fi
+    "${LAUNCH[@]}" "$VENV/torchrun" \
+        --nproc_per_node "$GPUS" \
+        --master_port "$MASTER_PORT" \
+        -m alpamayo1_5_distill.train_kd \
+        --config-path pkg://alpamayo1_5_distill/configs \
+        --config-name "${CONFIG_NAME:-sft_kd_qwen3_4b_lcdrive}" \
+        "${run_extra[@]}"
+}
+
+AUTO_RESUME_LATEST="${AUTO_RESUME_LATEST:-0}"
+MAX_RESTARTS="${MAX_RESTARTS:-0}"
+[[ "$AUTO_RESUME_LATEST" == "0" || "$AUTO_RESUME_LATEST" == "1" ]] || { echo "[restart] AUTO_RESUME_LATEST must be 0 or 1" >&2; exit 2; }
+[[ "$MAX_RESTARTS" =~ ^[0-9]+$ ]] || { echo "[restart] MAX_RESTARTS must be a non-negative integer" >&2; exit 2; }
+
+restart_count=0
+while true; do
+    resume_checkpoint=""
+    if [[ "$AUTO_RESUME_LATEST" == "1" ]]; then
+        resume_checkpoint="$(latest_complete_checkpoint)"
+    fi
+    if run_training "$resume_checkpoint"; then
+        exit 0
+    else
+        status=$?
+    fi
+    if (( restart_count >= MAX_RESTARTS )); then
+        echo "[restart] training failed with status $status; retry budget exhausted" >&2
+        exit "$status"
+    fi
+    restart_count=$((restart_count + 1))
+    echo "[restart] training failed with status $status; restarting $restart_count/$MAX_RESTARTS in 5s" >&2
+    sleep 5
+done

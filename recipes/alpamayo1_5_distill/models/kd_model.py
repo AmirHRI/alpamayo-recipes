@@ -659,7 +659,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 if type(m).__name__ != "_SkippedExpertLayer"]
         return None if len(surv) == len(layers) else surv
 
-    def _block_loss(self, student_kv, teacher_kv, rope, traj_mask, attn_mask,
+    def _block_loss(self, student_kv, teacher_kv, rope, traj_future_start_mask, attn_mask,
                     rope_deltas, traj_data=None):
         """L_block = mean_l [ || B_l(h_l^T; K_s,V_s) - sg B_l(h_l^T; K_t,V_t) ||^2 + (1 - cos angle) ].
 
@@ -684,7 +684,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
         device, dtype = teacher_kv[0][0].device, teacher_kv[0][0].dtype
         n_act = expert.n_action_tokens
         conditioning = build_expert_conditioning(
-            traj_future_start_mask=traj_mask,
+            traj_future_start_mask=traj_future_start_mask,
             tokenizer_attention_mask=attn_mask,
             rope_deltas=rope_deltas,
             n_action_tokens=n_act,
@@ -1668,6 +1668,12 @@ class KDReasoningVLA(TrainableReasoningVLA):
         }
         input_ids = self.fuse_traj_tokens(input_ids, traj_data)
 
+        # The action expert consumes the VLM prefix through the exact handoff token. Keep this
+        # boundary independent of labels_mask and of the broader trajectory-region mask below:
+        # history and future coordinates share the same discretized vocabulary, so using a
+        # generic "trajectory token" mask can select history when labels are unavailable.
+        traj_future_start_mask = input_ids == self.special_token_ids["traj_future_start"]
+
         labels = input_ids.clone()
         if labels_mask is not None:
             labels = torch.where(labels_mask, labels, IGNORE_INDEX)
@@ -1833,7 +1839,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                             }
                             for nm, tk in cands.items():
                                 lo, *_ = self._block_loss(
-                                    s_kv, tk, rope, traj_mask,
+                                    s_kv, tk, rope, traj_future_start_mask,
                                     tokenized_data.get("attention_mask"),
                                     student_rope_deltas, None,
                                 )
@@ -1854,7 +1860,7 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 with _Phase.t("block+field"):
                     (block_loss, block_loss_mse, block_loss_cosine,
                      fr_loss, field_loss, roll_loss) = self._block_loss(
-                        s_kv, t_kv_b, rope, traj_mask,
+                        s_kv, t_kv_b, rope, traj_future_start_mask,
                         tokenized_data.get("attention_mask"), student_rope_deltas, _traj)
                 if self.block_weight > 0:
                     total_loss = total_loss + self.block_weight * block_loss

@@ -43,6 +43,9 @@ class PAIDataset(Dataset):
         time_step: float = 0.1,
         reasoning_metadata: str | None = None,
         clip_uuid_filter: str | None = None,
+        camera_features: list[str] | None = None,
+        zip_cache_dir: str | None = None,
+        zip_cache_max_gb: float = 0,
     ):
         """Initialize dataset.
 
@@ -65,6 +68,9 @@ class PAIDataset(Dataset):
             num_history_steps: History length for ``load_physical_aiavdataset``.
             num_future_steps: Future horizon for ``load_physical_aiavdataset``.
             time_step: Seconds per step between trajectory samples.
+            camera_features: Optional camera feature names to read. ``None`` preserves the
+                loader's four-camera default. Supplying a subset avoids reading and decoding
+                camera ZIP entries that a downstream model will discard.
             reasoning_metadata: Filename under ``local_dir`` for the reasoning parquet, in PAI
                 dataset it is "reasoning/ood_reasoning.parquet". If None, no reasoning data will be loaded.
             clip_uuid_filter: Optional path to a text file with one clip UUID per line (e.g. an
@@ -72,6 +78,10 @@ class PAIDataset(Dataset):
                 restricted to the intersection of the chunk-selected clips and these UUIDs. This
                 enables training/validating on the exact official LCDrive split while still only
                 scanning the ``chunk_ids`` that are present on disk.
+            zip_cache_dir: Optional node-local directory used to cache immutable feature ZIPs.
+                Workers and distributed ranks safely share the same directory.
+            zip_cache_max_gb: Maximum total size of cached ZIPs. Must be positive when
+                ``zip_cache_dir`` is configured.
         """
         self.avdi = PhysicalAIAVDatasetLocalInterface(
             local_dir=local_dir,
@@ -79,6 +89,8 @@ class PAIDataset(Dataset):
             features_metadata=features_metadata,
             clip_index_metadata=clip_index_metadata,
             reasoning_metadata=reasoning_metadata,
+            zip_cache_dir=zip_cache_dir,
+            zip_cache_max_gb=zip_cache_max_gb,
         )
         self.clip_ids = self.avdi.get_all_clip_ids()
         if clip_uuid_filter is not None:
@@ -98,6 +110,7 @@ class PAIDataset(Dataset):
         self.num_history_steps = num_history_steps
         self.num_future_steps = num_future_steps
         self.time_step = time_step
+        self.camera_features = camera_features
 
         self.vla_preprocess_func = None
         if model_config is not None and isinstance(model_config, dict):
@@ -129,6 +142,7 @@ class PAIDataset(Dataset):
             num_history_steps=self.num_history_steps,
             num_future_steps=self.num_future_steps,
             time_step=self.time_step,
+            camera_features=self.camera_features,
         )
 
         # squeeze ego motion shape

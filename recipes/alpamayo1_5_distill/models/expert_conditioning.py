@@ -53,7 +53,11 @@ def build_expert_conditioning(
 
     batch, sequence_len = start_mask.shape
     # The prompt cache includes <traj_future_start>, hence +1.
-    offsets = start_mask.int().argmax(dim=1) + 1
+    # Match deployment's "last <traj_future_start>" crop semantics. There is normally one
+    # handoff per row, but choosing the last occurrence makes a malformed/repeated prompt fail
+    # safe in the same direction as inference instead of exposing an earlier suffix as cache.
+    token_columns = torch.arange(sequence_len, device=start_mask.device).unsqueeze(0)
+    offsets = torch.where(start_mask, token_columns, -1).amax(dim=1) + 1
     required_len = int(offsets.max().item())
     prefix_len = required_len if cache_len is None else int(cache_len)
     if prefix_len < required_len or prefix_len > sequence_len:

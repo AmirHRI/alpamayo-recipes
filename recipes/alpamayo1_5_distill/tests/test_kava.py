@@ -27,6 +27,8 @@ Run::
         ../alpamayo1_5_sft/.venv/bin/python -m pytest tests/test_kava.py -q
 """
 
+from types import SimpleNamespace
+
 import torch
 
 from alpamayo1_5_distill.data import kv_cache_io
@@ -877,6 +879,107 @@ def test_gradient_shares_are_logged_verbatim_not_averaged() -> None:
     KaVaTrainer.log(tr, {})
     assert captured["ce_loss"] == 2.0            # summed value IS averaged
     assert captured["gradshare_kv"] == 0.21      # ratio is NOT
+
+
+def test_training_dataloader_can_deliver_ready_workers_out_of_order(monkeypatch) -> None:
+    """The NFS speed path must actually pass ``in_order=False`` to PyTorch.
+
+    This uses a constructed trainer rather than initializing Accelerate/DeepSpeed; no worker
+    is started until a DataLoader is iterated, so the test stays process- and GPU-free.
+    """
+    import types
+
+    from alpamayo1_5_distill.trainer import KaVaTrainer
+
+    trainer = KaVaTrainer.__new__(KaVaTrainer)
+    trainer.args = types.SimpleNamespace(
+        dataloader_num_workers=1,
+        dataloader_pin_memory=True,
+        dataloader_persistent_workers=False,
+        dataloader_drop_last=False,
+        dataloader_prefetch_factor=2,
+        process_index=1,  # suppress the rank-zero informational print in this unit test
+    )
+    trainer.data_collator = lambda rows: rows
+    trainer._get_collator_with_removed_columns = lambda collator, description: collator
+    trainer.accelerator = types.SimpleNamespace(prepare=lambda loader: loader)
+
+    monkeypatch.setenv("KAVA_DATALOADER_IN_ORDER", "0")
+    monkeypatch.setenv("KAVA_DATALOADER_TIMEOUT_SECONDS", "37")
+    loader = KaVaTrainer._get_dataloader(
+        trainer,
+        torch.utils.data.TensorDataset(torch.arange(4)),
+        description="unit-test train",
+        batch_size=2,
+        is_training=True,
+    )
+    assert loader.in_order is False
+    assert loader.num_workers == 1
+    assert loader.prefetch_factor == 2
+    assert loader.timeout == 37
+
+
+def test_locality_sampler_covers_once_and_reshuffles_by_epoch() -> None:
+    from alpamayo1_5_distill.trainer import LocalityGroupedSampler
+
+    class Dataset:
+        # Two chunks, with repeated anchors for clips a/c.
+        keys = [(4, "a"), (7, "c"), (4, "a"), (4, "b"), (7, "c"), (7, "d")]
+
+        def __len__(self):
+            return len(self.keys)
+
+        def io_locality_keys(self):
+            return self.keys
+
+    dataset = Dataset()
+    sampler = LocalityGroupedSampler(dataset, seed=19)
+    epoch0 = list(sampler)
+    assert sorted(epoch0) == list(range(len(dataset)))
+    assert epoch0 == list(LocalityGroupedSampler(dataset, seed=19))
+
+    # A chunk occupies one contiguous interval, and each clip is contiguous inside it.
+    for key_position in (0, 1):
+        labels = [dataset.keys[i][key_position] for i in epoch0]
+        for label in set(labels):
+            positions = [i for i, value in enumerate(labels) if value == label]
+            assert positions == list(range(min(positions), max(positions) + 1))
+
+    sampler.set_epoch(1)
+    epoch1 = list(sampler)
+    assert sorted(epoch1) == list(range(len(dataset)))
+    assert epoch1 != epoch0
+
+
+def test_pai_passes_camera_subset_to_physical_reader(monkeypatch) -> None:
+    import alpamayo.data.pai as pai_module
+
+    captured = {}
+
+    def fake_loader(clip_id, **kwargs):
+        captured.update(kwargs)
+        return {
+            "image_frames": torch.zeros(2, 4, 3, 2, 2),
+            "camera_indices": torch.tensor([1, 6]),
+            "ego_history_xyz": torch.zeros(1, 1, 16, 3),
+        }
+
+    monkeypatch.setattr(pai_module, "load_physical_aiavdataset", fake_loader)
+    dataset = pai_module.PAIDataset.__new__(pai_module.PAIDataset)
+    dataset.clip_ids = ["clip"]
+    dataset.use_default_keyframe = True
+    dataset.avdi = SimpleNamespace(reasoning_db=None)
+    dataset.num_history_steps = 16
+    dataset.num_future_steps = 64
+    dataset.time_step = 0.1
+    dataset.camera_features = ["camera_front_wide_120fov", "camera_front_tele_30fov"]
+    dataset.include_extr_intr = False
+    dataset.reshape_tensors_for_rl = False
+    dataset.vla_preprocess_func = None
+
+    sample = dataset[0]
+    assert captured["camera_features"] == dataset.camera_features
+    assert sample["image_frames"].shape[0] == 2
 
 
 def test_cached_and_uncached_samples_expose_the_same_keys() -> None:

@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --job-name=a1_5_fulltraj
-#SBATCH --partition=debug
+#SBATCH --partition=gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=24:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/fulltraj_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/fulltraj_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/fulltraj_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/fulltraj_%j.err
 #
 # Exact full-Alpamayo trajectory cache.
 #
@@ -25,8 +25,9 @@ set -euo pipefail
 
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 CACHE_ROOT="${CACHE_ROOT:-$OUT/teacher_action_rollouts_full10b_2cam_nav_k6_m10}"
+CONFIG="${CONFIG:-cache_full_teacher_trajectories_2cam_nav_lcdrive}"
 LIMIT="${LIMIT:-8}"
 NUM_SHARDS="${NUM_SHARDS:-1}"
 SHARD="${SHARD:-0}"
@@ -48,7 +49,7 @@ echo "[slurm] cache_root=$CACHE_ROOT"
 nvidia-smi -L
 
 "$VENV/python" -u -m alpamayo1_5_distill.scripts.generate_teacher_trajectories \
-    config=cache_full_teacher_trajectories_2cam_nav_lcdrive \
+    config="$CONFIG" \
     cache_root="$CACHE_ROOT" \
     num_steps="$NUM_STEPS" num_noise="$NUM_NOISE" seed="$SEED" \
     num_shards="$NUM_SHARDS" shard="$SHARD" \

@@ -68,6 +68,22 @@ def test_expert_conditioning_builds_noncausal_additive_mask_for_sdpa():
     assert torch.equal(out.attention_mask[0, 0, 0], out.attention_mask[0, 0, 1])
 
 
+def test_expert_conditioning_uses_last_handoff_occurrence():
+    start = torch.tensor([[False, True, False, False, True, False]])
+    out = build_expert_conditioning(
+        traj_future_start_mask=start,
+        tokenizer_attention_mask=torch.ones_like(start),
+        rope_deltas=torch.tensor([[0]]),
+        n_action_tokens=2,
+        dtype=torch.float32,
+        attention_implementation="sdpa",
+    )
+
+    assert out.offsets.tolist() == [5]
+    assert out.prefix_len == 5
+    assert out.key_padding_mask.tolist() == [[True, True, True, True, True, True, True]]
+
+
 def _run_batch_invariance(device, attention_implementation, dtype):
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
     from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel

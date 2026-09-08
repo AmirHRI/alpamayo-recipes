@@ -24,9 +24,16 @@ failure this recipe has to detect.
 """
 
 import os
+from functools import partial
 from typing import Any
 
 import torch
+from torch.utils.data import DataLoader, Sampler
+from transformers.trainer import seed_worker
+from transformers.utils import is_datasets_available
+
+if is_datasets_available():
+    import datasets
 
 from alpamayo1_5_sft.trainer import ReasoningVLA_Trainer
 
@@ -91,6 +98,58 @@ NO_DECAY_PARAMS = ("slot_embeddings",)
 #: needs no field on the shared ``TrainingArguments`` owned by the sft recipe.
 GRAD_PROBE_STEPS = int(os.environ.get("KAVA_GRAD_PROBE_STEPS", 200))
 
+
+class LocalityGroupedSampler(Sampler[int]):
+    """Shuffle shards and clips while keeping their samples adjacent.
+
+    The default random sampler turns every worker into a random reader over thousands of
+    NFS-hosted ZIPs. This sampler still visits every dataset index exactly once per epoch and
+    reshuffles at every epoch, but uses a hierarchy of ``chunk -> clip -> anchor``. Consecutive
+    global batches therefore reuse a small working set in the node page cache, and repeated
+    anchors avoid bouncing between ZIP members.
+    """
+
+    def __init__(self, dataset: Any, seed: int) -> None:
+        if not hasattr(dataset, "io_locality_keys"):
+            raise TypeError(
+                "KAVA_IO_GROUPED_SAMPLER=1 requires dataset.io_locality_keys()"
+            )
+        keys = dataset.io_locality_keys()
+        if len(keys) != len(dataset):
+            raise ValueError(
+                f"dataset returned {len(keys)} locality keys for {len(dataset)} samples"
+            )
+        groups: dict[int, dict[str, list[int]]] = {}
+        for index, (chunk, clip_id) in enumerate(keys):
+            groups.setdefault(int(chunk), {}).setdefault(str(clip_id), []).append(index)
+        self._groups = groups
+        self._size = len(dataset)
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __len__(self) -> int:
+        return self._size
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+    @staticmethod
+    def _shuffled(values: list[Any], generator: torch.Generator) -> list[Any]:
+        if len(values) < 2:
+            return values
+        order = torch.randperm(len(values), generator=generator).tolist()
+        return [values[i] for i in order]
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        chunks = self._shuffled(list(self._groups), generator)
+        for chunk in chunks:
+            clips = self._shuffled(list(self._groups[chunk]), generator)
+            for clip_id in clips:
+                indices = self._shuffled(self._groups[chunk][clip_id].copy(), generator)
+                yield from indices
+
 #: The slice of the backbone the probe differentiates. One mid-stack layer is enough to
 #: rank the terms and keeps the probe to a few ms.
 #:
@@ -142,6 +201,122 @@ class KaVaTrainer(ReasoningVLA_Trainer):
         self._grad_shares: dict[str, float] = {}
         self._last_probe_step: int = -1
         self._probe_failed: bool = False
+
+    def _get_train_sampler(self, train_dataset=None):
+        raw = os.environ.get("KAVA_IO_GROUPED_SAMPLER", "0").strip().lower()
+        if raw not in {"0", "1", "false", "true", "no", "yes"}:
+            raise ValueError(
+                "KAVA_IO_GROUPED_SAMPLER must be 0/1, false/true, or no/yes; "
+                f"got {raw!r}"
+            )
+        if raw in {"0", "false", "no"}:
+            return super()._get_train_sampler(train_dataset)
+        dataset = self.train_dataset if train_dataset is None else train_dataset
+        sampler = LocalityGroupedSampler(dataset, seed=self.args.seed)
+        if self.args.process_index == 0:
+            clip_count = sum(len(clips) for clips in sampler._groups.values())
+            print(
+                "[dataloader] locality sampler "
+                f"samples={len(sampler)} chunks={len(sampler._groups)} clips={clip_count}",
+                flush=True,
+            )
+        return sampler
+
+    def _get_dataloader(
+        self,
+        dataset,
+        description: str,
+        batch_size: int,
+        sampler_fn=None,
+        is_training: bool = False,
+        dataloader_key: str | None = None,
+    ) -> DataLoader:
+        """Build the training loader with optional out-of-order worker delivery.
+
+        PyTorch's ordered delivery creates head-of-line blocking when one video sample is
+        slow to read or decode: all later completed batches wait behind it. On the NFS-backed
+        navigation run this appeared exactly every ``num_workers`` steps (three ~3 s steps,
+        then one 33--42 s step with one rank idle). ``in_order=False`` lets a ready worker
+        feed the rank while the slow worker finishes. Every sampler index is still consumed
+        exactly once; only its within-epoch arrival order changes.
+
+        Keep evaluation ordered and make the optimization opt-in because out-of-order
+        delivery changes exact replay order after a mid-epoch restart. The installed HF
+        Trainer does not expose PyTorch's ``in_order`` argument, so this mirrors its 4.57.1
+        loader construction with that single additional keyword.
+        """
+        raw = os.environ.get("KAVA_DATALOADER_IN_ORDER", "1").strip().lower()
+        if raw not in {"0", "1", "false", "true", "no", "yes"}:
+            raise ValueError(
+                "KAVA_DATALOADER_IN_ORDER must be 0/1, false/true, or no/yes; "
+                f"got {raw!r}"
+            )
+        in_order = raw in {"1", "true", "yes"}
+        if not is_training or in_order:
+            return super()._get_dataloader(
+                dataset,
+                description,
+                batch_size,
+                sampler_fn=sampler_fn,
+                is_training=is_training,
+                dataloader_key=dataloader_key,
+            )
+
+        timeout_raw = os.environ.get("KAVA_DATALOADER_TIMEOUT_SECONDS", "0").strip()
+        try:
+            dataloader_timeout = float(timeout_raw)
+        except ValueError as exc:
+            raise ValueError(
+                "KAVA_DATALOADER_TIMEOUT_SECONDS must be a non-negative number; "
+                f"got {timeout_raw!r}"
+            ) from exc
+        if dataloader_timeout < 0:
+            raise ValueError(
+                "KAVA_DATALOADER_TIMEOUT_SECONDS must be non-negative; "
+                f"got {dataloader_timeout}"
+            )
+
+        data_collator = self.data_collator
+        if is_datasets_available() and isinstance(dataset, datasets.Dataset):
+            dataset = self._remove_unused_columns(dataset, description=description)
+        else:
+            data_collator = self._get_collator_with_removed_columns(
+                self.data_collator, description=description
+            )
+
+        dataloader_params = {
+            "batch_size": batch_size,
+            "collate_fn": data_collator,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+            "in_order": False,
+            # A worker blocked in an NFS read otherwise leaves the other DDP ranks inside
+            # a collective until NCCL's much longer watchdog fires. This wait is only on an
+            # empty result queue, so it has no cost while prefetched batches are available.
+            "timeout": dataloader_timeout,
+        }
+        if not isinstance(dataset, torch.utils.data.IterableDataset):
+            if sampler_fn is not None:
+                dataloader_params["sampler"] = sampler_fn(dataset)
+            dataloader_params["drop_last"] = self.args.dataloader_drop_last
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+            dataloader_params["worker_init_fn"] = partial(
+                seed_worker,
+                num_workers=self.args.dataloader_num_workers,
+                rank=self.args.process_index,
+            )
+
+        if self.args.process_index == 0:
+            print(
+                "[dataloader] training in_order=False "
+                f"workers={self.args.dataloader_num_workers} "
+                f"prefetch_factor={self.args.dataloader_prefetch_factor} "
+                f"timeout={dataloader_timeout:g}s",
+                flush=True,
+            )
+        dataloader = self.accelerator.prepare(DataLoader(dataset, **dataloader_params))
+        return dataloader
 
     def get_decay_parameter_names(self, model: Any) -> list[str]:
         decay = super().get_decay_parameter_names(model)

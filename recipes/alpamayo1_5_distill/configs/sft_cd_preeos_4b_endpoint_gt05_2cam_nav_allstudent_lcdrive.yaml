@@ -1,0 +1,169 @@
+# Endpoint distillation + GT damper @ 0.5, starting from BEFORE the EoS stage.
+#
+# The ABLATION twin of sft_cd_eos_4b_endpoint_gt05_2cam_nav_allstudent_lcdrive. Objective,
+# data, batch, warmup, epochs and every trainer pin are byte-identical to that config; the
+# ONLY difference is the checkpoint CD initialises from, so the pair isolates exactly what
+# the EoS stage contributes to the final CD model.
+#
+#   this config : student VLM + the TEACHER's untouched expert   (no EoS stage)
+#   the twin    : student VLM + the EoS-adapted expert           (EoS ckpt-6876)
+#
+# Starting point -- output_preeos_4b_2cam_nav_all_frozen/checkpoint-1 (job 20765). That is
+# NOT a trained artifact: it is the pre-EoS composition materialised as a checkpoint, because
+# `from_eos_checkpoint` takes ONE path that supplies both the VLM and the expert init, and the
+# distillation checkpoint holds only `vlm.*` (714 tensors, no expert at all). It was produced
+# by a 1-step EoS run at learning_rate=1e-10 / min_lr=0 -- through the repo's own
+# `from_student` composition and checkpoint writer rather than a hand-merge of safetensors,
+# which this tree repeatedly warns can silently drop tensors on an assign=True load.
+# ⚠️ VERIFIED, not assumed: all 397 `expert.*` tensors are bitwise identical to the teacher's
+# (max|diff| 0.000e+00) and `vlm.*` is bitwise the distillation student's checkpoint-13752.
+# learning_rate=0 is impossible here -- cosine_warmup_with_min_lr divides by the LR.
+#
+# Measured starting point, n=1000 on nav_lcdrive_val_mysubset_1k, cameras [1,3], nav STRIPPED,
+# job 20737 (this is the "control" row of the EoS eval -- the same composition):
+#   student + teacher expert (= this run's init)   ade 2.0352   min_ade 0.9015
+#   student + EoS expert     (= the twin's init)   ade 1.7966   min_ade 0.9516
+# So this run starts from a WORSE ade but a BETTER min_ade, i.e. from a more diverse, less
+# mode-sharpened expert.
+#
+# RESULT (jobs 20766 train, 20767-9 eval; twin jobs 20754 / 20755-7). n=1000, nav stripped,
+# same harness, `pre` = this config, `post` = the EoS-initialised twin:
+#     NFE      pre ade / min_ade      post ade / min_ade
+#      1        1.8314 / 1.1101        1.8061 / 1.1765
+#      2        1.8695 / 0.9920        1.8478 / 1.0609
+#     10        2.0408 / 0.9957        1.9243 / 0.9962
+#   paired pre-minus-post (negative = skipping EoS better):
+#     NFE=1   min_ade -0.0664 +/- 0.0082 (t=-8.11, better on 61.4%)  ade +0.0254 (t=+1.95)
+#     NFE=2   min_ade -0.0689 +/- 0.0100 (t=-6.91, better on 59.0%)  ade +0.0217 (t=+1.43, ns)
+#     NFE=10  min_ade -0.0005 (t=-0.04, level)                       ade +0.1165 (t=+5.52)
+#
+# CONCLUSION: the EoS stage is NOT a prerequisite for few-step sampling -- CD reaches good
+# 1- and 2-step behaviour from the teacher's expert directly. What EoS does is trade oracle
+# diversity for first-sample sharpness, and CD does NOT recover the diversity it spent: the
+# pre-EoS lineage keeps ~0.067 min_ade at NFE 1 and 2, close to the +0.0500 min_ade EoS cost
+# itself. So: keep EoS if you deploy a single unranked sample (ade wins at every NFE, clearly
+# at 10); SKIP EoS if you rerank best-of-N (min_ade better at 1 and 2, level at 10), which
+# makes its ~2.5 h of GPU buy nothing. ⚠️ `ade` is sample 0 of 6 through the broken logprob
+# argmax, so it reflects an arbitrary draw, not a chosen one -- if anything reranks
+# downstream, min_ade is the column that matters.
+#
+defaults:
+  - sft_base
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.consistency_expert.ConsistencyExpertVLA.from_eos_checkpoint
+  eos_checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_preeos_4b_2cam_nav_all_frozen/checkpoint-1
+  vlm_name_or_path: /temp/achahe/hf_cache/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
+  alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  cotrain_vlm: false
+  stop_grad_from_vlm: true
+  cd:
+    teacher_source: cached_full
+    m_rungs: 10
+    cd_weight: 0.0
+    x0_teacher_weight: 1.0
+    x0_gt_weight: 0.5
+    x0_gt_normalizer: 1.0
+    x0_source: gt
+    metric: mse
+    normalizer: 1.0
+    student_prune_layers: null
+    # ⚠️ 36, NOT the 28 the 2B arm uses and NOT the `from_eos_checkpoint` default. This
+    # value is passed straight through as `expert_num_layers` when the student expert is
+    # built, and checkpoint-3126 stores 36 (`expert.layers.0..35`). Leaving it at 28 does
+    # not raise: it builds a 28-layer expert, silently drops the top 8 layers' weights on
+    # the assign=True load, and trains a truncated model that will look like the objective
+    # failed. In `cached_full` mode nothing else validates this number -- the depth check
+    # `_validate_full_teacher` only runs in `teacher_source: online`.
+    teacher_num_layers: 36
+
+data:
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+    frame_cache_root: /temp/achahe/physical_ai_av/framecache_nav2cam_1080p
+    strip_nav_turn_distance: true
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    teacher_trajectory_cache_root: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/teacher_action_rollouts_full10b_2cam_nav_k6_m10
+    teacher_trajectory_cached_only: true
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    strip_nav_turn_distance: true
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  ddp_find_unused_parameters: false
+  # ⚠️ Both mandatory for this stack and NOT stylistic. DeepSpeed casts the whole module to
+  # bf16 while `action_in_proj` must stay fp32; gradient checkpointing raises inside the
+  # Kava expert. Same pins as the EoS run that produced checkpoint-3126.
+  deepspeed: null
+  gradient_checkpointing: false
+  # 4 x 4 GPUs x 2 accumulation = 32, matching the 2B arm's effective batch on a node with
+  # 4 GPUs instead of 2. The EoS run fit bs=8 at 54.5-59.0 GB of 81.5 GB, but that was one
+  # expert forward on a 36-layer expert with no cached-target machinery; bs=4 leaves room
+  # for the endpoint targets. Raise it if the first steps show headroom.
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 2
+  # ⚠️ The knob that decides wall-clock here. A frozen-VLM run is DATA-bound, not compute-
+  # bound: the EoS run went 12.2 s/it -> 4.7 s/it purely by moving from 2 workers/rank to
+  # 10. h100c has 128 cores across 4 GPUs, so 10 is affordable. Do not copy the 2B arm's 5
+  # (that number exists because two runs were sharing 24 cores).
+  dataloader_num_workers: 10
+  learning_rate: 2e-5
+  warmup_steps: 440
+  num_train_epochs: 2
+  save_strategy: epoch
+  save_total_limit: 3
+
+paths:
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_cd_preeos4b_endpoint_gt05_2cam_nav_allstudent_all110k_e2_bs32
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-consistency-distill
+  group: cd_preeos_student_4b_endpoint_gt05_allstudent
+
+# ⚠️ NO `callbacks.ema` block, deliberately. cd_weight=0 means there is no bootstrap term
+# and therefore no target network, so an EMA would only burn memory and make the saved
+# checkpoint a lagging average of weights that were never the ones trained.
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_cd_eos4b_endpoint_gt05
+run_name: cd_eos4b_endpoint_gt05_${now:%m%d-%H%M}

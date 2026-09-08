@@ -108,6 +108,7 @@ class PAIDatasetWithNav(PAIDataset):
             num_history_steps=self.num_history_steps,
             num_future_steps=self.num_future_steps,
             time_step=self.time_step,
+            camera_features=self.camera_features,
         )
 
         sample_data["nav_text"] = entry["nav_text"]
