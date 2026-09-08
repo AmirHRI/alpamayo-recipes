@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=120G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeos2b_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeos2b_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeos2b_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeos2b_%j.err
 #
 # Two-epoch CD initialized from the 28-layer EoS checkpoint. The student VLM is frozen.
 # Effective batch = 4 samples/rank x 2 ranks x 4 accumulation = 32.
@@ -20,7 +20,7 @@ set -euo pipefail
 SMOKE="${SMOKE:-0}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 EOS_CKPT="${EOS_CKPT:-$OUT/output_eos_2b_nav_e3_clean_maskfix_e2_lcdrive/checkpoint-4168}"
 RUN_OUT="${OUTPUT_DIR:-$OUT/output_cd_eos2b_nav_e2_bs32_20260827}"
 

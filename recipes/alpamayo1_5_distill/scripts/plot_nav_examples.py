@@ -61,7 +61,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--annotations", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--local-dir", default="/data/datasets/physical_ai_av/")
+    ap.add_argument("--local-dir", default="/temp/achahe/physical_ai_av/")
     ap.add_argument("--chunk-ids", default="0-3146")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--cols", type=int, default=2, help="category blocks per row")

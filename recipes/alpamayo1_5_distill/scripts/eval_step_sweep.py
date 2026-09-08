@@ -225,7 +225,7 @@ def main(cfg: DictConfig) -> None:
     # pairs them on noise. Change it only to measure the noise floor by re-running.
     seed = int(sw.get("seed", 1234))
     out_dir = str(sw.get("out_dir",
-                         "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep"))
+                         "/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep"))
     os.makedirs(out_dir, exist_ok=True)
     dev = torch.device("cuda")
 

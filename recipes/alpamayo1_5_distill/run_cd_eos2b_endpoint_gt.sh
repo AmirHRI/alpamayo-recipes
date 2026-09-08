@@ -6,7 +6,7 @@ GT_W="${GT_W:?set GT_W (e.g. 0.1)}"
 TAG=$(echo "$GT_W" | tr -d '.')
 GPUS="${GPUS:-0,1}"; PORT="${PORT:-31801}"
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 EOS_CKPT=$OUT/output_eos_2b_nav_e3_clean_maskfix_e2_lcdrive/checkpoint-4168
 CACHE_ROOT=$OUT/teacher_action_rollouts_full10b_2cam_nav_k6_m10
 RUN_OUT=$OUT/output_cd_eos2b_endpoint_gt${TAG}_nav_e2_bs32_20260830

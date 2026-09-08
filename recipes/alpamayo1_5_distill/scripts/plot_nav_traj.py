@@ -69,8 +69,8 @@ def _ade(pred: np.ndarray, gt: np.ndarray) -> float:
 @hydra.main(version_base=None, config_path=None, config_name="config")
 def main(cfg: DictConfig) -> None:
     sw = cfg.get("sweep", {})
-    T = "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training"
-    M = "/data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests"
+    T = "/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training"
+    M = "/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests"
     npz_path = str(sw.get("teacher_npz", f"{T}/stepsweep/teachernav_k10.npz"))
     ann_path = str(sw.get("annotations", f"{M}/nav_lcdrive_val_mysubset_1k.json"))
     out = str(sw.get("out", f"{T}/figures/nav_traj.png"))

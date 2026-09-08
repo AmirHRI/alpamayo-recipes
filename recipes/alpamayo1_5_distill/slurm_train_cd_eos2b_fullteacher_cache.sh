@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=120G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdftcache_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdftcache_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdftcache_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdftcache_%j.err
 #
 # Two-epoch CD of the epoch-3 2B VLM + 28-layer EoS expert against cached
 # full Alpamayo-1.5 rollouts. Effective batch = 4 x 2 GPUs x 4 accum = 32.
@@ -20,7 +20,7 @@ set -euo pipefail
 SMOKE="${SMOKE:-0}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 EOS_CKPT="${EOS_CKPT:-$OUT/output_eos_2b_nav_e3_clean_maskfix_e2_lcdrive/checkpoint-4168}"
 CACHE_ROOT="${CACHE_ROOT:-$OUT/teacher_action_rollouts_full10b_2cam_nav_k6_m10}"
 RUN_OUT="${OUTPUT_DIR:-$OUT/output_cd_eos2b_fullteacher_cache_x0gtw0.1_nav_e2_bs32_20260828}"

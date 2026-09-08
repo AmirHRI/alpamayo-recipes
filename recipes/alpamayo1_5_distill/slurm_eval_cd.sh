@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96G
 #SBATCH --time=12:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.err
 #
 # Score a CD checkpoint (or the untouched teacher) across denoising step counts, NAV-conditioned.
 #
@@ -30,11 +30,11 @@ LIMIT="${LIMIT:-0}"
 BS="${BS:-1}"
 STEPS="${STEPS:-[1,2,3,5,10]}"
 CAMERAS="${CAMERAS:-[1,3]}"
-TEN_B=/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-COSMOS_8B=/data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+TEN_B=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+COSMOS_8B=/temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep
 
 if [[ -n "${PRUNE_EXPERT_LAYERS:-}" ]]; then
     echo "[slurm] REFUSING: PRUNE_EXPERT_LAYERS is set; this arm is the FULL 36-layer expert." >&2

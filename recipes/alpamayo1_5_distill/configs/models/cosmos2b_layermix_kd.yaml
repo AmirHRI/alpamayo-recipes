@@ -28,12 +28,12 @@
 # Compatibility, verified: kv_heads x head_dim = 8x128 = 1024 on the 2B, the 10B teacher AND
 # expert_cfg -- so the cache needs no width projection. 2B hidden 2048 == expert_cfg 2048.
 _target_: alpamayo1_5_distill.models.kd_model.KDReasoningVLA.from_pretrained_vlm
-vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
-alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+vlm_name_or_path: /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 checkpoint_path: null
 
-teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-teacher_vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+teacher_checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+teacher_vlm_name_or_path: /temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
 
 kd:
   # ---- the layer mix ----

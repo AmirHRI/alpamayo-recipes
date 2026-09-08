@@ -22,7 +22,7 @@ import re
 
 import numpy as np
 
-TRAIN = "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training"
+TRAIN = "/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training"
 STEPS_PER_EPOCH = 1563
 
 #: label -> per-clip result glob. Order is the reading order of every table below.

@@ -45,10 +45,10 @@ data:
     # ⚠️ NAV: one sample per ANNOTATION, each with its OWN t0_relative (116 distinct values,
     # event-anchored) and its own nav_text. NOT the default 5.1 s keyframe -- so nothing trained
     # here is comparable to the arms that use it; this run needs its own no-nav control.
-    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
-    local_dir: /data/datasets/physical_ai_av/
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
     vla_preprocess_args:
       _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
       chat_template_version: r1_5
@@ -64,9 +64,9 @@ data:
   val_dataset:
     _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
     cameras: [1, 3]
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_clip_uuids.txt
     vla_preprocess_args:
       _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
       chat_template_version: r1_5
@@ -155,7 +155,7 @@ paths:
   # ⚠️ ITS OWN DIR. Sharing nav2bmix's would let save_total_limit prune that run's
   # checkpoints and let wandb_utils resume its run id, appending a different objective's
   # curve onto a finished run -- the failure caught mid-flight on job 493.
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_2b_layermix_pinned_nav_lcdrive
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_2b_layermix_pinned_nav_lcdrive
 
 evaluate:
   eval_ckpt: null

@@ -48,7 +48,7 @@ instruction describes intent BEYOND the prediction horizon rather than inside it
 Usage::
 
     python -m alpamayo1_5_distill.scripts.gen_nav_annotations \
-        --clip-list /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt \
+        --clip-list /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt \
         --out /data/.../nav_train.json --workers 16
 """
 
@@ -290,7 +290,7 @@ def main() -> None:
                          "would silently shrink the scored set and break comparability with "
                          "runs measured on the full list. Tagged meta_action=['no_event'].")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--local-dir", default="/data/datasets/physical_ai_av/")
+    ap.add_argument("--local-dir", default="/temp/achahe/physical_ai_av/")
     ap.add_argument("--chunk-ids", default="0-3146")
     ap.add_argument("--t0-us", type=int, default=DEFAULT_T0_US)
     ap.add_argument("--n-future", type=int, default=64)

@@ -106,7 +106,7 @@ def main(cfg: DictConfig) -> None:
     limit = int(sw.get("limit", 0))
     only = str(sw.get("only", ""))
     out_dir = str(sw.get("out_dir",
-                         "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/camsweep"))
+                         "/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/camsweep"))
     os.makedirs(out_dir, exist_ok=True)
     dev = torch.device("cuda")
 

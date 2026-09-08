@@ -9,8 +9,8 @@
 # job queues on (Resources) with GPUs idle. 96G matches the other eval scripts here.
 #SBATCH --mem=96G
 #SBATCH --time=12:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep_%j.err
 #
 # GATE C -- the teacher's accuracy as a function of denoising steps, at 2 cameras.
 # See scripts/eval_step_sweep.py for what this measures and why it has never been run.
@@ -34,9 +34,9 @@ CAMERAS="${CAMERAS:-[1,3]}"
 CONFIG_NAME="${CONFIG_NAME:-sft_eval_stitched_4b_lcdrive}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep
-TEN_B=/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-COSMOS_8B=/data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep
+TEN_B=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+COSMOS_8B=/temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
 
 # ⚠️ MUST be unset. `from_teacher` calls `_apply_expert_pruning`, which is a silent no-op
 # when the variable is empty and bypasses 8 of 36 layers when it is not -- so a stray export

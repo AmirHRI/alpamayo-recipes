@@ -65,7 +65,7 @@ Usage::
         --config-name sft_eval_stitched_2b_layermix_lcdrive \
         ++model.attn_implementation=sdpa \
         ++probe.n_fit=32 ++probe.n_clips=100 \
-        ++probe.out=/data/achahe/layer_mix_oracle.json
+        ++probe.out=/temp/achahe/layer_mix_oracle.json
 """
 
 from __future__ import annotations
@@ -89,9 +89,9 @@ from alpamayo1_5_distill.models.layer_mix import (
 from alpamayo1_5_distill.models.stitched_model import StitchedAlpamayoR1
 from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA
 
-TEACHER_CKPT = "/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format"
+TEACHER_CKPT = "/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format"
 COSMOS = (
-    "/data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/"
+    "/temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/"
     "snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9"
 )
 #: Same for every variant of a clip. The value is arbitrary; using the SAME one is not.

@@ -58,7 +58,7 @@ from omegaconf import DictConfig, OmegaConf  # noqa: E402
 
 from alpamayo.visualization.viz import project_waypoints_ftheta  # noqa: E402
 
-SWEEP = "/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep"
+SWEEP = "/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep"
 STEPS = [1, 2, 3, 5, 10]
 
 #: Step count is an ORDINAL variable, so it takes a one-hue ramp light->dark, not categorical

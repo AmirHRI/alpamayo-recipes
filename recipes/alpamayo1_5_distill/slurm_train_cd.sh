@@ -10,8 +10,8 @@
 # job queues on (Resources) with GPUs idle -- that is what blocked the blockrandt continuation.
 #SBATCH --mem=120G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cd_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cd_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cd_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cd_%j.err
 #
 # Consistency distillation of the FULL 36-layer action expert, teacher VLM frozen.
 # See configs/sft_cd_expert_teachercache.yaml for what this measures and the Gate C numbers
@@ -27,7 +27,7 @@ set -euo pipefail
 SMOKE="${SMOKE:-0}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 
 # ⚠️ MUST be unset. `_apply_expert_pruning` is a SILENT no-op when empty and bypasses 8 of
 # 36 layers when set, so a stray export from a previous shell would train the set-C ablation

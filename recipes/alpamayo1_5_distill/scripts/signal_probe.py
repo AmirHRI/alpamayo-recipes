@@ -97,7 +97,7 @@ def main(cfg: DictConfig) -> None:
     n_samples = int(sw.get("num_traj_samples", 6))
     limit = int(sw.get("limit", 200))
     seed = int(sw.get("seed", 1234))
-    out_dir = str(sw.get("out_dir", "/data/achahe/alpamayo-recipes/recipes/"
+    out_dir = str(sw.get("out_dir", "/temp/achahe/alpamayo-recipes/recipes/"
                                    "alpamayo1_5_distill/training/signalprobe"))
     os.makedirs(out_dir, exist_ok=True)
     if torch.cuda.device_count() < 2:

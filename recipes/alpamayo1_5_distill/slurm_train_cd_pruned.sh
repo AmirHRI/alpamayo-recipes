@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=120G
 #SBATCH --time=2-00:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdpruned_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdpruned_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdpruned_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdpruned_%j.err
 #
 # Two-epoch consistency distillation of the 28-active-layer action student against the
 # original full 36-layer teacher. The frozen 8B VLM and all data/conditioning settings are
@@ -23,7 +23,7 @@ set -euo pipefail
 SMOKE="${SMOKE:-0}"
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 PRUNE_MAP=4,10,13,15,19,25,27,34
 PRUNE_CONFIG='[4,10,13,15,19,25,27,34]'
 RUN_OUT="${OUTPUT_DIR:-$OUT/output_cd_expert_pruned28_2cam_nav_lcdrive_bs32_e2_20260826}"

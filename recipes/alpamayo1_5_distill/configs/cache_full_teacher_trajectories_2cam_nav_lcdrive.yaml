@@ -14,9 +14,9 @@ hydra:
 
 model:
   _target_: alpamayo1_5_distill.models.stitched_model.StitchedAlpamayoR1.from_teacher
-  checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-  teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-  vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+  checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  teacher_checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  vlm_name_or_path: /temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
   attn_implementation: sdpa
 
 data:
@@ -24,10 +24,10 @@ data:
     _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
     _recursive_: false
     cameras: [1, 3]
-    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
-    local_dir: /data/datasets/physical_ai_av/
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_50k_turnpreserved.json
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
     vla_preprocess_args:
       _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
       chat_template_version: r1_5
@@ -39,6 +39,6 @@ data:
       generation_mode: true
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 
 task_name: alpamayo_1_5_full_teacher_action_rollout_cache

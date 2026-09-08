@@ -55,9 +55,9 @@ data:
   # include_camera_ids / include_frame_nums TRUE and evaluating it in the other format
   # moved min_ade 1.116 -> 0.626 once, which produced two retracted findings.
   train_dataset:
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
     vla_preprocess_args:
       _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
       chat_template_version: r1_5
@@ -68,9 +68,9 @@ data:
       include_frame_nums: true
       generation_mode: false
   val_dataset:
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
     vla_preprocess_args:
       _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
       chat_template_version: r1_5
@@ -122,7 +122,7 @@ trainer:
   save_total_limit: 5
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_cd_expert_10b_lcdrive
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_cd_expert_10b_lcdrive
 
 # ⚠️ REQUIRED, not optional. The `/wandb: default` group ships `team: ???` and `project: ???`,
 # and train_hf does `init_wandb(**cfg.wandb)` -- the `**` resolves EVERY key, so an unset one

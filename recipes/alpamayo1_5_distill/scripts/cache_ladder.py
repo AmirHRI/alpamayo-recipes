@@ -166,7 +166,7 @@ def main(cfg: DictConfig) -> None:
     n_samples = int(sw.get("num_traj_samples", 6))
     limit = int(sw.get("limit", 300))
     only = str(sw.get("only", ""))
-    out_dir = str(sw.get("out_dir", "/data/achahe/alpamayo-recipes/recipes/"
+    out_dir = str(sw.get("out_dir", "/temp/achahe/alpamayo-recipes/recipes/"
                                    "alpamayo1_5_distill/training/cacheladder"))
     os.makedirs(out_dir, exist_ok=True)
 

@@ -29,15 +29,15 @@ model:
   # The student's base tower: Cosmos-Reason2-2B, 28 text layers / 2048 hidden / kv 8 x 128.
   # kv_heads x head_dim = 1024 matches the teacher and expert_cfg, which is what lets the
   # teacher's expert read this cache at all.
-  vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+  vlm_name_or_path: /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
   # Supplies traj tokenizer AND expert_cfg / diffusion_cfg / action_*_cfg -- this is what
   # makes the skeleton an AlpamayoR1 with an expert rather than a bare VLA.
-  alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
   # Left null: evaluate_hf.py:70 overwrites it with `evaluate.eval_ckpt`, which is how the
   # per-arm student checkpoint gets in. Setting it here would be silently discarded.
   checkpoint_path: null
   # Where the frozen expert + action projections come from (397 + 12 tensors).
-  teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  teacher_checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 
 data:
   # ⚠️ include_camera_ids / include_frame_nums MUST stay true. The teacher declares both in
@@ -46,9 +46,9 @@ data:
   # TRAINED in this format, and the expert is the teacher's, so a format change desynchronises
   # both halves of the stitch at once.
   val_dataset:
-    local_dir: /data/datasets/physical_ai_av/
+    local_dir: /temp/achahe/physical_ai_av/
     chunk_ids: "0-3146"
-    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
     vla_preprocess_args:
       _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
       chat_template_version: r1_5
@@ -91,7 +91,7 @@ evaluate:
       - _target_: alpamayo.metrics.metric_api.DistanceMetrics
 
 paths:
-  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/evalstitch
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/evalstitch
 
 task_name: alpamayo_1_5_kd_stitched_eval
 run_name: stitch_4b_${now:%m%d-%H%M}

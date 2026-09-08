@@ -7,8 +7,8 @@
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96G
 #SBATCH --time=12:00:00
-#SBATCH --output=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.out
-#SBATCH --error=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.err
+#SBATCH --output=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.out
+#SBATCH --error=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/cdeval_%j.err
 #
 # Evaluate a cache-aligned consistency checkpoint with 28 active expert blocks in 36
 # slots. The inference factory materialises the identity slots before strictly loading the
@@ -26,12 +26,12 @@ BS="${BS:-1}"
 STEPS="${STEPS:-[1,2]}"
 CAMERAS="${CAMERAS:-[1,3]}"
 PRUNE_MAP=4,10,13,15,19,25,27,34
-TEN_B=/data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
-COSMOS_8B=/data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
-COSMOS_2B=/data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+TEN_B=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+COSMOS_8B=/temp/achahe/hf_cache/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+COSMOS_2B=/temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
-OUT=/data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep
+OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/stepsweep
 TAG="nav_${ARM}"
 
 [[ -d "$CKPT" ]] || { echo "[slurm] no checkpoint: $CKPT" >&2; exit 1; }
