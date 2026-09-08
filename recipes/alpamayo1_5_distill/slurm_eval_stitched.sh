@@ -53,6 +53,28 @@ if [[ "$ARM" == *2b* ]]; then
     CONFIG_NAME=sft_eval_stitched_2b_prunedexpert_lcdrive
     export PRUNE_EXPERT_LAYERS="${PRUNE_EXPERT_LAYERS:-4,10,13,15,19,25,27,34}"
 fi
+# ⚠️ ARM=mix2b* is the LAYER-MIX arm and must OVERRIDE the branch above, which matches it too
+# (the name contains "2b"). There the expert is pruned to 28; here it keeps all 36 layers and
+# its cache slots are synthesised from the student's 28 by the trained block-convex P. Two
+# things therefore have to change, and both are silent failures if missed:
+#   - the config, or the eval builds a 28-layer expert and _refuse_orphaned_layer_mix fires;
+#   - PRUNE_EXPERT_LAYERS must be UNSET, because from_stitch raises when layer_mix is on and
+#     it is set -- pruning and mixing are alternatives, never companions.
+# ⚠️ The PINNED-ENDS variant needs its own eval config: the mixer geometry (2 blocks of
+# 11 -> 15 with 4/2 pinned) must match what the checkpoint's layer_mixer.* was saved from, or
+# load_state_dict reports a size mismatch. Checked BEFORE the mix2b* branch, since
+# "mixpin2bnav..." does not match "mix2b*" but the ordering should not be load-bearing.
+if [[ "$ARM" == mixpin2b* ]]; then
+    MODEL_TAG=2b
+    CONFIG_NAME=sft_eval_stitched_2b_layermix_pinned_lcdrive
+    unset PRUNE_EXPERT_LAYERS
+    echo "[slurm] pinned layer-mix arm: 36-layer expert, head/tail identity, pin unset"
+elif [[ "$ARM" == mix2b* ]]; then
+    MODEL_TAG=2b
+    CONFIG_NAME=sft_eval_stitched_2b_layermix_lcdrive
+    unset PRUNE_EXPERT_LAYERS
+    echo "[slurm] layer-mix arm: 36-layer expert, PRUNE_EXPERT_LAYERS unset"
+fi
 # PIN_GPU=3 -> run on that PHYSICAL card. ⚠️ Must NOT go through srun: slurm re-derives
 # CUDA_VISIBLE_DEVICES from the step's GPU binding after --export is processed, so the pin is
 # discarded and the job silently takes cuda:0 (this cost a co-tenant's card once -- see

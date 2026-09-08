@@ -346,6 +346,36 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         model.cotrain_vlm = False
         model.stop_grad_from_vlm = True
         model._set_vlm_trainability()
+
+        # ⚠️ LAYER MIX. The EoS checkpoint of a layer-mix student carries `layer_mixer.*`
+        # alongside its 36-layer expert, but `_load_modules_from_checkpoint` above filters to
+        # ("vlm.", "expert.", "action_in_proj.", "action_out_proj.", "diffusion.",
+        # "action_space.") -- `layer_mixer.` is NOT in that list, so the trained matrices
+        # would be dropped without a word. Load them explicitly, and RAISE if absent: a
+        # 28-layer cache reaching a 36-layer expert does not fail, it makes DynamicCache
+        # auto-extend slots 28..35 holding action tokens only.
+        if cd_cfg.pop("layer_mix", False):
+            from alpamayo1_5_distill.models.layer_mix import (
+                LAYER_MIX_SHARPEN, LayerMixer,
+            )
+            from alpamayo1_5_distill.models.stitched_model import _load_layer_mix
+
+            ref = next(model.vlm.parameters())
+            model.layer_mixer = LayerMixer(
+                n_student=len(model.vlm.model.language_model.layers),
+                n_expert=teacher_layers,
+                n_blocks=int(cd_cfg.pop("layer_mix_blocks", 4)),
+                gain=bool(cd_cfg.pop("layer_mix_gain", False)),
+                sharpen=float(cd_cfg.pop("layer_mix_sharpen", LAYER_MIX_SHARPEN)),
+                pin_head=int(cd_cfg.pop("layer_mix_pin_head", 0)),
+                pin_tail=int(cd_cfg.pop("layer_mix_pin_tail", 0)),
+            ).to(device=ref.device, dtype=ref.dtype)
+            _load_layer_mix(str(eos_checkpoint_path), model)
+            # The cache producer is frozen for the whole CD run, and P is part of it.
+            for prm in model.layer_mixer.parameters():
+                prm.requires_grad_(False)
+            print(f"[cd] layer mix ACTIVE ({model.layer_mixer.n_student} -> "
+                  f"{model.layer_mixer.n_expert}), P frozen", flush=True)
         model.init_cd(
             teacher_checkpoint_path=str(eos_checkpoint_path),
             **cd_cfg,
@@ -551,6 +581,13 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         )
         cache = vlm_outputs.past_key_values
         cache.crop(conditioning.prefix_len)
+        # ⚠️ 28 VLM layers -> 36 expert slots, on the ONE cache all three CD branches share
+        # (v_teacher, v_target/EMA, v_online). Mixing here rather than per-branch is what
+        # keeps them reading identical conditioning -- the property the consistency
+        # constraint is defined against.
+        mixer = getattr(self, "layer_mixer", None)
+        if mixer is not None:
+            cache = mixer.mix_cache(cache)
         for layer in cache.layers:
             layer.keys = layer.keys.detach()
             layer.values = layer.values.detach()

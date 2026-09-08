@@ -77,6 +77,7 @@ from alpamayo1_5_distill.models.block_losses import (
 )
 from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
 from alpamayo1_5_distill.models.expert_holder import FrozenExpert
+from alpamayo1_5_distill.models.layer_mix import LAYER_MIX_SHARPEN, LayerMixer
 from alpamayo1_5_distill.models.kv_distill import (
     KVProjectorBank,
     build_layer_map,
@@ -155,6 +156,8 @@ class KDVLAOutput(ModelOutput):
     kv_loss_vision: torch.FloatTensor | None = None
     kv_loss_text: torch.FloatTensor | None = None
     kv_loss_traj: torch.FloatTensor | None = None
+    mix_entropy_k: torch.FloatTensor | None = None
+    mix_entropy_v: torch.FloatTensor | None = None
 
 
 def recompute_kv(
@@ -247,6 +250,16 @@ class KDReasoningVLA(TrainableReasoningVLA):
     kv_layerwise_std: bool = True
     kv_layer_bands: list | None = None
     log_kv_regions: bool = True
+    #: Keep the expert at ``layer_mix_expert_layers`` and synthesise its cache slots from the
+    #: student's shallower stack with a block-convex mix, instead of pruning the expert down
+    #: to the student's depth. See ``models/layer_mix.py``.
+    layer_mix: bool = False
+    layer_mix_expert_layers: int = 36
+    layer_mix_blocks: int = 4
+    layer_mix_gain: bool = False
+    layer_mix_sharpen: float = LAYER_MIX_SHARPEN
+    layer_mix_pin_head: int = 0
+    layer_mix_pin_tail: int = 0
 
     #: When True, ``forward`` also stashes the loss terms **with their graph attached** in
     #: :attr:`last_loss_terms`, so ``KaVaTrainer`` can take ``autograd.grad`` of each term
@@ -283,6 +296,13 @@ class KDReasoningVLA(TrainableReasoningVLA):
         kv_layerwise_std: bool = True,
         kv_layer_bands: list | None = None,
         log_kv_regions: bool = True,
+        layer_mix: bool = False,
+        layer_mix_expert_layers: int = 36,
+        layer_mix_blocks: int = 4,
+        layer_mix_gain: bool = False,
+        layer_mix_sharpen: float = LAYER_MIX_SHARPEN,
+        layer_mix_pin_head: int = 0,
+        layer_mix_pin_tail: int = 0,
     ) -> None:
         """Attach the frozen teacher and the (optional) K/V projector bank.
 
@@ -383,6 +403,81 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 n_student, kv_width=self._kv_width(), align=self.kv_align
             )
             self.kv_projector.to(device=ref.device, dtype=ref.dtype)
+
+        self.layer_mix = bool(layer_mix)
+        self.layer_mix_expert_layers = int(layer_mix_expert_layers)
+        self.layer_mix_blocks = int(layer_mix_blocks)
+        self.layer_mix_gain = bool(layer_mix_gain)
+        self.layer_mix_sharpen = float(layer_mix_sharpen)
+        self.layer_mix_pin_head = int(layer_mix_pin_head)
+        self.layer_mix_pin_tail = int(layer_mix_pin_tail)
+        if self.layer_mix:
+            self._init_layer_mix(n_student)
+
+    def _init_layer_mix(self, n_student: int) -> None:
+        """Build the mixer and refuse every configuration that would train the wrong thing.
+
+        Each of these raises at INIT rather than surfacing 4000 steps later as a number that
+        is finite, falling, and about something else -- the failure mode this tree keeps
+        paying for.
+        """
+        # (1) PRUNING AND MIXING ARE ALTERNATIVES. Pruning cuts the expert to the student's
+        # depth; mixing keeps it whole and synthesises the missing slots. Combined, the expert
+        # would be built shallow AND fed a mix sized for the full depth -- every shape still
+        # matches somewhere and nothing complains.
+        pruned = [x for x in os.environ.get("PRUNE_EXPERT_LAYERS", "").split(",") if x.strip()]
+        if pruned:
+            raise ValueError(
+                f"layer_mix=True with PRUNE_EXPERT_LAYERS={','.join(pruned)}. These are "
+                "alternatives, not companions: mixing exists precisely so the expert need "
+                "NOT be pruned. Unset PRUNE_EXPERT_LAYERS."
+            )
+        # (2) L_KV maps the RAW student layers through build_layer_map -- a different, and
+        # here contradictory, student->teacher convention. Two live layer maps in one run is
+        # not an ablation, it is an unreadable result.
+        if self.kv_weight > 0:
+            raise ValueError(
+                "layer_mix=True with kv_weight>0: L_KV supervises the student's own 28 layers "
+                f"through build_layer_map ({self.kv_layer_map[:4] if self.kv_layer_map else None}"
+                "...), which contradicts the learned mix. Set kv_weight=0."
+            )
+        # (3) P lives only inside the block family. Without one of those terms it receives no
+        # gradient, and DDP/DeepSpeed with ddp_find_unused_parameters=false errors on that.
+        if not (self.block_weight > 0 or self.field_weight > 0
+                or self.roll_weight > 0 or self.block_freerun_weight > 0):
+            raise ValueError(
+                "layer_mix=True but no block-family term is active (block/field/roll/freerun "
+                "weights are all 0), so the mixing matrices would never receive gradient."
+            )
+        ref = next(self.vlm.parameters())
+        mixer = LayerMixer(
+            n_student=n_student,
+            n_expert=self.layer_mix_expert_layers,
+            n_blocks=self.layer_mix_blocks,
+            gain=self.layer_mix_gain,
+            sharpen=self.layer_mix_sharpen,
+            pin_head=self.layer_mix_pin_head,
+            pin_tail=self.layer_mix_pin_tail,
+        )
+        self.layer_mixer = mixer.to(device=ref.device, dtype=ref.dtype)
+        # (5) The span loss is the term that grades "9 expert slots from 7 student layers".
+        # Disjoint spans at m = g_out land exactly on the block boundaries; any other m
+        # straddles them and measures something blurrier. A warning, not an error -- m=1 and
+        # m=n_expert are both legitimate deliberate choices.
+        if self.block_span_mix > 1 and self.block_span_mix != mixer.g_out:
+            print(
+                f"[layer-mix] WARNING block_span_mix={self.block_span_mix} != g_out="
+                f"{mixer.g_out}; spans will straddle mixing blocks, so the span term no "
+                "longer grades one block's 9-from-7 reconstruction in isolation.",
+                flush=True,
+            )
+        if self.block_span > 1 and self.block_span != mixer.g_out:
+            print(
+                f"[layer-mix] WARNING block_span={self.block_span} != g_out={mixer.g_out}; "
+                "same caveat as block_span_mix.",
+                flush=True,
+            )
+        print(mixer.describe(), flush=True)
 
     @classmethod
     def from_pretrained_vlm(
@@ -557,8 +652,17 @@ class KDReasoningVLA(TrainableReasoningVLA):
 
     def _ensure_expert(self, checkpoint_path: str, device, dtype) -> None:
         if not self._expert_holder:
+            # ⚠️ With layer_mix the expert keeps its FULL depth instead of inheriting the
+            # student's, so FrozenExpert loads the teacher's 36 layers 1:1 and its depth remap
+            # never fires. The caller then owes it 36 cache slots -- see the mix in `forward`.
             self._expert_holder.append(
-                FrozenExpert(checkpoint_path, self._text_model().config)
+                FrozenExpert(
+                    checkpoint_path,
+                    self._text_model().config,
+                    expert_num_layers=(
+                        self.layer_mix_expert_layers if self.layer_mix else None
+                    ),
+                )
             )
         e = self._expert_holder[0]
         if next(e.parameters()).device != device:
@@ -1801,6 +1905,12 @@ class KDReasoningVLA(TrainableReasoningVLA):
                 )
                 with _Phase.t('recompute_kv'):
                     s_kv = recompute_kv(self._text_model(), outputs.hidden_states, h, d)
+                    if self.layer_mix:
+                        # 28 -> 36, grad-carrying, keyed 0..35 so _block_loss indexes it
+                        # exactly as it indexes an unmixed dict. The depth-mismatch branch
+                        # below then never fires (36 == 36) and `_surviving_expert_layers`
+                        # returns None, because no slot is a stand-in: every one is real.
+                        s_kv = self.layer_mixer.mix_dict(s_kv)
                 with torch.no_grad():
                     t_kv_b = recompute_kv(self._teacher_text_model(), t_out.hidden_states, h, d)
                 # ⚠️ Depth mismatch is EXPECTED with a shallow student: the expert's layer
@@ -1934,4 +2044,9 @@ class KDReasoningVLA(TrainableReasoningVLA):
             kv_loss_vision=region_losses.get("vision"),
             kv_loss_text=region_losses.get("text"),
             kv_loss_traj=region_losses.get("traj"),
+            # Normalised mixing entropy: whether P moved, and which way. The tent init reads
+            # ~0.228 for 7->9; rising toward 1.0 is a collapse to a plain block average, which
+            # also shrinks ||K|| -- read it against kv_ratio_k / kv_ratio_v.
+            mix_entropy_k=self.layer_mixer.entropy("k") if self.layer_mix else None,
+            mix_entropy_v=self.layer_mixer.entropy("v") if self.layer_mix else None,
         )

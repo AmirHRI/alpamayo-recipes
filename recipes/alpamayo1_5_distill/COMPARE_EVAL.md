@@ -337,7 +337,7 @@ Paired per-clip against the 10-step reference:
 | endpoint + 1.0·gt | +0.1371 | +4.53 | −0.1752 | −4.62 |
 
 **Two operating points, each a PARETO IMPROVEMENT on the 10-step sampler at 1/5 the denoising
-cost** — at 2 epochs; §7e-i shows both were still improving when training stopped.
+cost** — and 2 epochs is converged; §7e-i has the third-epoch check.
 `0.3·gt` beats the reference on `min_ade` and ties `ade`; `0.5·gt` beats it on `ade` and
 ties `min_ade`. Neither wins both with significance, and that is the shape of the problem, not a
 shortfall — `ade` and `min_ade` trade through diversity, the same tension §7a documents across
@@ -387,8 +387,32 @@ epochs. Measured ep1 → ep2, paired, n=1000:
 | gt=0.5 | −0.0240 | −3.64 | −0.0314 | −5.88 | 2.2268 → 2.1952 |
 | gt=1.0 | −0.0686 | −7.53 | −0.0688 | −9.34 | 2.2729 → 2.1949 |
 
-Both metrics were still falling together at 3126 steps, and so was the floor. So the asymptote
-is BELOW 2.195 and its location is unknown.
+Both metrics were still falling together at 3126 steps, and so was the floor.
+
+**A third epoch on gt=0.5 then settled it: the curve is flat by epoch 2.** True resume
+(optimizer + scheduler restored, LR continuing mid-cosine at 6.1e-6 and re-annealing, world
+size held at 2 because `rng_state_*.pth` is per-rank), so it even got a mild LR bump:
+
+| gt=0.5 @ 2 NFE | `ade` | `min_ade` | diversity | coverage | floor |
+|---|---|---|---|---|---|
+| ep1 (1563) | 2.3967 | 1.4590 | 1.441 | 1.1977 | 2.2268 |
+| ep2 (3126) | 2.3726 | 1.4276 | 1.451 | 1.1699 | 2.1952 |
+| ep3 (4689) | 2.3739 | 1.4299 | 1.448 | 1.1681 | 2.1970 |
+
+| paired delta | Δ`ade` | z | Δ`min_ade` | z |
+|---|---|---|---|---|
+| ep2 − ep1 | −0.0240 | −3.64 | −0.0314 | −5.88 |
+| **ep3 − ep2** | **+0.0013** | **+0.86** | **+0.0023** | **+1.60** |
+
+So the ep1 → ep2 gain was the TAIL of the curve, not a rate to extrapolate — an extrapolation
+predicting `ade` ≈ 2.35 / `min_ade` ≈ 1.40 for ep3 was wrong; it delivered 2.3739 / 1.4299.
+Diversity, coverage and the floor are unchanged to three decimals. **2 epochs is the recipe;
+do not spend a third.** gt=1.0's ep1 → ep2 delta was larger (−0.069) so it may have had a
+little more left, untested — but it is the worse operating point on `min_ade`.
+
+`min_ade` never closes the 1.4276 → 1.3974 gap, so the both-metrics win does not exist at any
+epoch count here: 0.3 and 0.5 remain two separate operating points. Final gt=0.5 @ 2 NFE vs the
+10-step reference: `ade` **−0.1120 (z −3.22)**, `min_ade` +0.0325 (z +1.21, n.s.).
 
 ⚠️ **The action-space training loss is NOT a convergence signal for these metrics, and this
 tree has now been fooled by it twice.** `x0_gt_loss` is statistically flat across the whole of
@@ -399,9 +423,10 @@ conditional variance (~0.45 at gt 1.0), so the reducible part is buried; the met
 those actions INTEGRATED over 6.4 s, where small systematic gains compound. Judge convergence
 by evaluating successive checkpoints, never by the loss curve.
 
-A third epoch on gt=0.5 (true resume: optimizer + scheduler state restored, LR continuing
-mid-cosine at 6.1e-6, world size held at 2 because `rng_state_*.pth` is per-rank) is running at
-the time of writing.
+⚠️ Corollary for the two traps above: the action-space loss said "converged" at a point where
+the metrics still had 0.03-0.07 left (ep1 → ep2), and it said the same thing at a point where
+they genuinely were converged (ep2 → ep3). It carries no information about either. Only
+successive-checkpoint evals do.
 
 ### 7f. The CD bootstrap does not work on this budget — the endpoint pair does
 

@@ -36,23 +36,32 @@ set -euo pipefail
 RECIPE_DIR=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill
 VENV=/home/achahe/alpamayo-recipes/recipes/alpamayo1_5_sft/.venv/bin
 OUT_DIR=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
-# MODEL selects which EOS run to score. The 2B arm stays the default so every previously
-# recorded invocation of this script keeps its exact meaning; 4b is opt-in.
+# MODEL selects which EOS run to score; MIX selects the LAYER-MIX variant of the 2B student.
+# The 2B pruned arm stays the default so every previously recorded invocation of this script
+# keeps its exact meaning; 4b and MIX=1 are both opt-in.
 # ⚠️ EOS_DIR, CONFIG and the TAG prefix must move TOGETHER. Mixing a 4B checkpoint into the
 # 2B config loads a 28-layer expert config against 36-layer weights, and reusing the 2B TAG
 # would overwrite the 2B per-clip JSON with 4B numbers under a 2B name. That is why MODEL is
-# a single switch rather than three independent env vars.
+# a single switch rather than three independent env vars -- and the same argument applies to
+# MIX: the eval config has to match the geometry the checkpoint's layer_mixer.* was saved
+# from, and its per-clip JSON must not collide with a pruned-student run.
 MODEL="${MODEL:-2b}"
-case "$MODEL" in
-    2b) EOS_DIR="$OUT_DIR/output_eos_2b_nav_lcdrive"
-        CONFIG=sft_eval_eos_2b_nav_lcdrive
-        TAG_PREFIX=eos_2b_nav ;;
-    4b) EOS_DIR="$OUT_DIR/output_eos_4b_2cam_nav_lcdrive"
-        CONFIG=sft_eval_eos_4b_2cam_nav_lcdrive
-        TAG_PREFIX=eos_4b_2cam_nav ;;
-    *)  echo "[slurm] unknown MODEL=$MODEL (want 2b|4b)" >&2; exit 1 ;;
+MIX="${MIX:-0}"
+case "$MODEL:$MIX" in
+    2b:0) EOS_DIR="$OUT_DIR/output_eos_2b_nav_lcdrive"
+          CONFIG=sft_eval_eos_2b_nav_lcdrive
+          TAG_PREFIX=eos_2b_nav ;;
+    2b:1) EOS_DIR="$OUT_DIR/output_eos_2b_mix_nav_lcdrive"
+          CONFIG=sft_eval_eos_2b_mix_nav_lcdrive
+          TAG_PREFIX=eos_2b_mix_nav ;;
+    4b:0) EOS_DIR="$OUT_DIR/output_eos_4b_2cam_nav_lcdrive"
+          CONFIG=sft_eval_eos_4b_2cam_nav_lcdrive
+          TAG_PREFIX=eos_4b_2cam_nav ;;
+    4b:1) echo "[slurm] MIX=1 is 2B-only: the 4B student's expert is already 36 layers deep," \
+               "so there is no 28->36 cache to synthesise." >&2; exit 1 ;;
+    *)    echo "[slurm] unknown MODEL=$MODEL (want 2b|4b) / MIX=$MIX (want 0|1)" >&2; exit 1 ;;
 esac
-# Escape hatches for one-off run dirs; they default to whatever MODEL selected. Overriding
+# Escape hatches for one-off run dirs; they default to whatever MODEL/MIX selected. Overriding
 # EOS_DIR alone is fine (same architecture, different run); overriding it across
 # architectures without also setting CONFIG/TAG_BASE is the failure described above.
 EOS_DIR="${EOS_DIR_OVERRIDE:-$EOS_DIR}"
@@ -99,11 +108,12 @@ fi
 # The student tower is the SAME in both arms -- only where `expert.*` comes from changes.
 EXPERT_SRC="$CKPT"
 [[ "$ARM" == "control" ]] && EXPERT_SRC="$TEACHER"
-# ...and the 2B control DOES need the remap, because the 10B expert is 36 layers deep while
-# the 2B student's is 28. ⚠️ NOT for 4b: that student's expert is already 36, so n_ckpt ==
-# n_have, the remap branch is skipped, and setting the pin would only mislead a later reader
-# into thinking a remap happened.
-if [[ "$ARM" == "control" && "$MODEL" == "2b" ]]; then
+# ...and the 2B PRUNED control DOES need the remap, because the 10B expert is 36 layers deep
+# while that student's is 28. ⚠️ NOT for 4b: its expert is already 36, so n_ckpt == n_have,
+# the remap branch is skipped, and setting the pin would only mislead a later reader into
+# thinking a remap happened. ⚠️ NOT under MIX=1 either: there the expert is KEPT at 36 and the
+# cache is synthesised instead, and from_stitch raises if the pin is set with layer_mix on.
+if [[ "$ARM" == "control" && "$MODEL" == "2b" && "$MIX" != "1" ]]; then
     export PRUNE_EXPERT_LAYERS=4,10,13,15,19,25,27,34
 fi
 

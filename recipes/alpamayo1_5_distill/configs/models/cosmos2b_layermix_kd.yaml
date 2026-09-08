@@ -1,0 +1,83 @@
+# Student: Cosmos-Reason2-2B (28 text layers), distilled from the 10B teacher, driving the
+# teacher's FULL 36-LAYER action expert through a learned block-convex cache mix.
+#
+# WHY THIS EXISTS. Expert layer l reads VLM cache layer l, so a 28-layer student used to force
+# the expert down to 28 (set C: layers {4,10,13,15,19,25,27,34} dropped). That cut is expensive
+# BEFORE the student is even involved: PRUNING.md measures the teacher at min_ade 0.5776 through
+# its full 36-layer expert and 0.7893 through the set-C ablation. Every 2B block/span arm so far
+# has been optimising toward the lower of those two ceilings.
+#
+# WHAT REPLACES IT. Keep all 36 expert layers, and SYNTHESISE the 36 cache slots from the
+# student's 28 layers with learned convex mixing matrices, block-structured 4 x (7 -> 9):
+#
+#   student VLM layers   0..6      7..13     14..20    21..27      (4 blocks of 7)
+#                          |  P_K/P_V |         |         |         (each 7x9)
+#   expert cache slots   0..8      9..17     18..26    27..35      (4 blocks of 9)
+#
+#   P = softmax over the 7 SOURCE layers, so every output slot is a convex combination and
+#   block locality is structural. 2 x 4 x 7 x 9 = 504 scalars total.
+#
+# ⚠️ PRUNE_EXPERT_LAYERS MUST NOT BE SET. Pruning and mixing are alternatives, not companions;
+# kd_model._init_layer_mix raises if both are on. This is the one arm in the tree that does not
+# export it.
+#
+# ⚠️ The span term is what grades the hypothesis. block_span_mix=9 makes each disjoint span
+# exactly one block's 9 expert layers driven by exactly one block's 7 student layers
+# (_span_sweep's range(0, 36-9+1, 9) = [0, 9, 18, 27]). Any other m straddles the blocks.
+#
+# Compatibility, verified: kv_heads x head_dim = 8x128 = 1024 on the 2B, the 10B teacher AND
+# expert_cfg -- so the cache needs no width projection. 2B hidden 2048 == expert_cfg 2048.
+_target_: alpamayo1_5_distill.models.kd_model.KDReasoningVLA.from_pretrained_vlm
+vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+checkpoint_path: null
+
+teacher_checkpoint_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+teacher_vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Cosmos-Reason2-8B/snapshots/a9fae2cf89dc64db96b12860417f0eb403013bb9
+
+kd:
+  # ---- the layer mix ----
+  layer_mix: true
+  # The expert's depth, overriding the one it would inherit from the 2B's text config. 36 is
+  # the teacher's own, so its 397 expert tensors load 1:1 and expert_holder's depth remap
+  # never fires -- check the log for "36 layers" and the ABSENCE of "[block] expert REMAP".
+  layer_mix_expert_layers: 36
+  # 28 = 4x7 and 36 = 4x9, so the blocks are exact. Must divide both depths.
+  layer_mix_blocks: 4
+  # Per-output-slot scalar gain, OFF. A mix drifting toward uniform shrinks ||K|| by up to
+  # sqrt(7) for uncorrelated layers; kv_ratio_k / kv_ratio_v report that every step, so turn
+  # this on in response to a measurement rather than in anticipation of one.
+  layer_mix_gain: false
+
+  # How far the init is pulled from the depth-matched tent toward one-hot (0 = tent, 1 =
+  # nearest-source gather).
+  # ⚠️ The tent is MEASURED HARMFUL: in the validated teacher-mode oracle (n=500) one-hot
+  # gather scored min_ade 0.7396 against the tent's 0.8059 -- blending adjacent layers
+  # everywhere cost 0.066, and the tent was even worse than pruning itself. That behavioural
+  # comparison is the only evidence bearing on this value; it says "sharper than the tent"
+  # and does not pin a number, so 0.75 is a judgement call and 1.0 is the endpoint that won.
+  # ⚠️ Do NOT re-derive this from the fitted P's shape. Per column its effective sources are
+  # 2.222 vs the tent's 1.489 -- maximally sharp on the 7/9 columns that had a pass-through
+  # source and maximally broad on the 2 that did not, which is the probe's degeneracy showing
+  # through rather than a property of a good mix.
+  layer_mix_sharpen: 0.75
+
+  # ---- the objective ----
+  # ⚠️ ce_weight / kd_weight / kv_weight are 0 in the launcher, matching every other block arm.
+  # kv_weight in particular MUST stay 0: L_KV maps the student's raw 28 layers through
+  # build_layer_map, a contradictory convention, and kd_model raises rather than run both.
+  block_weight: 1.0
+  block_timestep: beta
+  block_norm: teacher
+  block_span: 1
+  # BOTH objectives, weighted mean: teacher-forced per-layer (m=1) grades each of the 36 slots
+  # in isolation; span(m=9) grades whether one block's 9 slots SURVIVE being chained on a cache
+  # built from only 7 student layers. The second is the one this arm is really asking about.
+  block_span_mix: 9
+  block_span_mix_weight: 1.0
+
+  kd_temperature: 1.0
+  kv_align: direct
+  kv_loss_type: l1
+  kv_layerwise_std: true
+  log_kv_regions: false     # kv_weight is 0 here; the region splits would report on nothing

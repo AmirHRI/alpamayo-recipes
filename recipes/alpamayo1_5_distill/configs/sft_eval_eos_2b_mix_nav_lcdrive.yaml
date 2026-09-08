@@ -1,0 +1,125 @@
+# EXPERT-ON-STUDENT read-out for the LAYER-MIX student: the deployable configuration.
+#
+# Student VLM (frozen) + its layer mix + the 36-layer expert fine-tuned on the cache that
+# student actually produces. Every other layer-mix number in mix_pruning.md comes from the
+# stitched eval, which uses the teacher's FROZEN expert -- a diagnostic, not a deployment.
+#
+# The control for this arm is that stitched number, min_ade 1.0662 / ade 2.4965
+# (stitch_2b_mix2bnav_m9w1.0_checkpoint-7815_cam13_nav.json): same student, same data, the
+# teacher's untouched expert. Report the GAIN over it, since the pruned-student EoS runs
+# started from different controls (2.6216 -> 2.0753, and 1.5030 -> 1.3974).
+#
+# ⚠️ PRUNE_EXPERT_LAYERS must stay unset: this expert is 36 layers, not 28.
+
+defaults:
+  - sft_base
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.stitched_model.StitchedAlpamayoR1.from_stitch
+  # The student's base tower: Cosmos-Reason2-2B, 28 text layers / 2048 hidden / kv 8 x 128.
+  vlm_name_or_path: /data/achahe/alpasim/huggingface/hub/Cosmos-Reason2-2B
+  # Supplies the +4000 trajectory vocabulary AND expert_cfg / diffusion_cfg / action_*_cfg --
+  # the config only; no weights are taken from here.
+  alpamayo_config_path: /data/achahe/alpasim/huggingface/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  # Left null on purpose: evaluate_hf.py:70 overwrites it with `evaluate.eval_ckpt`, which is
+  # how slurm_eval_eos.sh's CKPT reaches the student tower. Setting it here is discarded.
+  checkpoint_path: null
+  # THE POINT OF THIS CONFIG: the expert comes from the EOS run, not from the 10B.
+  teacher_checkpoint_path: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_eos_2b_mix_nav_lcdrive/checkpoint-4168
+  # ⚠️ REQUIRED. flash_attention_2 dies on the expert's 4D mask with a device-side assert
+  # (alpamayo_r1.py:248-262); training escapes it only because it passes attention_mask=None.
+  attn_implementation: sdpa
+
+  # ⚠️ MUST MATCH the geometry the checkpoint's layer_mixer.* was saved from. The EoS
+  # checkpoint carries BOTH halves of the deployable model: the frozen student VLM with its
+  # layer_mixer, and the 36-layer expert that was fine-tuned on the mixed cache. Both
+  # checkpoint_path and teacher_checkpoint_path therefore point at the same directory.
+  layer_mix: true
+  layer_mix_expert_layers: 36
+  layer_mix_blocks: 4
+  layer_mix_gain: false
+  layer_mix_sharpen: 0.75
+
+data:
+  # ⚠️ MUST mirror sft_expert_on_student_2b_nav_lcdrive.yaml exactly: same annotations, same
+  # per-anchor t0, cameras [1, 3], "route" in components_order, camera-ids + frame-nums TRUE.
+  # The expert was made tolerant of the cache THIS conditioning produces; changing any of the
+  # four desynchronises the halves of the stitch and the number means nothing. Dropping the
+  # camera-id / frame-num flags alone once moved min_ade 1.116 -> 0.626.
+  val_dataset:
+    # CameraSubsetPAIDataset (not PAIDatasetWithNav directly): it slices the camera axis
+    # BEFORE preprocessing so the prompt is rebuilt from 2 cameras, and it promotes its base
+    # to PAIDatasetWithNav automatically once `annotations_path` is given.
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]          # front-wide, front-telephoto
+    annotations_path: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    local_dir: /data/datasets/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /data/datasets/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      # "route" is what carries nav_text; r1_5.py emits it only on `case "route":`, so
+      # removing it does not error -- the instruction just silently vanishes.
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      # ⚠️ true here, false in the training config: eval must build a PROMPT to roll out from,
+      # not a teacher-forced label sequence.
+      generation_mode: true
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  # No optimizer exists at eval and both of these break it: the ZeRO-2 json expects an
+  # optimizer to shard, and checkpointing forces use_cache=False -- which would disable the
+  # very KV cache the expert reads.
+  deepspeed: null
+  gradient_checkpointing: false
+  report_to: none
+  per_device_eval_batch_size: 4
+  dataloader_num_workers: 4
+
+# ⚠️ Explicit null. `/wandb: default` ships `team: ???` / `project: ???` and any `**cfg.wandb`
+# resolution raises MissingMandatoryValue before wandb is ever reached.
+wandb: null
+
+evaluate:
+  eval_ckpt: null
+  max_eval_steps: -1
+  torch_dtype: bfloat16
+  metric_runner:
+    _target_: alpamayo.metrics.metric_runner.MetricRunner
+    metrics:
+      # K=6 samples -> min_ade@6. Identical to every other arm's sampler so the comparison
+      # is not confounded by the RNG stream.
+      - _target_: alpamayo.metrics.metric_api.ReasoningSampler
+        num_traj_sets: 1
+        top_p: 0.98
+        temperature: 0.6
+        traj_only_generation: false
+        max_generation_length: 256
+        # Denoising (NFE) budget. ⚠️ This key MUST exist here even though the script always
+        # overrides it: `++evaluate...diffusion_kwargs.inference_step=N` cannot create the
+        # intermediate `diffusion_kwargs` node, so without this line the override is silently
+        # rejected and every run would quietly score at the default budget.
+        # Route: ReasoningSampler(**kwargs) -> self.kwargs -> sample_trajectories_from_data
+        # -> ..._with_vlm_rollout(diffusion_kwargs=) -> diffusion.sample(**diffusion_kwargs)
+        # at stitched_model.py:599. `inference_step` is the euler step count of FlowMatching.
+        diffusion_kwargs:
+          inference_step: 10
+      - _target_: alpamayo.metrics.metric_api.DistanceMetrics
+
+paths:
+  output_dir: /data/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/evaleos
+
+task_name: alpamayo_1_5_eos_eval
+run_name: eos_2b_nav_${now:%m%d-%H%M}

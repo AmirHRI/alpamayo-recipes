@@ -28,20 +28,36 @@
 # ⚠️ --mem is REQUIRED. Without it slurm hands over the node's entire RAM and every other job
 # queues on (Resources) with GPUs idle. 170G is half the node, matching the 2-of-4 GPU share.
 set -euo pipefail
-# ⚠️ PRUNE_EXPERT_LAYERS is REQUIRED but may be the literal "none". The 2B students are 28
-# layers deep, so the expert must be pruned to match and a MISSING pin would raise mid-load
-# after ~5 min of weight loading -- hence the mandatory variable. The 4B student is already
-# 36 deep, matching the teacher's expert, so pruning it would CREATE the mismatch. "none"
-# says that explicitly: it is not the same as forgetting the variable, and it must not be
-# exported (the loader keys off the variable's PRESENCE, so exporting an empty string is
-# not equivalent).
-: "${PRUNE_EXPERT_LAYERS:?set PRUNE_EXPERT_LAYERS=comma,separated,indices, or =none for an unpruned 36-layer student}"
-if [[ "$PRUNE_EXPERT_LAYERS" == "none" ]]; then
+# Three ways to reach an expert that is NOT pruned, and they are not interchangeable:
+#
+#   MIX=1                      the LAYER-MIX student: the expert keeps all 36 layers and its
+#                              cache slots are synthesised by P from the 28-layer student, so
+#                              there is nothing to prune and from_stitch RAISES if the pin is
+#                              set. Pruning and mixing are alternatives, never both.
+#   PRUNE_EXPERT_LAYERS=none   the 4B student, already 36 deep and matching the teacher's
+#                              expert -- pruning it would CREATE the mismatch.
+#   PRUNE_EXPERT_LAYERS=<ids>  the 2B PRUNED student: 28 layers deep, so the expert must be
+#                              cut to match.
+#
+# Outside MIX=1 the variable stays MANDATORY, because a MISSING pin raises mid-load, ~5 min
+# into weight loading. "none" states "deliberately unpruned" and must NOT be exported: the
+# loader keys off the variable's PRESENCE, so exporting an empty string is not equivalent.
+if [[ "${MIX:-0}" == "1" ]]; then
+    [[ -z "${PRUNE_EXPERT_LAYERS:-}" || "$PRUNE_EXPERT_LAYERS" == "none" ]] || {
+        echo "[slurm] MIX=1 with PRUNE_EXPERT_LAYERS=$PRUNE_EXPERT_LAYERS is contradictory:" \
+             "mixing keeps all 36 expert layers, pruning removes 8. Pick one." >&2
+        exit 1; }
     unset PRUNE_EXPERT_LAYERS
-    echo "[slurm] PRUNE_EXPERT_LAYERS=none -> expert left UNPRUNED (36 layers)"
+    echo "[slurm] MIX=1: 36-layer expert, cache synthesised by P, PRUNE_EXPERT_LAYERS unset"
 else
-    export PRUNE_EXPERT_LAYERS
-    echo "[slurm] PRUNE_EXPERT_LAYERS=$PRUNE_EXPERT_LAYERS"
+    : "${PRUNE_EXPERT_LAYERS:?set PRUNE_EXPERT_LAYERS=comma,separated,indices, =none for an unpruned 36-layer student, or MIX=1 for the layer-mix student}"
+    if [[ "$PRUNE_EXPERT_LAYERS" == "none" ]]; then
+        unset PRUNE_EXPERT_LAYERS
+        echo "[slurm] PRUNE_EXPERT_LAYERS=none -> expert left UNPRUNED (36 layers)"
+    else
+        export PRUNE_EXPERT_LAYERS
+        echo "[slurm] PRUNE_EXPERT_LAYERS=$PRUNE_EXPERT_LAYERS"
+    fi
 fi
 CONFIG="${CONFIG:?set CONFIG=<config name under configs/>}"
 SMOKE="${SMOKE:-0}"
