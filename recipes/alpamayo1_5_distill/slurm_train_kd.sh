@@ -401,9 +401,134 @@ case "$ARM" in
                 "++callbacks.block_span_schedule.spans=[1,9,18,36]"
                 ++callbacks.block_span_schedule.strict_num_train_epochs=true
                 ++trainer.num_train_epochs=4
-                # Every 500 steps, not the old 0.125 ratio (1,719). Each crash on the old arm
-                # rolled back 1,116 steps; with saves this cheap a restart costs minutes.
-                ++trainer.save_strategy=steps ++trainer.save_steps=500
+                # ⚠️ 0.125 of the run = 1,719 steps = HALF AN EPOCH, and that alignment is
+                # the point, not the interval. 3,438/6,876/10,314/13,752 are the epoch
+                # boundaries, so these 8 saves land on all four of them plus the four
+                # midpoints -- and save_total_limit=8 then keeps exactly that set.
+                # A "cheaper restart" interval of 500 divides none of those boundaries and
+                # prunes to the last 8 (10,500..13,752), which is how job 20724 finished with
+                # NO epoch-1/2/3 checkpoint at all. Per-epoch comparison needs them; a longer
+                # rollback on the rare crash is the cheaper of the two costs.
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36_framecache1080p" ;;
+    nav4bspanmix2camallfc)
+        # nav4bspan2camallfc's twin, ADDING the teacher-forced term back instead of replacing
+        # it. The plain-span arm swaps objectives at each boundary -- m=1, then m=9, then 18,
+        # then 36 -- so after epoch 1 the per-layer signal is gone. This arm keeps m=1 in every
+        # epoch and rides the scheduled span alongside it (weighted MEAN, block_span_mix_weight):
+        #
+        #   epoch 1  block_span_mix=1   mix degenerate -> teacher-forced m=1 alone
+        #   epoch 2  block_span_mix=9   teacher-forced m=1 + span m=9
+        #   epoch 3  block_span_mix=18  teacher-forced m=1 + span m=18
+        #   epoch 4  block_span_mix=36  teacher-forced m=1 + span m=36
+        #
+        # Epoch 1 is therefore IDENTICAL to nav4bspan2camallfc's epoch 1, which is what makes
+        # the two arms a clean A/B on "does the span add anything ON TOP of m=1, or is it
+        # better as a replacement?" -- the question kd_model's mix branch was written to ask.
+        # ⚠️ block_span stays 1: under a mix schedule it is what the teacher-forced term reads,
+        # and the callback rejects any other value rather than silently changing that meaning.
+        # Everything else is held to nav4bspan2camallfc exactly -- manifest, nav format, frame
+        # cache, effective batch 32, warmup 733, epoch-aligned saves -- so the only difference
+        # between the two runs is whether m=1 survives past epoch 1.
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_2cam_nav_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav2cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            exit 1; }
+        [[ -n "$BS" ]] || BS=8
+        [[ -n "$ACCUM" ]] || ACCUM=1    # effective batch = 4 x 8 = 32, as the twin arm
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=1
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}"
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.target=block_span_mix
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                # 0.125 = 1,719 = half an epoch, so the 8 saves land on all four epoch
+                # boundaries plus the midpoints and save_total_limit=8 keeps the lot.
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36mix_w${MIXW:-1.0}_framecache1080p" ;;
+    mixspan2bnavfc)
+        # The 4B's CURRICULUM objective on the 2B LAYER-MIX student. Deliberately NOT mix2bnav:
+        # that arm runs the simultaneous pair (teacher-forced m=1 PLUS span m=9, weighted mean)
+        # every step, while this one runs ONE span per epoch, [1, 9, 18, 36], exactly as
+        # nav4bspan2camallfc did. block_span_mix=0 is what selects the schedule over the mix;
+        # BlockSpanScheduleCallback RAISES if it is left >1, so the two cannot be run by accident.
+        #
+        # Held identical to the 4B run so the 2B and 4B students are comparable end to end:
+        # same manifest (anchors_all, 109,997), same nav format (distance stripped, so the
+        # model-visible route is "<|route_start|>Turn left<|route_end|>"), same generation-mode
+        # prompt ending at <traj_future_start>, same effective batch 32 -> 3,438 steps/epoch,
+        # 13,752 total, warmup 733 = 21.3% of one epoch. ⚠️ That warmup is only correct BECAUSE
+        # the effective batch is 32 on this manifest; the config's shipped 333 is for the 50k
+        # manifest and must not be reused here.
+        #
+        # ⚠️ BS=2/ACCUM=4, not the 4B's BS=8/ACCUM=1, for the same effective 32. The config
+        # measured 38.6 GB at bs=1 and projects ~66 GB at bs=2 for THIS stack -- a 2B student
+        # carrying a 36-layer expert whose m=9 span chain is UNCHECKPOINTED (SPAN_CKPT_MIN=14).
+        # Extrapolating that line puts bs=8 near 230 GB, well past even an H200. Gradient
+        # accumulation is mathematically equivalent here, so only memory and step timing change.
+        # Peak is epoch 2 (m=9, uncheckpointed); epochs 3-4 checkpoint the chain and cost less.
+        unset PRUNE_EXPERT_LAYERS
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_nav_layermix_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        # The 4B's cache serves this run unchanged: cameras [1,3] match, and the 50k manifest
+        # this config ships is a strict subset of anchors_all (verified: 0 anchors and 0 clips
+        # outside it), so every (clip, t0) the loader asks for is already materialised.
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav2cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            exit 1; }
+        [[ -n "$BS" ]] || BS=2
+        [[ -n "$ACCUM" ]] || ACCUM=4    # 4 GPUs x 2 x 4 = 32, matching the 4B run
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.layer_mix=true
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=0
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                # ⚠️ 0.125 = 1,719 steps = HALF AN EPOCH. The alignment is the point: these 8
+                # saves land on all four epoch boundaries (3,438/6,876/10,314/13,752) plus the
+                # four midpoints, and save_total_limit=8 keeps exactly that set. An interval of
+                # 500 divides none of the boundaries and prunes to the last 8, which is how the
+                # 4B run finished with only its epoch-4 checkpoint -- useless for the per-epoch
+                # 2B-vs-4B comparison this arm exists to enable.
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
                 ++trainer.save_total_limit=8
                 ++trainer.dataloader_prefetch_factor=4
                 ++trainer.dataloader_persistent_workers=true)
@@ -583,7 +708,7 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam|nav4bspan2camall|nav4bspan2camallfc)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam|nav4bspan2camall|nav4bspan2camallfc|mixspan2bnavfc|nav4bspanmix2camallfc)" >&2; exit 1 ;;
 esac
 
 # The requested run has a deliberate human gate. Running this file directly prints a real turn
