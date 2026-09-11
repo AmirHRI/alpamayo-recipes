@@ -414,6 +414,216 @@ case "$ARM" in
                 ++trainer.dataloader_prefetch_factor=4
                 ++trainer.dataloader_persistent_workers=true)
         ARM="${ARM}_m1-9-18-36_framecache1080p" ;;
+    nav4bspan4camallfc)
+        # nav4bspan2camall again, reading the PRE-MATERIALISED frame cache instead of the
+        # dataset ZIPs. Same student, cameras, manifest, objective, batch and schedule -- ONLY
+        # where the pixels come from changes, which is what keeps the two comparable.
+        #
+        # WHY. Job 20710 measured the live loader at 1.64 TiB of NFS per EPOCH to deliver
+        # 879,976 images: whole 1.2 GiB chunk ZIPs for the ~49% of clips the manifest wants,
+        # whole 604-frame clips for the ~27 frames it uses, at 1920x1080 for a ViT that sees
+        # 576x320. /temp gives ~120 MB/s (already nconnect=8), so that IS ~4 h/epoch of wire
+        # time -- a 3.0 s median step against a 2.0 s GPU floor, and three crashes when a 1 GiB
+        # copy outran the 120 s dataloader timeout. scripts/build_frame_cache.py wrote those
+        # 879,976 images once (~84 GiB, x264 crf18); a step now reads ~2.7 MB.
+        # tests/test_frame_cache_equivalence.py holds the substitution honest: prompt text and
+        # image_grid_thw identical to the live loader, ego tensors identical, pixels within
+        # 0.011 mean |delta| of the source after the processor's downscale.
+        #
+        # So everything the old arm needed to SURVIVE NFS is gone, not retuned: no ZIP cache,
+        # no locality sampler, no out-of-order delivery, no dataloader timeout. Shuffling is
+        # free now, and mixes batches strictly better than chunk-grouped sampling did.
+        #
+        # Deliberately NOT staged into /dev/shm: at ~84 GiB the page cache holds the whole
+        # working set inside the 640 GiB cgroup, reclaimably, and warms itself during epoch 1.
+        # Staging would spend the same bytes on UNRECLAIMABLE tmpfs -- the accounting that made
+        # the old arm fragile in the first place.
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_4cam_nav_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav4cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            echo "        Then:      build_frame_cache.py --out $FRAME_CACHE --finalize" >&2
+            exit 1; }
+        # ⚠️ BS=4/ACCUM=2, NOT the 2-camera arm's 8/1. Four cameras is 16 images per sample
+        # instead of 8, so the vision activations roughly double. The effective batch is
+        # held at 4 x 4 x 2 = 32, which is what keeps warmup 733 and 3,438 steps/epoch
+        # identical to every other run -- gradient accumulation is exactly equivalent for
+        # a mean-reduced loss, so only memory and step timing change.
+        [[ -n "$BS" ]] || BS=4
+        [[ -n "$ACCUM" ]] || ACCUM=2    # effective batch = 4 GPUs x 4 x 2 = 32
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        # Decoding two 4-frame mini-clips is far cheaper than seeking 1080p video inside a
+        # multi-GB ZIP, and there is no NFS storm left to provoke, so workers are cheap.
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=0
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                # ⚠️ 0.125 of the run = 1,719 steps = HALF AN EPOCH, and that alignment is
+                # the point, not the interval. 3,438/6,876/10,314/13,752 are the epoch
+                # boundaries, so these 8 saves land on all four of them plus the four
+                # midpoints -- and save_total_limit=8 then keeps exactly that set.
+                # A "cheaper restart" interval of 500 divides none of those boundaries and
+                # prunes to the last 8 (10,500..13,752), which is how job 20724 finished with
+                # NO epoch-1/2/3 checkpoint at all. Per-epoch comparison needs them; a longer
+                # rollback on the rare crash is the cheaper of the two costs.
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36_framecache4cam1080p" ;;
+    nav4bspan2camallfc_cachenorm)
+        # nav4bspan2camallfc with EXACTLY ONE variable changed: block_norm teacher -> cache.
+        # Its own output_dir and run_name, so epoch 1 (checkpoint-3438) is paired against the
+        # parent's checkpoint-3438 with only the normaliser differing.
+        #
+        # WHY. Measured in block_losses.py: driving a block with a ZERO cache scores 0.0104,
+        # so 99% of ||y_teacher||^2 is cache-INDEPENDENT residual stream -- a component the
+        # student cannot get wrong. The informative band is 0..0.0104 and a trained student
+        # sits at 0.0012, i.e. 88% already captured with the whole remaining gap in the last
+        # 12%. That is why "500 steps moved this loss within noise while ade moved -13% at
+        # z=-3.44". block_norm=cache divides by ||y_teacher - y_zero||^2 instead: zero-cache
+        # scores exactly 1.0, the model ~0.115, and layers are weighted by how much the cache
+        # actually controls them rather than by residual magnitude.
+        #
+        # ⚠️ Adam is per-parameter scale-invariant, so this changes CROSS-LAYER weighting and
+        # the readability of the curve, NOT the gradient direction within a layer. COMPARE_EVAL
+        # §4 found three hand-designed cross-layer reweightings all NEGATIVE, so the honest
+        # prior is "better diagnostic, unproven accuracy". Read the curve before the eval.
+        #
+        # ⚠️ COSTS AN EXTRA ZERO-CACHE FORWARD per step (y_zero, kd_model.py:879-887) on top of
+        # the teacher-forced pass. Budget above the parent's ~3.4 h/epoch.
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_2cam_nav_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav2cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            exit 1; }
+        [[ -n "$BS" ]] || BS=8
+        [[ -n "$ACCUM" ]] || ACCUM=1    # 4 GPUs x 8 x 1 = 32, identical to the parent
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=cache ++model.kd.block_span=1
+                ++model.kd.block_span_mix=0
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36_framecache1080p" ;;
+
+    nav4bspan2camallfc_freerun)
+        # nav4bspan2camallfc with EXACTLY ONE variable changed: block_freerun_weight 0 -> 2e-4 (see SMOKE RESULT below).
+        # block_norm stays 'teacher' so this is NOT confounded with the cachenorm twin; the two
+        # run in parallel on separate output_dirs and are each paired against the same parent.
+        #
+        # WHY. freerun_probe.py (n=32): the teacher-forced error L_block trains on is FLAT at
+        # ~4.1e-4 across all 36 layers, while the free-running error -- the student expert
+        # consuming its OWN chain, which is what inference does -- grows to 1.3e-2. That is 32x
+        # overall and 72x at the deepest layers. L_block has no gradient path to it; this term
+        # supplies one. The span schedule is NOT a substitute: COMPARE_EVAL §3 measured the
+        # objective m-INVARIANT (loss FALLS 0.00170 -> 0.00093 as spans deepen, peak memory flat
+        # at 65.8 GiB from m=1 to m=28) because the expert layer map is contractive.
+        #
+        # ⚠️ BLOCK_FR_FP32=1 IS BROKEN -- DO NOT SET IT. kd_model.py:1472-1483 casts the
+        # activations to fp32 while DISABLING autocast, but the frozen expert's weights stay
+        # bf16, so the first q_proj raises
+        #     RuntimeError: expected mat1 and mat2 to have the same dtype, float != BFloat16
+        # at modeling_qwen3_vl.py:428, on every rank, at step 0. Job 20829 died on it four
+        # times through the restart loop. The flag appears in no other script or doc, so the
+        # fp32 opt-in has never run end-to-end on this stack.
+        # Casting the whole expert to fp32 is NOT the fix: L_block runs OUTSIDE autocast
+        # against bf16 weights, so that would silently change the parent-comparable term too.
+        # A correct fix needs a SEPARATE fp32 copy of the expert for this chain only.
+        #
+        # So this arm runs the free-running chain in bf16, which kd_model.py:1464-1471 warns
+        # produced a non-finite gradient on the first backward under plain zero2 (grad_norm
+        # pinned at the 2.0 sentinel at step 0, nan at step 1). That warning is now UNVERIFIED
+        # on this stack -- SMOKE=1 is the 20-step check, and is cheap. Run it before the full
+        # 4-epoch job:
+        #     SMOKE=1 APPROVED=1 ARM=nav4bspan2camallfc_freerun sbatch slurm_train_kd.sh
+        #
+        # SMOKE RESULT (job 20830, 20 steps, 158 s): bf16 is FINE -- no nan, no 2.0 sentinel,
+        # so the kd_model.py warning does not hold on this stack and no fp32 path is needed.
+        # But it also showed weight=1.0 is WRONG BY ~3 ORDERS OF MAGNITUDE here:
+        #     freerun_loss ~89-190   block_loss ~0.083   ->  freerun is 99.94% of the total
+        # and over 20 steps freerun was FLAT (89,143,106,130,114,143,190,130) while block_loss
+        # ROSE 0.0789 -> 0.0893, with grad_norm swinging 2.5k-9.8k (cachenorm arm: ~1.2-1.6k).
+        # The docstring's "L_block keeps ~4% of the gradient at weight 1.0" is not true here.
+        #
+        # ⚠️ WHY THAT MATTERS: `tgt = captured[n_layers-1]["y_out"]` -- freerun matches ONLY the
+        # FINAL layer's output after chaining all 36 blocks, i.e. it is an ENDPOINT-ONLY
+        # objective, structurally the same as L_field. COMPARE_EVAL §4a measured L_field alone
+        # at 7.8x WORSE than L_block and worse than the CE-only and KD-only floors, because
+        # intermediates drift freely while block_loss rises 25.6x. Rising block_loss under a
+        # dominant endpoint term is that exact signature, already visible by step 16.
+        #
+        # So weight=0.0002 keeps L_BLOCK DOMINANT (~75%) and uses freerun as the auxiliary that
+        # supplies the compounding gradient L_block cannot see. That is the `blockfield`
+        # combination COMPARE_EVAL §9 lists as never having run past checkpoint-500.
+        # ⚠️ COST: 7.9 s/step vs the parent's 3.5 s (job 20830) -> budget ~7.5 h/epoch.
+        MODEL_TAG=4b
+        CONFIG_NAME=sft_kd_qwen3_4b_2cam_nav_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav2cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            exit 1; }
+        [[ -n "$BS" ]] || BS=8
+        [[ -n "$ACCUM" ]] || ACCUM=1    # 4 GPUs x 8 x 1 = 32, identical to the parent
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=0
+                ++model.kd.block_freerun_weight=0.0002
+                ++model.kd.block_freerun_layers=0
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36_framecache1080p" ;;
     nav4bspanmix2camallfc)
         # nav4bspan2camallfc's twin, ADDING the teacher-forced term back instead of replacing
         # it. The plain-span arm swaps objectives at each boundary -- m=1, then m=9, then 18,
@@ -464,6 +674,67 @@ case "$ARM" in
                 ++trainer.num_train_epochs=4
                 # 0.125 = 1,719 = half an epoch, so the 8 saves land on all four epoch
                 # boundaries plus the midpoints and save_total_limit=8 keeps the lot.
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36mix_w${MIXW:-1.0}_framecache1080p" ;;
+    mixspanmix2bnavfc)
+        # The FOURTH cell of the 2x2: {4B, 2B} x {span REPLACES m=1, span rides ALONGSIDE m=1}.
+        # This is mixspan2bnavfc's twin -- same 2B layer-mix student, same everything -- with
+        # the schedule driving block_span_mix instead of block_span, exactly as
+        # nav4bspanmix2camallfc is nav4bspan2camallfc's twin:
+        #
+        #   epoch 1  block_span_mix=1   mix degenerate -> teacher-forced m=1 alone
+        #   epoch 2  block_span_mix=9   teacher-forced m=1 + span m=9
+        #   epoch 3  block_span_mix=18  teacher-forced m=1 + span m=18
+        #   epoch 4  block_span_mix=36  teacher-forced m=1 + span m=36
+        #
+        # Epoch 1 is therefore identical to mixspan2bnavfc's epoch 1, so the pair isolates the
+        # objective change at the 2B scale the same way the 4B pair does at 4B.
+        # ⚠️ block_span stays 1: under a mix schedule it is what the teacher-forced term reads.
+        # ⚠️ m=36 is legal here ONLY because the span is bounded by the MIXER's 36 synthesised
+        # slots, not the 28-layer student or the 28-layer expert module. Getting that wrong is
+        # what killed job 20777 at its epoch-4 boundary; see BlockSpanScheduleCallback.
+        # ⚠️ Spans of 18 and 36 straddle the mixer's 4 blocks of 9, so from epoch 3 the span
+        # term stops grading one block's 9-from-7 reconstruction at a time. That is inherent to
+        # putting this schedule on a mixed student and is equally true of mixspan2bnavfc -- the
+        # two arms remain comparable to each other, which is the point.
+        unset PRUNE_EXPERT_LAYERS
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_2cam_nav_layermix_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav2cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            exit 1; }
+        # BS=8/ACCUM=1 measured at ~65 GB/GPU on the H200 for this exact stack (job 20776), so
+        # the twin's conservative BS=2/ACCUM=4 is unnecessary. Effective batch is 32 either way.
+        [[ -n "$BS" ]] || BS=8
+        [[ -n "$ACCUM" ]] || ACCUM=1    # 4 GPUs x 8 x 1 = 32
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.layer_mix=true
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=1
+                ++model.kd.block_span_mix_weight="${MIXW:-1.0}"
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.target=block_span_mix
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                # 0.125 = 1,719 = half an epoch: the 8 saves land on all four epoch boundaries
+                # plus the midpoints, and save_total_limit=8 keeps exactly that set.
                 ++trainer.save_strategy=steps ++trainer.save_steps=0.125
                 ++trainer.save_total_limit=8
                 ++trainer.dataloader_prefetch_factor=4
@@ -708,7 +979,7 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam|nav4bspan2camall|nav4bspan2camallfc|mixspan2bnavfc|nav4bspanmix2camallfc)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam|nav4bspan2camall|nav4bspan2camallfc|nav4bspan4camallfc|nav4bspan2camallfc_cachenorm|nav4bspan2camallfc_freerun|mixspan2bnavfc|nav4bspanmix2camallfc|mixspanmix2bnavfc)" >&2; exit 1 ;;
 esac
 
 # The requested run has a deliberate human gate. Running this file directly prints a real turn
