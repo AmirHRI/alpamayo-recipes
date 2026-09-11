@@ -421,6 +421,9 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
     ):
         """``v_repo`` at ``(x, tau)`` from ``module`` (self, EMA-loaded self, or the teacher).
 
+        Action states stay fp32 through Fourier encoding, matching inference; only the
+        projected embeddings are cast to the expert dtype.
+
         ⚠️ ``tau_to_s(tau)`` -- the expert's timestep encoder was trained on the repo's ``s``.
         ⚠️ autocast around ``action_in_proj``/``action_out_proj``, not at the call site:
         ``PerWaypointActionInProjV2`` forces ``x.float()`` internally, so its fp32 activations
@@ -486,7 +489,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
 
         eps = torch.randn(x0.shape, device=device, dtype=torch.float32)
         v = lambda mod, x, tau: self._velocity(
-            mod, x.to(dtype), tau, cache, conditioning, dtype
+            mod, x.float(), tau, cache, conditioning, dtype
         ).float()
 
         # 1) boundary. f(x, 0) = x exactly, for the real head at real scale.
@@ -613,7 +616,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
                     "every batch; set data.train_dataset.teacher_trajectory_cache_root"
                 )
             with torch.no_grad(), _Phase.t("teacher_cache"):
-                states = teacher_trajectory_states.to(device=device)
+                states = teacher_trajectory_states.to(device=device, dtype=torch.float32)
                 _, noise_index, x_hi_fp32, x_lo_fp32, tau_lo, tau_hi = (
                     sample_cached_teacher_transition(
                         states,
@@ -631,8 +634,8 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
                 v_teacher = transition_velocity(
                     x_hi_fp32, x_lo_fp32, tau_lo, tau_hi
                 )
-                x_hi = x_hi_fp32.to(dtype)
-                x_lo = x_lo_fp32.to(dtype)
+                x_hi = x_hi_fp32
+                x_lo = x_lo_fp32
             if (
                 os.environ.get("CD_SELFTEST") == "1"
                 and not getattr(self, "_cd_selftested", False)
@@ -657,7 +660,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
                 self._cd_selftest(x0, cache, conditioning, dtype, device)
             _, tau_lo, tau_hi = sample_rungs(b, self.m_rungs, device, generator=gen)
             eps = torch.randn(x0.shape, device=device, dtype=torch.float32, generator=gen)
-            x_hi = interpolate(x0, eps, tau_hi).to(dtype)
+            x_hi = interpolate(x0, eps, tau_hi)
             teacher = self._ensure_teacher_expert(device, dtype)
             # One online teacher NFE and the backward-in-tau Euler step it drives.
             with torch.no_grad(), _Phase.t("expert_teacher"):
@@ -666,7 +669,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
                 )
                 x_lo = teacher_step(
                     x_hi.float(), v_teacher.float(), tau_hi - tau_lo
-                ).to(dtype)
+                )
 
         # 4) the EMA target, theta^- = stopgrad(EMA(theta)). Skipped entirely when every
         #    sample is on the anchor rung, where its coefficient (1 - lam) is exactly zero.

@@ -40,6 +40,11 @@ SCRIPT="$REPO/recipes/alpamayo1_5_distill/scripts/build_frame_cache.py"
 OUT="${OUT:-/temp/achahe/physical_ai_av/framecache_nav2cam_1080p}"
 SHARDS="${SHARDS:-24}"
 CRF="${CRF:-18}"
+# ⚠️ Must be passed to EVERY build_frame_cache.py call below. The script defaults to "1,3",
+# so omitting it here would quietly write a 2-camera cache into a directory named for 4 --
+# and the reader only rejects a mismatch against what the INDEX records, which would then
+# also say 2. The camera set is part of the cache identity; keep it in the OUT name too.
+CAMERAS="${CAMERAS:-1,3}"
 VERIFY="${VERIFY:-0}"
 
 [[ -x "$VENV" ]] || { echo "[cache] no interpreter at $VENV" >&2; exit 1; }
@@ -53,7 +58,7 @@ df -h /temp | tail -1 | sed 's/^/[cache] /'
 # a frame-selection or codec regression would be invisible in the trained model, so it is
 # proven on real anchors before 100+ GiB is written.
 echo "[cache] --- verify ---"
-"$VENV" "$SCRIPT" --out "$OUT" --crf "$CRF" --verify "${VERIFY_N:-8}" --verify-only \
+"$VENV" "$SCRIPT" --out "$OUT" --crf "$CRF" --cameras "$CAMERAS" --verify "${VERIFY_N:-8}" --verify-only \
     2>&1 | grep -vE "FutureWarning|import pynvml"
 
 if [[ "$VERIFY" != "0" ]]; then
@@ -67,6 +72,7 @@ for ((s = 0; s < SHARDS; s++)); do
     "$VENV" "$SCRIPT" \
         --out "$OUT" \
         --crf "$CRF" \
+        --cameras "$CAMERAS" \
         --shard "$s" \
         --num-shards "$SHARDS" \
         --log-every 50 \
@@ -95,7 +101,7 @@ echo "[cache] clip zips:  $(find "$OUT" -name '*.zip' | wc -l)"
 # leaves the index unwritten rather than letting training start on a partial cache.
 if [[ "$status" == "0" ]]; then
     echo "[cache] --- finalize ---"
-    if "$VENV" "$SCRIPT" --out "$OUT" --crf "$CRF" --finalize 2>&1 \
+    if "$VENV" "$SCRIPT" --out "$OUT" --crf "$CRF" --cameras "$CAMERAS" --finalize 2>&1 \
         | grep -vE "FutureWarning|import pynvml"; then
         echo "[cache] cache is complete and indexed; train with"
         echo "        ARM=nav4bspan2camallfc sbatch slurm_train_kd.sh"

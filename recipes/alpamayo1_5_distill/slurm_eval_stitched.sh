@@ -64,16 +64,48 @@ fi
 # 11 -> 15 with 4/2 pinned) must match what the checkpoint's layer_mixer.* was saved from, or
 # load_state_dict reports a size mismatch. Checked BEFORE the mix2b* branch, since
 # "mixpin2bnav..." does not match "mix2b*" but the ordering should not be load-bearing.
-if [[ "$ARM" == mixpin2b* ]]; then
+# ⚠️ SUBSTRING globs, and the ORDER IS NOW LOAD-BEARING: `*mixpin2b*` is also matched by
+# `*mix*2b*`, so pinned must be tested first. The earlier anchored forms (`mixpin2b*` /
+# `mix2b*`) only matched arms whose name STARTS with the mix token, so `mixspan2bnavfc...`
+# fell through to the pruned-expert branch above -- loading a 28-layer expert config for a
+# 36-layer mix checkpoint AND exporting the pin that from_stitch refuses. Both are the silent
+# failures the comments above warn about. The pre-flight check below is what actually
+# guarantees this is right; these globs only pick the default.
+if [[ "$ARM" == *mixpin2b* ]]; then
     MODEL_TAG=2b
     CONFIG_NAME=sft_eval_stitched_2b_layermix_pinned_lcdrive
     unset PRUNE_EXPERT_LAYERS
     echo "[slurm] pinned layer-mix arm: 36-layer expert, head/tail identity, pin unset"
-elif [[ "$ARM" == mix2b* ]]; then
+elif [[ "$ARM" == *mix*2b* ]]; then
     MODEL_TAG=2b
     CONFIG_NAME=sft_eval_stitched_2b_layermix_lcdrive
     unset PRUNE_EXPERT_LAYERS
     echo "[slurm] layer-mix arm: 36-layer expert, PRUNE_EXPERT_LAYERS unset"
+fi
+# ⚠️ PROMPT DISTRIBUTION, chosen independently of the stitch above. Every config picked so far
+# scores 4 cameras with NO route, because that is how the original KV arms were trained. The
+# frame-cache arms were trained on cameras [1,3] WITH the nav route, so scoring them with the
+# default block is off-distribution twice over -- the camera half alone measured +0.2167
+# min_ade (jobs 20585 vs 20598) and the route half deletes the conditioning outright.
+# Auto-detected from "framecache" so no PREVIOUSLY RECORDED invocation changes meaning; set
+# NAV2CAM=1/0 to force it either way, or CONFIG_NAME=... to bypass this entirely.
+if [[ -z "${CONFIG_NAME_OVERRIDE:-}" ]]; then
+    _nav2cam_default=0
+    [[ "$ARM" == *framecache* ]] && _nav2cam_default=1
+    if [[ "${NAV2CAM:-$_nav2cam_default}" == "1" ]]; then
+        case "$CONFIG_NAME" in
+            sft_eval_stitched_4b_lcdrive)
+                CONFIG_NAME=sft_eval_stitched_4b_2cam_nav_lcdrive ;;
+            sft_eval_stitched_2b_layermix_lcdrive)
+                CONFIG_NAME=sft_eval_stitched_2b_layermix_2cam_nav_lcdrive ;;
+            *)  echo "[slurm] NAV2CAM=1 has no 2cam+nav counterpart for $CONFIG_NAME;" \
+                     "add one or pass CONFIG_NAME_OVERRIDE=" >&2; exit 1 ;;
+        esac
+        echo "[slurm] NAV2CAM: cameras [1,3] + route -> $CONFIG_NAME"
+    fi
+else
+    CONFIG_NAME="$CONFIG_NAME_OVERRIDE"
+    echo "[slurm] CONFIG_NAME_OVERRIDE -> $CONFIG_NAME"
 fi
 # PIN_GPU=3 -> run on that PHYSICAL card. ⚠️ Must NOT go through srun: slurm re-derives
 # CUDA_VISIBLE_DEVICES from the step's GPU binding after --export is processed, so the pin is
@@ -119,6 +151,40 @@ else
         [[ -z "$CKPT" ]] && { echo "[slurm] no checkpoint for ARM=$ARM" >&2; exit 1; }
     fi
 fi
+# PRE-FLIGHT: ask the CHECKPOINT, not its name, whether it was trained with the layer mix.
+# The arm-name globs above are a guess; this is the fact. Both failure directions are already
+# "caught" downstream -- _refuse_orphaned_layer_mix for a mix checkpoint under a plain config,
+# a load_state_dict size mismatch for the wrong mixer geometry -- but only after ~5 min of
+# weight loading and with an error that does not name the real problem. Two seconds here turns
+# that into one line before anything is allocated.
+if [[ -f "$CKPT/model.safetensors" ]]; then
+    "$VENV/python" - "$CKPT" "$CONFIG_NAME" <<'PYEOF' || exit 1
+import os, sys
+from safetensors import safe_open
+
+ckpt, config_name = sys.argv[1], sys.argv[2]
+with safe_open(os.path.join(ckpt, "model.safetensors"), "pt") as f:
+    shapes = {k: tuple(f.get_slice(k).get_shape()) for k in f.keys() if "layer_mixer" in k}
+
+ckpt_has_mix = bool(shapes)
+config_wants_mix = "layermix" in config_name
+if ckpt_has_mix != config_wants_mix:
+    sys.exit(
+        f"[eval] MISMATCH: checkpoint {'HAS' if ckpt_has_mix else 'has NO'} layer_mixer.* "
+        f"but config {config_name} {'expects' if config_wants_mix else 'does not expect'} the "
+        f"mix.\n       A layer-mix student evaluated through a pruned-expert config (or the "
+        f"reverse) scores a model that was never trained.\n       Check the ARM -> CONFIG_NAME "
+        f"branches in this script."
+    )
+if ckpt_has_mix:
+    blocks, g_in, g_out = shapes["layer_mixer.logit_k"]
+    print(
+        f"[slurm] checkpoint mixer verified: {blocks} blocks, {g_in} -> {g_out} "
+        f"({blocks * g_in} student -> {blocks * g_out} expert layers)"
+    )
+PYEOF
+fi
+
 # CAMERAS=[1,3] -> evaluate on that camera SUBSET, with the prompt rebuilt from it.
 # ⚠️ REQUIRED for any arm trained on a subset. block2bspan / block2b2cam train on cameras
 # [1,3] (sft_kd_cosmos2b_2cam_lcdrive), but the val_dataset shipped here is the 4-camera

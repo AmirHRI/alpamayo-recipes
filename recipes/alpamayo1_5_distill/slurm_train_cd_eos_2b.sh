@@ -25,6 +25,16 @@ EOS_CKPT="${EOS_CKPT:-$OUT/output_eos_2b_nav_e3_clean_maskfix_e2_lcdrive/checkpo
 RUN_OUT="${OUTPUT_DIR:-$OUT/output_cd_eos2b_nav_e2_bs32_20260827}"
 
 # This is already a compact, cache-aligned 28-layer expert. Identity-slot pruning is wrong.
+# ⚠️ SAME REASON AS slurm_train_cd_eos_4b.sh, and this script was missing it. ConsistencyExpertVLA
+# eagerly calls AutoProcessor.from_pretrained(self.vlm_name_or_path) at construction, and at that
+# instant the value is still whatever the 10B config.json holds -- the bare repo id
+# `nvidia/Cosmos-Reason2-8B`, which is GATED. Without these the job dies in ~35 s with a 401
+# naming a model this run never otherwise touches. The 8B is already in /temp/achahe/hf_cache;
+# HF_HOME points at it and OFFLINE suppresses the revision HEAD request that would 401 anyway.
+# The EoS/stitched path rewrites the config before instantiation, which is why those runs need
+# no HF env at all -- so the omission here stayed invisible until a 2B CD run was attempted.
+export HF_HOME=/temp/achahe/hf_cache
+export HF_HUB_OFFLINE=1
 unset PRUNE_EXPERT_LAYERS
 
 if [[ ! -f "$EOS_CKPT/model.safetensors.index.json" && ! -f "$EOS_CKPT/model.safetensors" ]]; then
@@ -76,7 +86,12 @@ echo "[slurm] effective batch: 4 x 2 GPUs x 4 accumulation = 32"
 echo "[slurm] epochs: 2; output: $RUN_OUT"
 nvidia-smi -L
 
-srun "$VENV/torchrun" --nproc_per_node 2 --master_port "$MASTER_PORT" \
+# ⚠️ Rank count is now a variable, DEFAULT 2 so every recorded invocation of this script keeps
+# its exact meaning. It matters because the effective batch is nproc x bs x accum: at the
+# config's bs4/accum2 this is 16 on 2 ranks but 32 on 4, and 32 is what the 4B CD used.
+# Mismatching it silently halves the batch and doubles the step count -- visible only as a
+# 13,750-step run where the 4B took 6,876.
+srun "$VENV/torchrun" --nproc_per_node "${GPUS:-2}" --master_port "$MASTER_PORT" \
     -m alpamayo1_5_distill.train_kd \
     --config-path pkg://alpamayo1_5_distill/configs \
     --config-name "${CONFIG:-sft_cd_eos_2b_nav_lcdrive}" \

@@ -3,6 +3,8 @@
 
 """Tests for batch-safe action-expert cache conditioning."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -193,6 +195,94 @@ def _run_batch_invariance(device, attention_implementation, dtype):
 def test_same_prompt_is_batch_invariant_with_correct_expert_mask():
     """The same short prompt must not change when batched beside a longer prompt."""
     _run_batch_invariance(torch.device("cpu"), "sdpa", torch.float32)
+
+
+@pytest.mark.parametrize("reverse_rows", [False, True])
+def test_eos_forward_masks_padding_and_future_suffixes(reverse_rows):
+    from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLTextConfig
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLTextModel
+
+    from alpamayo1_5_distill.models.stitched_model import TrainableStitchedAlpamayoR1
+
+    torch.manual_seed(19)
+
+    def text_model():
+        config = Qwen3VLTextConfig(
+            vocab_size=32, hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+            num_attention_heads=4, num_key_value_heads=2, head_dim=8,
+            max_position_embeddings=128,
+            rope_scaling={"rope_type": "default", "mrope_section": [2, 1, 1]},
+        )
+        config._attn_implementation = "sdpa"
+        return Qwen3VLTextModel(config).eval()
+
+    vlm = text_model()
+    expert = text_model()
+    action_in = torch.nn.Linear(2, 32)
+    action_out = torch.nn.Linear(32, 2)
+    captured = {}
+
+    def prefill(input_ids, attention_mask, labels, use_cache):
+        assert labels is None
+        positions = (attention_mask.cumsum(-1) - 1).clamp_min(0)
+        output = vlm(
+            input_ids=input_ids, attention_mask=attention_mask,
+            position_ids=positions.unsqueeze(0).expand(3, -1, -1), use_cache=use_cache,
+        )
+        output.rope_deltas = attention_mask.sum(-1, keepdim=True) - input_ids.shape[1]
+        return output
+
+    def capture_expert(module, args, kwargs):
+        captured["mask"] = kwargs["attention_mask"].detach().clone()
+        captured["positions"] = kwargs["position_ids"].detach().clone()
+        captured["prefix_len"] = kwargs["past_key_values"].get_seq_length()
+
+    def compute_loss(training_data, pred):
+        captured["pred"] = pred.detach().clone()
+        return pred.square().mean()
+
+    expert.register_forward_pre_hook(capture_expert, with_kwargs=True)
+    harness = SimpleNamespace(
+        cotrain_vlm=False, stop_grad_from_vlm=True,
+        config=SimpleNamespace(traj_token_ids={"future_start": 31}, expert_non_causal_attention=True),
+        fuse_traj_tokens=lambda input_ids, traj_data: input_ids,
+        vlm=prefill, expert=expert,
+        action_in_proj=lambda noisy, timesteps: action_in(noisy),
+        action_out_proj=action_out,
+        action_space=SimpleNamespace(get_action_space_dims=lambda: (2, 2)),
+        diffusion=SimpleNamespace(compute_loss_from_pred=compute_loss),
+        _process_traj_future_training=lambda data: {
+            "noisy_x": data["ego_future_xyz"], "timesteps": torch.zeros(1),
+        },
+    )
+    action = torch.randn(1, 2, 2)
+    single = {"input_ids": torch.tensor([[4, 31, 10, 11, 12]]),
+              "attention_mask": torch.ones(1, 5, dtype=torch.long)}
+    TrainableStitchedAlpamayoR1.forward(harness, single, ego_future_xyz=action)
+    expected = captured["pred"].clone()
+    mixed = {
+        "input_ids": torch.tensor([[0, 0, 4, 31, 10, 11, 12], [2, 3, 4, 5, 31, 10, 11]]),
+        "attention_mask": torch.tensor([[0, 0, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1, 1]]),
+    }
+    actions = torch.cat((action, torch.randn_like(action)))
+    if reverse_rows:
+        mixed = {key: value.flip(0) for key, value in mixed.items()}
+        actions = actions.flip(0)
+    output = TrainableStitchedAlpamayoR1.forward(harness, mixed, ego_future_xyz=actions)
+    short_row = int(reverse_rows)
+    torch.testing.assert_close(captured["pred"][short_row:short_row + 1], expected)
+    assert captured["prefix_len"] == 5
+    assert captured["mask"][short_row, 0, 0].eq(0).tolist() == [
+        False, False, True, True, False, True, True,
+    ]
+    assert captured["positions"][0, short_row].tolist() == [2, 3]
+    assert "input_ids" in mixed
+    output.loss.backward()
+    assert all(parameter.grad is None for parameter in vlm.parameters())
+    for parameter in (expert.layers[0].self_attn.q_proj.weight, action_in.weight, action_out.weight):
+        assert parameter.grad is not None
+        assert torch.isfinite(parameter.grad).all()
+        assert parameter.grad.abs().sum() > 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")

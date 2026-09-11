@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from alpamayo1_5_distill.models.consistency_losses import (
@@ -491,7 +492,109 @@ def test_loss_shapes_at_batch_one_and_eight():
 # ---------------------------------------------------------------- expert field wiring
 
 
-def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice():
+@pytest.mark.parametrize("teacher_source", ["cached_full", "online"])
+@pytest.mark.parametrize("cd_weight", [0.0, 1.0])
+def test_cd_forward_preserves_fp32_action_states(teacher_source, cd_weight, monkeypatch):
+    """Keep sampler precision before Fourier encoding, even with a bf16 expert."""
+    from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
+
+    monkeypatch.delenv("CD_SELFTEST", raising=False)
+
+    class Cache:
+        layers = ()
+
+        def crop(self, length):
+            self.prefix_len = length
+
+    batch, n_action, seed = 4, 3, 17
+    ground_truth = torch.linspace(-0.9137, 1.2317, batch * n_action * 2).view(
+        batch, n_action, 2
+    )
+    states = torch.randn(
+        batch, 2, 11, n_action, 2, generator=torch.Generator().manual_seed(23)
+    )
+    generator = torch.Generator().manual_seed(seed)
+    if teacher_source == "cached_full":
+        _, noise_index, expected_hi, expected_lo, tau_lo, tau_hi = (
+            sample_cached_teacher_transition(states, 10, generator=generator)
+        )
+        endpoint = cached_teacher_endpoint(states, noise_index)
+    else:
+        _, tau_lo, tau_hi = sample_rungs(batch, 10, torch.device("cpu"), generator)
+        noise = torch.randn(ground_truth.shape, generator=generator)
+        expected_hi = interpolate(ground_truth, noise, tau_hi)
+        expected_lo = teacher_step(
+            expected_hi, torch.full_like(expected_hi, 0.125), tau_hi - tau_lo
+        )
+    assert not torch.equal(expected_hi, expected_hi.bfloat16().float())
+    assert bool(needs_target(tau_lo).any())
+
+    parameter = torch.nn.Parameter(torch.tensor(0.125, dtype=torch.bfloat16))
+    calls = []
+
+    def velocity(module, state, tau, cache, conditioning, dtype):
+        assert dtype == torch.bfloat16
+        assert state.dtype == torch.float32
+        calls.append(state.detach().clone())
+        return parameter.expand_as(state)
+
+    expert = torch.nn.Linear(2, 2, dtype=torch.bfloat16)
+    expert.config = SimpleNamespace(_attn_implementation="sdpa")
+    owner = SimpleNamespace(
+        expert=expert,
+        action_space=SimpleNamespace(
+            get_action_space_dims=lambda: (n_action, 2),
+            traj_to_action=lambda **kwargs: ground_truth,
+        ),
+        config=SimpleNamespace(traj_token_ids={"future_start": 9}),
+        cotrain_vlm=False,
+        fuse_traj_tokens=lambda input_ids, data: input_ids,
+        vlm=lambda **kwargs: SimpleNamespace(
+            past_key_values=Cache(), rope_deltas=torch.zeros(batch, 1, dtype=torch.long)
+        ),
+        _cd_seed=seed,
+        teacher_source=teacher_source,
+        m_rungs=10,
+        cd_weight=cd_weight,
+        x0_teacher_weight=1.0 if teacher_source == "cached_full" else 0.0,
+        x0_gt_weight=0.5,
+        x0_gt_normalizer=1.0,
+        cd_metric="mse",
+        cd_huber_c=None,
+        cd_normalizer=1.0,
+        keep_loss_terms=False,
+        _velocity=velocity,
+        _ensure_teacher_expert=lambda device, dtype: expert,
+    )
+    output = ConsistencyExpertVLA.forward(
+        owner,
+        tokenized_data={
+            "input_ids": torch.tensor([[1, 9]]).repeat(batch, 1),
+            "attention_mask": torch.ones(batch, 2),
+        },
+        teacher_trajectory_states=states if teacher_source == "cached_full" else None,
+    )
+
+    expected_calls = [expected_hi] if teacher_source == "online" else []
+    if cd_weight:
+        expected_calls.append(expected_lo)
+    expected_calls.append(expected_hi)
+    assert len(calls) == len(expected_calls)
+    for actual, expected in zip(calls, expected_calls):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    prediction = parameter.expand_as(expected_hi)
+    gt_loss, _ = x0_reconstruction_loss(expected_hi, tau_hi, prediction, ground_truth)
+    torch.testing.assert_close(output.x0_gt_loss, gt_loss.detach())
+    if teacher_source == "cached_full":
+        teacher_loss, _ = x0_reconstruction_loss(expected_hi, tau_hi, prediction, endpoint)
+        torch.testing.assert_close(output.x0_teacher_loss, teacher_loss.detach())
+    output.loss.backward()
+    assert parameter.grad is not None and bool(torch.isfinite(parameter.grad))
+    assert float(parameter.grad.abs()) > 0.0
+
+
+@pytest.mark.parametrize("expert_dtype", [torch.float32, torch.bfloat16])
+def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice(expert_dtype):
     """Teacher/student calls must see the deployment mask and post-norm hidden state."""
     from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
     from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
@@ -505,6 +608,7 @@ def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice():
 
     class ActionIn(torch.nn.Module):
         def forward(self, x, timestep):
+            assert x.dtype == torch.float32
             self.timestep = timestep.detach().clone()
             return torch.cat((x, x), dim=-1)
 
@@ -538,7 +642,7 @@ def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice():
         tokenizer_attention_mask=torch.ones(batch, 2),
         rope_deltas=torch.zeros(batch, 1, dtype=torch.long),
         n_action_tokens=n_action,
-        dtype=torch.float32,
+        dtype=expert_dtype,
         attention_implementation="sdpa",
     )
     owner = SimpleNamespace(
@@ -551,9 +655,10 @@ def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice():
     for arm in (Arm(), Arm()):  # frozen teacher and online/EMA share this exact path
         cache = Cache()
         velocity = ConsistencyExpertVLA._velocity(
-            owner, arm, x, tau, cache, conditioning, torch.float32
+            owner, arm, x, tau, cache, conditioning, expert_dtype
         )
-        torch.testing.assert_close(velocity, x)
+        torch.testing.assert_close(velocity, x.to(expert_dtype))
+        assert arm.expert.kwargs["inputs_embeds"].dtype == expert_dtype
         assert arm.expert.kwargs["attention_mask"] is conditioning.attention_mask
         assert arm.expert.kwargs["position_ids"] is conditioning.position_ids
         assert arm.expert.kwargs["is_causal"] is False
