@@ -56,16 +56,20 @@ import json
 import logging
 import os
 import re
+from contextlib import nullcontext
 from typing import Any
 
 import torch
 import einops
 from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from alpamayo_r1.models.base_model import IGNORE_INDEX
 from alpamayo_r1.models.token_utils import to_special_token
 from safetensors.torch import load_file
 
 from alpamayo1_5_sft.models.sft_alpamayo_r1 import TrainableAlpamayoR1
-from alpamayo1_5_sft.models.sft_base_model import TrainableReasoningVLA, load_alpamayo1_vlm
+from alpamayo1_5_sft.models.sft_base_model import (
+    ReasoningVLAOutput, TrainableReasoningVLA, load_alpamayo1_vlm,
+)
 from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
 from alpamayo1_5_distill.models.layer_mix import LAYER_MIX_SHARPEN, LayerMixer
 
@@ -920,36 +924,134 @@ class TrainableStitchedAlpamayoR1(StitchedAlpamayoR1):
 
     ``StitchedAlpamayoR1`` knows how to pair a Qwen3-VL student tower with the teacher's
     expert but extends ``AlpamayoR1`` directly, so it only has the inference forward. The
-    training forward lives on ``TrainableAlpamayoR1``, a sibling under ``AlpamayoR1``.
-    Borrowing the three methods is the same pattern ``KaVaExpertTeacher`` uses for
-    ``generate_cot_prefix`` -- if either class starts depending on state the other lacks,
-    this is the line that breaks, loudly.
+    action-target construction is borrowed from ``TrainableAlpamayoR1``. The forward
+    uses the same per-row cache masks and positions as prefill-only inference and CD,
+    excluding padding and tokens after each row's trajectory handoff.
 
     ⚠️ ``cotrain_vlm``/``stop_grad_from_vlm`` are set here because they are assigned in
     ``TrainableAlpamayoR1.__init__``, which this class does not run.
     """
 
-    forward = TrainableAlpamayoR1.forward
     _process_traj_future_training = TrainableAlpamayoR1._process_traj_future_training
-    _process_position_ids_qwen2_5_vl = TrainableAlpamayoR1._process_position_ids_qwen2_5_vl
+
+    def forward(
+        self,
+        tokenized_data: dict[str, Any],
+        ego_history_xyz: torch.Tensor | None = None,
+        ego_history_rot: torch.Tensor | None = None,
+        ego_future_xyz: torch.Tensor | None = None,
+        ego_future_rot: torch.Tensor | None = None,
+        labels_mask: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> ReasoningVLAOutput:
+        tokenized_data = dict(tokenized_data)
+        input_ids = tokenized_data.pop("input_ids")
+        traj_data = {
+            "ego_history_xyz": ego_history_xyz,
+            "ego_history_rot": ego_history_rot,
+            "ego_future_xyz": ego_future_xyz,
+            "ego_future_rot": ego_future_rot,
+        }
+        input_ids = self.fuse_traj_tokens(input_ids, traj_data)
+        # ⚠️ CE is gated SEPARATELY from gradient flow. `cotrain_vlm` opens the gradient
+        # path from the diffusion loss to the VLM through the cache; `cotrain_vlm_ce` adds
+        # the VLM's OWN token-head CE on top. They are different heads (COMPARE_EVAL §0),
+        # so bundling them would silently make a cache experiment a token-head experiment.
+        ce = getattr(self, "cotrain_vlm_ce", False)
+        labels = input_ids.clone() if ce else None
+        if labels is not None and labels_mask is not None:
+            labels = torch.where(labels_mask, labels, IGNORE_INDEX)
+        with nullcontext() if self.cotrain_vlm else torch.no_grad():
+            vlm_outputs = self.vlm(
+                input_ids=input_ids, labels=labels, use_cache=True, **tokenized_data
+            )
+
+        future_traj_data = self._process_traj_future_training(traj_data)
+        action_embeds = self.action_in_proj(
+            future_traj_data["noisy_x"], future_traj_data["timesteps"]
+        )
+        conditioning = build_expert_conditioning(
+            traj_future_start_mask=input_ids == self.config.traj_token_ids["future_start"],
+            tokenizer_attention_mask=tokenized_data.get("attention_mask"),
+            rope_deltas=vlm_outputs.rope_deltas,
+            n_action_tokens=action_embeds.shape[1],
+            dtype=action_embeds.dtype,
+            attention_implementation=getattr(self.expert.config, "_attn_implementation", None),
+        )
+        cache = vlm_outputs.past_key_values
+        cache.crop(conditioning.prefix_len)
+        if self.stop_grad_from_vlm:
+            for layer in cache.layers:
+                layer.keys = layer.keys.detach()
+                layer.values = layer.values.detach()
+        expert_outputs = self.expert(
+            inputs_embeds=action_embeds,
+            position_ids=conditioning.position_ids,
+            past_key_values=cache,
+            attention_mask=conditioning.attention_mask,
+            use_cache=True,
+            **({"is_causal": False} if self.config.expert_non_causal_attention else {}),
+        )
+        hidden = expert_outputs.last_hidden_state[:, -action_embeds.shape[1]:]
+        pred = self.action_out_proj(hidden).view(-1, *self.action_space.get_action_space_dims())
+        loss = self.diffusion.compute_loss_from_pred(training_data=future_traj_data, pred=pred)
+        if ce:
+            loss = loss + vlm_outputs.loss
+        return ReasoningVLAOutput(loss=loss)
 
     @classmethod
     def from_student(cls, checkpoint_path: str, vlm_name_or_path: str,
-                     teacher_checkpoint_path: str, cotrain_vlm: bool = False, **kw):
-        """Student tower from `checkpoint_path`, teacher expert from `teacher_checkpoint_path`."""
+                     teacher_checkpoint_path: str, cotrain_vlm: bool = False,
+                     cotrain_vlm_layers: str | None = None,
+                     cotrain_vlm_ce: bool = False, **kw):
+        """Student tower from `checkpoint_path`, teacher expert from `teacher_checkpoint_path`.
+
+        ``cotrain_vlm_layers`` (e.g. ``"27-35"``, inclusive) trains ONLY those text layers of
+        the VLM and freezes the rest. Full cotrain does not fit: this config runs plain DDP
+        (``deepspeed: null``, deliberately -- DeepSpeed's bf16 breaks
+        ``PerWaypointActionInProjV2``'s internal ``x.float()``), so optimizer state is
+        REPLICATED per rank and ~6.8 B trainable needs ~81 GB before activations, on 80 GB
+        cards, with ``gradient_checkpointing`` unavailable (KaVaExpertTeacher raises).
+        Layers 27-35 are the measured choice: COMPARE_EVAL §5 puts 95% of the recoverable
+        gap in the deep third and 0% (inside the noise floor) in layers 0-9.
+
+        ⚠️ ``stop_grad_from_vlm`` MUST go False whenever any VLM parameter trains. The
+        forward detaches every cache K/V when it is True, so the diffusion loss would never
+        reach the VLM and the only signal left would be the token-head CE -- a DIFFERENT
+        head (COMPARE_EVAL §0). That runs clean and trains the wrong thing.
+        """
         model = cls.from_stitch(
             checkpoint_path=checkpoint_path, vlm_name_or_path=vlm_name_or_path,
             teacher_checkpoint_path=teacher_checkpoint_path, **kw)
-        model.cotrain_vlm = bool(cotrain_vlm)
-        model.stop_grad_from_vlm = True
+        model.cotrain_vlm = bool(cotrain_vlm) or cotrain_vlm_layers is not None
+        model.cotrain_vlm_ce = bool(cotrain_vlm_ce)
+        model.stop_grad_from_vlm = not model.cotrain_vlm
         for prm in model.vlm.parameters():
-            prm.requires_grad_(cotrain_vlm)
+            prm.requires_grad_(model.cotrain_vlm)
+        if cotrain_vlm_layers is not None:
+            text_layers = model.vlm.model.language_model.layers
+            lo, _, hi = str(cotrain_vlm_layers).partition("-")
+            lo, hi = int(lo), int(hi if hi else lo)
+            if not 0 <= lo <= hi < len(text_layers):
+                raise ValueError(
+                    f"cotrain_vlm_layers={cotrain_vlm_layers!r} outside "
+                    f"0..{len(text_layers) - 1}"
+                )
+            for prm in model.vlm.parameters():
+                prm.requires_grad_(False)
+            for i in range(lo, hi + 1):
+                for prm in text_layers[i].parameters():
+                    prm.requires_grad_(True)
+            n_vlm = sum(q.numel() for q in model.vlm.parameters() if q.requires_grad)
+            print(f"[stitch-train] PARTIAL cotrain: VLM text layers {lo}-{hi} of "
+                  f"{len(text_layers)} trainable ({n_vlm / 1e9:.2f} B), rest frozen; "
+                  f"stop_grad_from_vlm={model.stop_grad_from_vlm}, "
+                  f"vlm_ce={model.cotrain_vlm_ce}", flush=True)
 
         mixer = getattr(model, "layer_mixer", None)
         if mixer is not None:
-            # ⚠️ THE TRAINING FORWARD DOES NOT MIX ON ITS OWN. `forward` here is borrowed from
-            # TrainableAlpamayoR1, which reads `vlm_outputs.past_key_values`, crops it, and
-            # hands it straight to the expert -- it never touches
+            # ⚠️ THE TRAINING FORWARD DOES NOT MIX ON ITS OWN. It masks and crops the VLM
+            # cache, then hands it straight to the expert -- it never touches
             # sample_trajectories_prefill_only, which is where the EVAL path applies the mix.
             # Left alone, a 28-layer cache would reach a 36-layer expert and DynamicCache
             # would AUTO-EXTEND: slots 28..35 created on demand holding only the 64 action
@@ -975,8 +1077,16 @@ class TrainableStitchedAlpamayoR1(StitchedAlpamayoR1):
             print(f"[stitch-train] layer mix ACTIVE in the training forward "
                   f"({mixer.n_student} -> {mixer.n_expert}), P frozen", flush=True)
         n_tr = sum(q.numel() for q in model.parameters() if q.requires_grad)
+        # ⚠️ Keyed on the RESOLVED attribute, not the `cotrain_vlm` argument: a partial
+        # cotrain leaves the argument False while VLM layers really do train, and the old
+        # print then said "VLM FROZEN" on a run that was training 0.91 B of it.
+        vlm_state = ("partial" if cotrain_vlm_layers is not None
+                     else "TRAINABLE" if model.cotrain_vlm else "frozen")
         logger.warning("[stitch-train] VLM %s, trainable params %.2f B",
-                       "TRAINABLE" if cotrain_vlm else "frozen", n_tr / 1e9)
-        print(f"[stitch-train] VLM {'trainable' if cotrain_vlm else 'FROZEN'}, "
-              f"trainable {n_tr / 1e9:.2f} B", flush=True)
+                       vlm_state, n_tr / 1e9)
+        print(f"[stitch-train] VLM {vlm_state}, trainable {n_tr / 1e9:.2f} B", flush=True)
+        print(
+            "[stitch-train] expert conditioning: per-row padding/suffix masks and RoPE positions",
+            flush=True,
+        )
         return model

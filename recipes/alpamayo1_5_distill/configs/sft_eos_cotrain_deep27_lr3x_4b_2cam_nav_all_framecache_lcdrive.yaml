@@ -1,0 +1,203 @@
+# Train the ACTION EXPERT against the 110k-ANCHOR 2-CAMERA NAV 4B STUDENT's cache. VLM FROZEN.
+#
+# The all-data counterpart of sft_expert_on_student_4b_2cam_nav_lcdrive.yaml. That one adapts
+# the expert to the 50k student (ARM=nav4bmix2cam, block m=1 + span m=9, 5 epochs); this one
+# adapts it to the student from ARM=nav4bspan2camallfc -- 109,997 event-anchored annotations,
+# the m=1/9/18/36 span CURRICULUM (one span per epoch, not a fixed mix), 4 epochs, job 20724.
+#
+# Measured starting point for THIS student, stitched onto the TEACHER's expert, n=1000 on
+# nav_lcdrive_val_mysubset_1k with cameras [1,3] (job 20724 ckpt-13752, evaluated 2026-09-05):
+#   teacher VLM  + teacher expert   min_ade 0.7155   <- ceiling under the same 2-cam input
+#   50k student  + teacher expert   min_ade 0.9689   <- what the sibling config starts from
+#   THIS student + teacher expert   min_ade 0.9012   <- this run's starting point
+# so 0.1857 of min_ade remains between this student's cache and the ceiling, against 0.2534
+# for the 50k student. The expert has less room to recover here because the cache is already
+# better -- do not read a smaller delta as a worse run.
+#
+# ⚠️ strip_nav_turn_distance: TRUE, unlike the 50k sibling. This is REQUIRED, not cosmetic.
+# The nav4bspan2camallfc student trained with `++data.train_dataset.strip_nav_turn_distance=
+# true` (its log reads "[nav] stripped distance from 10185/109997 turn instructions"), so it
+# has NEVER seen "Turn left in 29m" -- only "Turn left". Feeding it the raw form puts its
+# cache off-distribution, and the expert would then be adapted to a cache the student does not
+# produce in the matched setting. Measured cost of exactly that mismatch, on the 2026-09-05
+# stitched eval which did NOT strip: on the 79/1000 val clips whose nav_text carries a
+# distance the student scored +0.2883 min_ade WORSE than the 50k student, while on the other
+# 921 it scored -0.0982 BETTER (t=-6.24). The aggregate 0.9012 above is that blend and is
+# therefore PESSIMISTIC for this student; re-measure stripped before quoting it as final.
+# The 50k sibling correctly omits this flag -- that student trained on the raw form.
+#
+# ⚠️ frame_cache_root, unlike every earlier arm. The live loader streams 1.64 TiB of NFS per
+# epoch to deliver 879,976 images (measured, job 20710) because it copies whole 1.2 GiB chunk
+# ZIPs for the ~49% of clips the manifest wants, whole 604-frame clips for the ~27 frames it
+# uses. scripts/build_frame_cache.py wrote exactly those images once (~91 GiB, x264 crf18);
+# a step reads ~2.7 MB instead. The cache is keyed by THIS manifest's (clip_id, t0_relative)
+# anchors and holds cameras [1,3] only, which is why it drops in here unchanged --
+# tests/test_frame_cache_equivalence.py holds it to prompt-identical, ego-identical output.
+#
+# ⚠️ warmup_steps moves with the DATA, not just the batch. 109,997 annotations at 4 x 8 x 1
+# = 32 is 3,438 steps/epoch, so the same 12.5% fraction the sibling used (195 of 1,563) is
+# 430 here. Copying 195 across would warm up over 5.7% of an epoch instead of 12.5%.
+#
+# ⚠️ NO PRUNE_EXPERT_LAYERS. The 4B student's text tower is 36 deep, already matching the
+# teacher's 36-layer expert, so pruning would CREATE the mismatch it exists to avoid. Pass
+# PRUNE_EXPERT_LAYERS=none to slurm_train_eos.sh -- "none" is not the same as omitting it.
+#
+# Launch (4 GPUs so the 32 effective batch above is real; the script defaults to 2):
+#   PRUNE_EXPERT_LAYERS=none CONFIG=sft_expert_on_student_4b_2cam_nav_all_framecache_lcdrive \
+#     sbatch --gpus=4 --cpus-per-task=96 --mem=340G slurm_train_eos.sh
+
+defaults:
+  - sft_base
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.stitched_model.TrainableStitchedAlpamayoR1.from_student
+  # 110k-anchor 2-camera nav student, end of epoch 4 (job 20724, span curriculum 1/9/18/36).
+  checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_4b_nav4bspan2camallfc_m1-9-18-36_framecache1080p_lcdrive/checkpoint-13752
+  # ⚠️ the SNAPSHOT dir, not the repo root -- the parent has no config.json/weights.
+  vlm_name_or_path: /temp/achahe/hf_cache/hub/models--Qwen--Qwen3-VL-4B-Instruct/snapshots/ebb281ec70b05090aa6165b016eac8ec08e71b17
+  teacher_checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  # Supplies the +4000 trajectory vocabulary the student tower was built with.
+  alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  attn_implementation: sdpa
+  # ⚠️ PARTIAL cotrain: only VLM text layers 27-35 train; the rest of the tower, the vision
+  # encoder and the embeddings stay frozen. Full cotrain does NOT fit -- `deepspeed: null`
+  # below means plain DDP, so optimizer state is REPLICATED per rank and ~6.8 B trainable
+  # needs ~81 GB before activations on 80 GB cards, with gradient_checkpointing unavailable.
+  # 27-35 is the measured choice: COMPARE_EVAL §5 puts 95% of the recoverable gap in the
+  # deep third and 0% (inside the noise floor) in layers 0-9.
+  #
+  # Because layers 0-26 are frozen AND nothing upstream requires grad, autograd builds no
+  # graph before layer 27 -- activations are retained for 9 layers, not 36. That is what
+  # makes this affordable at the SAME BS=8/ACCUM=1 as the frozen-VLM baseline, so epoch
+  # boundaries line up and the arms stay paired.
+  #
+  # ⚠️ from_student sets stop_grad_from_vlm=False automatically whenever any VLM parameter
+  # trains. With it True the forward detaches every cache K/V and the diffusion loss never
+  # reaches the VLM -- the run would train only on token-head CE, a DIFFERENT head (§0).
+  # Read the "[stitch-train] PARTIAL cotrain:" line at startup; do not assume it.
+  cotrain_vlm: false
+  cotrain_vlm_layers: "27-35"
+  # ⚠️ Left FALSE deliberately. This is a CACHE experiment: the only signal we want is the
+  # diffusion loss reaching the deep layers through the cache. Adding the VLM's own
+  # trajectory-token CE would make it a token-head experiment as well, and §0 forbids
+  # comparing the two heads.
+  cotrain_vlm_ce: false
+
+data:
+  # Identical preprocessing to every other arm here -- the teacher declares
+  # include_camera_ids / include_frame_nums TRUE and evaluating it in the other format
+  # moved min_ade 1.116 -> 0.626 once, which produced two retracted findings.
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]          # front-wide, front-telephoto -- what the student was trained on
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+    frame_cache_root: /temp/achahe/physical_ai_av/framecache_nav2cam_1080p
+    strip_nav_turn_distance: true
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  # ⚠️ NAV-conditioned val, and STRIPPED to match train -- the student is off-distribution on
+  # raw "Turn left in 29m" either way, so an unstripped val loss would be measuring the
+  # harness mismatch rather than the expert. Consequence to remember: this val loss is NOT
+  # on the same footing as the 0.9012 starting point above, which was measured unstripped.
+  # There is no frame cache for val: it was built from the TRAIN manifest's clips only.
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [1, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    strip_nav_turn_distance: true
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  # ⚠️ TRUE here, false in the frozen-VLM parent -- and the parent's reason ("the frozen VLM
+  # produces no gradients, so DDP would otherwise warn every step") no longer holds, because
+  # layers 27-35 now do produce gradients.
+  # With cotrain_vlm_ce=False the VLM's logits are discarded, so the DEEPEST trained layer
+  # (35) reaches the loss ONLY through its k_proj/v_proj, which land in the cache -- its
+  # q_proj, o_proj and MLP feed nothing but the dead lm_head path. Layers 27-34 are fine
+  # because their hidden states flow into later layers' K/V. Left false, DDP aborts on the
+  # first step with "Expected to have finished reduction in the prior iteration" (job 20832).
+  # Costs a little throughput; the alternative (training 27-34 only) would drop the single
+  # most cache-sensitive layer, which COMPARE_EVAL §5 measures at -0.173 min_ade per layer.
+  ddp_find_unused_parameters: true
+
+  # ⚠️ NO deepspeed here, deliberately. DeepSpeed's bf16 casts parameters but does NOT wrap
+  # the forward in torch.autocast; `action_in_proj` (PerWaypointActionInProjV2) forces
+  # `x.float()` internally, so its fp32 activations meet bf16 weights and raise
+  # "mat1 and mat2 must have the same dtype". Plain bf16=True in sft_base gives the
+  # Trainer's native autocast, which handles it.
+  # Affordable WITHOUT ZeRO because only 2.28 B trains: weights+grads+Adam ~ 27 GB on top of
+  # the frozen 4 B VLM (~9 GB). Note this is DDP, so that optimizer state is REPLICATED per
+  # rank -- adding GPUs does not reduce it, unlike the ZeRO-2 distillation runs.
+  deepspeed: null
+  # ⚠️ MUST be false: KaVaExpertTeacher raises "does not support gradient checkpointing".
+  gradient_checkpointing: false
+
+  # 4 GPUs x 8 x 1 = 32 effective, matching the distillation runs and the 50k sibling.
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 1
+  # Fine-tuning 2.28 B of already-trained expert onto a slightly different cache, not
+  # steering the VLM. Conservative: it starts at teacher weights and should not move far.
+  learning_rate: 2e-5
+  # ⚠️ VLM-ONLY 3x LR (6e-5 effective), the OPTIMISATION partner of the 27-35 arm (job 20835).
+  # The base 2e-5 was chosen for "fine-tuning 2.28 B of already-trained expert ... should not
+  # move far" -- a rate picked for the EXPERT, then inherited by the VLM layers when cotrain
+  # was switched on. After one epoch the trained VLM weights had moved only ~4e-3 max, so
+  # under-stepping is the cheapest explanation for why only 35% of the centre gap closed.
+  # ReasoningVLA_Trainer.create_optimizer matches parameter-name PREFIXES, longest match
+  # wins, unmatched params keep 1.0 -- so "vlm." lifts exactly the cotrained layers (the rest
+  # of the tower has requires_grad=False and is skipped) and leaves the expert at 2e-5.
+  # ⚠️ 3x is a PROBE, not a tuned value. 2e-5 is already a normal full-finetune rate for a 4B
+  # tower, so this may overshoot; read epoch 1 against 20835 before going further.
+  lr_multiplier:
+    "vlm.": 3.0
+  # 12.5% of the 3,438-step epoch -- see the warmup note in the header.
+  warmup_steps: 430
+  num_train_epochs: 2
+  # One checkpoint per epoch (steps 3438 and 6876), matching both siblings so the arms stay
+  # comparable. ⚠️ A crash therefore costs up to a full epoch (~2-3 h here). That is the
+  # sibling's documented tradeoff and is kept deliberately; the frame cache removes the NFS
+  # stall that caused the crashes this tree has actually seen (job 20710, 3x).
+  save_strategy: epoch
+  save_total_limit: 10
+
+paths:
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_eos_cotrain_deep27_lr3x_4b_2cam_nav_framecache
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-expert-on-student
+  group: expert_on_student_4b_all
+
+evaluate:
+  eval_ckpt: null
