@@ -171,7 +171,126 @@ swapping nothing. `L_block` scores each layer independently, so it can drive eve
 error down while degrading the joint consistency the expert reads. §4's fingerprint: the deep
 band improved 15–19% while `min_ade` got **worse** by 0.16–0.18.
 
-## 7. Reproducing
+## 7. CD, three dampers, and why the line is closed
+
+CD was run on top of the best cotrained 4B checkpoint (27-35 x3, centre 1.4376) aimed at the one
+thing it can reach: the 1-step sampler error. That headroom is real and measured -- centre 1.5995
+at NFE=1 vs 1.4376 at NFE=2, SAME weights and SAME cache, so 0.162 is lost purely to the coarse
+solve. Cached-rollout ceiling is the teacher's 10-step centre, 1.3887.
+
+Three dampers, all `cd_weight=0`, `x0_teacher_weight=1.0`, cached 10B rollouts, judged at ep2:
+
+| arm | NFE=1 centre | NFE=1 spread | NFE=2 centre |
+|---|---|---|---|
+| init (cotrain 27-35 x3) | **1.5995** | 0.3212 | **1.4376** |
+| CD `x0_gt_weight=0.3` (ep1) | 1.9044 | 1.6286 | 1.6255 |
+| CD `x0_gt_weight=1.0` | 1.5774 | 0.4362 | 1.5523 |
+| CD `x0_gt_weight=2.0` | 1.5801 | 0.3332 | 1.5643 |
+
+⚠️ **gt=0.3 failed and the reasoning that produced it was wrong.** Spread exploded 5x at NFE=1
+(0.32 -> 1.63 against the teacher's 0.42) and dragged the centre +0.305 (t=+9.9). It was chosen
+on the argument "err towards wide -- over-dispersion is recoverable, collapse is not". That is
+true of the DISPERSION axis and says nothing about the centre: scaling the K samples about their
+barycentre cannot move the barycentre. Measured on the failed run, the centre stays pinned at
+1.9044 for every alpha from 1.0 down to 0. **A centre regression is the unrecoverable one.**
+
+⚠️ **Stronger damping fixes it, and at NFE=1 gt=1.0 BEATS the teacher** -- centre 1.5774 vs
+1.5856, min_ade 1.2554 vs 1.2817, medoid 1.5852 vs 1.5852, spread 0.4362 vs 0.4180. So CD does
+produce a teacher-competitive 1-step model.
+
+⚠️ **But do not deploy it.** Both stronger arms regress ~+0.12 at NFE=2 (t=+9.6 / +10.2) -- the
+sign flip `student4B_CD.md` documents. The un-CD'd model at NFE=2 (centre **1.4376**) beats every
+CD arm at every budget, and since the VLM prefill dominates inference the second denoising step
+is nearly free, so there is no compute argument for the 1-step regime CD serves.
+
+⚠️ **The 0.162 headroom estimate was too optimistic: CD collected 0.022, about 13%.** The estimate
+assumed the 1-step penalty was purely recoverable sampler error because it appears at fixed
+weights and fixed cache. Most of it is not reachable by the endpoint objective.
+
+⚠️ The damper is SATURATED between 1.0 and 2.0 (centre 1.5774 vs 1.5801), so the useful range is
+bracketed and nothing between them is worth another run.
+
+⚠️ **Judge CD on CENTRE, never min_ade.** gt=0.3 has the BEST min_ade of any arm in this file
+(1.1341 at NFE=1) and is the worst model by every other measure. Best-of-6 rewards the blow-up.
+
+⚠️ The machinery was audited and is CORRECT -- `tau_to_s = 1 - tau`; the endpoint expression is
+bit-for-bit `flow_matching._euler` at `inference_step=1`; `noise_index` threads from
+`sample_cached_teacher_transition` into `cached_teacher_endpoint` so `(eps, x0_teacher)` stays
+paired; the `inference_step` override takes; 41/41 consistency tests pass. The regression is the
+objective, not the plumbing.
+
+⚠️ Only 1 rung in 10 has tau=1, so ~90% of CD's gradient trains "jump to the endpoint from a
+partially denoised TEACHER state" rather than the 1-step-from-noise map NFE=1 evaluates
+(`COMPARE_EVAL.md` §9's multi-rung item). CD is a blunt instrument for this target.
+
+## 8. The 2B layer-mix student — the mechanism transfers, the TUNING does not
+
+Same intervention on a different student and a different expert path: Cosmos-Reason2-2B, 28 text
+layers, cache SYNTHESISED 28 -> 36 by the frozen layer mixer. Init
+`output_kd_2b_mixspan2bnavfc_m1-9-18-36_framecache1080p_lcdrive/checkpoint-13752`, paired against
+the frozen-VLM 2B mix EoS run at the SAME checkpoint. All @ep2, NFE=2, n=1000.
+
+| arm | trainable VLM | units | ade | min_ade | medoid | centre | spread |
+|---|---|---|---|---|---|---|---|
+| frozen baseline | 0 | 0 | 1.9027 | 1.3849 | 1.8500 | 1.8320 | 0.4690 |
+| **14-27 x1** | 0.70 B | 0.70 | **1.7310** | 1.1532 | **1.6550** | **1.6431** | 0.5203 |
+| 21-27 x3 | 0.35 B | 1.05 | 1.7812 | 1.1482 | 1.6796 | 1.6707 | 0.5894 |
+| 21-27 x5 | 0.35 B | 1.75 | 1.8147 | **1.1370** | 1.7071 | 1.6961 | 0.6232 |
+
+**The mechanism transfers and pays MORE here than on the 4B**: centre −0.1613 (t=−6.2) for
+21-27 x3 against the 4B's −0.0976, and **−0.4424 (t=−11.2) at NFE=1**, where the frozen 2B was
+nearly degenerate (spread 0.2052 -- every draw in the same wrong place). Cotrain restored it to
+0.5217. Every metric improves at every budget bar `ade` at NFE=10 (+0.0245, ns).
+
+⚠️ **THE 2.7-UNIT OPTIMUM IS 4B-SPECIFIC AND DOES NOT TRANSFER.** On this student centre runs
+1.8320 (0 units) -> **1.6431 (0.70)** -> 1.6707 (1.05) -> 1.6961 (1.75): monotonically worse as
+movement grows past 0.70, not an inverted U, and **0.70 units BEATS 1.05**. So capacity and LR are
+NOT interchangeable here -- more layers at x1 wins with LESS total movement. The 4B model failed
+on the 2B in BOTH directions: the LR ladder regressed AND the capacity/LR trade broke.
+
+⚠️ Fraction-of-tower does not rescue it either: 0.91 B of the 4B's ~4.5 B is ~20%, 0.35 B of this
+~2 B is ~17.5% -- near-identical shares, optima differing >2x. Suspect the synthesised 28 -> 36
+cache is more perturbation-sensitive than a native 36-layer tower.
+
+⚠️ **Raising the LR buys SPREAD at the cost of centring on this student.** NFE=1 spread runs
+0.3217 (x1) / 0.5217 (x3) / 0.8515 (x5) against the teacher's 0.4180, and x5's `ade` blows up
++0.2552 (t=+15.6) while its min_ade stays flat. Every regression here announced itself as
+over-dispersion BEFORE the centre moved -- watch spread, not just centre.
+
+⚠️ **The frozen-VLM baseline gets WORSE with its second epoch** (+0.0159 centre, t=+5.8), while
+the cotrain arm falls −0.4059 (t=−14.5) over the same epochs. Frozen EoS has not merely saturated
+on this student, it has begun to overfit -- so none of the cotrain gain is generic extra training.
+
+⚠️ The x3 arm was WORSE than the frozen baseline at ep1 (2.0766 vs 1.8161) and decisively better
+at ep2. **Judge this family at epoch 2**; an ep1 verdict is worth nothing.
+
+⚠️ **The 2B SATURATES on capacity where the 4B does not.** Adding a full-tower arm:
+
+| 2B arm | trainable | ade | min_ade | medoid | centre | spread |
+|---|---|---|---|---|---|---|
+| frozen baseline | 0 | 1.9027 | 1.3849 | 1.8500 | 1.8320 | 0.4690 |
+| 21-27 x3 | 0.35 B | 1.7812 | 1.1482 | 1.6796 | 1.6707 | 0.5894 |
+| 14-27 x1 | 0.70 B | 1.7310 | 1.1532 | 1.6550 | 1.6431 | 0.5203 |
+| **0-27 x1** | 1.41 B | **1.7257** | 1.1491 | **1.6471** | **1.6392** | 0.5178 |
+
+0-27 vs 14-27, centre: −0.0460 (t=−2.2) at NFE=1 but **−0.0040 (t=−0.3)** at NFE=2 and
+**−0.0023 (t=−0.2)** at NFE=10 -- NULL at both. Doubling capacity from half- to full-tower buys
+this student nothing at the operating point, while the same step on the 4B (0.91 -> 3.63 B) gave
+−0.034 (t=−1.8). So capacity is the SAFE dial on both -- it never regressed -- but how much of it
+pays differs: the 2B saturates by ~half its tower, the 4B keeps paying to the full one.
+
+⚠️ **Correction to the reading above.** What looked like a 2B "regression past 1.05 units" was the
+LR confound: 14-27 x1 and 21-27 x3 differ in BOTH capacity and LR. With LR held at x1 the capacity
+curve is flat-to-improving and never falls. The units scale should not be used on either student.
+
+**2B recipe: 14-27 x1** -- statistically tied with full-tower at NFE=2 and NFE=10, and it trains
+in 7.8 h at BS=8 rather than 10.2 h at BS=4. Gap closed: 39% of the 2B's 0.4933 (vs the 4B's 67%
+of its 0.1965), consistent with COMPARE_EVAL §1 -- this student has its own, lower ceiling.
+
+⚠️ **Not comparable to the 4B rows** (`COMPARE_EVAL.md` §0): different student, different expert
+path. The 2B's absolute ceiling is its own -- centre 1.6431 here vs 1.4376 on the 4B.
+
+## 9. Reproducing
 
 ```bash
 cd recipes/alpamayo1_5_distill
@@ -201,7 +320,7 @@ Archives: `training/stepsweep/teachernav_k2.npz`, `training/teacher_eval/teacher
 `training/{eos_4b_maskfix_20812,cd4b_maskfix_fp32_20820}_eos_checkpoint-{3438,6876}{,_nfe1,_nfe2}.npz`.
 All per-clip and joinable on `clip_id`.
 
-## 8. Open
+## 10. Open
 
 * ~~**`block_norm=cache`**~~ and ~~**`block_freerun_weight > 0`**~~ — both RUN and both closed.
   See `KD_LOSS_ABLATION.md`: cachenorm buys a readable curve and no accuracy gain; freerun is
@@ -261,6 +380,42 @@ All per-clip and joinable on `clip_id`.
   | 19-35 | 2 | 1.5074 | 1.4453 | 1.0365 | 0.4099 | 46% |
   | 27-35 x3LR | 1 | 1.6152 | 1.5480 | 1.1134 | 0.4517 | **-5%** |
   | **27-35 x3LR** | **2** | **1.5010** | **1.4376** | **1.0235** | 0.4170 | **50%** |
+
+  ### ⚠️ THE "ONE DIAL PEAKING AT 2.7 UNITS" READING IS WRONG — RETRACTED
+
+  Adding a FULL-TOWER arm refutes it. 0-35 x1 trains every text layer (3.63 B, ~3.63 units,
+  PAST the supposed peak and into the range where x5=4.55 regressed) and is the BEST 4B arm at
+  every budget on every metric:
+
+  | 4B arm | units | ade | min_ade | medoid | centre | spread |
+  |---|---|---|---|---|---|---|
+  | *teacher @2* | | *1.4788* | *0.9321* | *1.3476* | *1.3387* | *0.5778* |
+  | frozen baseline | 0 | 1.6178 | 1.0930 | 1.5417 | 1.5352 | 0.4801 |
+  | 19-35 x1 | 1.72 | 1.5074 | 1.0365 | 1.4560 | 1.4453 | 0.4099 |
+  | 27-35 x3 | 2.73 | 1.5010 | 1.0235 | 1.4434 | 1.4376 | 0.4170 |
+  | 27-35 x5 | 4.55 | 1.5257 | 1.0324 | 1.4650 | 1.4603 | 0.4306 |
+  | **0-35 x1** | 3.63 | **1.4681** | **1.0012** | **1.4061** | **1.4035** | 0.4072 |
+
+  vs the x3 incumbent, centre: −0.0605 (t=−2.6) at NFE=1, −0.0341 (t=−1.8) at NFE=2, −0.0240
+  (t=−1.3) at NFE=10. Consistent in direction everywhere, clearly significant only at NFE=1.
+
+  **CAPACITY AND LR ARE NOT ONE DIAL. Capacity helps; LR hurts.** The inverted U was an artefact
+  of only ever probing past 2.73 by RAISING LR, which is the harmful lever. Hold the LR at x1 and
+  add layers and the curve keeps improving. The unit scale conflated two effects, and the grid
+  that produced it varied them together.
+
+  **67% of the centre gap is now closed** at NFE=2 (1.5352 -> 1.4035 against the teacher's
+  1.3387), up from 50%. At NFE=1 the student's centre PASSES the teacher's, 1.5391 vs 1.5856 --
+  on the dispersion-insensitive metric, not just `ade`.
+
+  ⚠️ `ade` at NFE=2 (1.4681) also nominally beats the teacher's 1.4788, but the student is still
+  UNDER-dispersed (0.4072 vs 0.5778) and `ade` rewards that. Centre remains the honest
+  comparator, and there it trails by 0.065.
+
+  ⚠️ **ANY "all layers" arm needs BS=4/ACCUM=2.** Once nothing is frozen ahead of layer 0,
+  activations scale with the WHOLE tower, not the trained slice -- ~68 GB at BS=8 for the 4B,
+  comparable to the ~71 GB of states. It OOMed at BS=8 on BOTH the 80 GB H100 (2B) and the
+  141 GB H200 (4B). Effective batch stays 32 either way, so steps/epoch and checkpoints pair.
 
   ⚠️ **DO NOT JUDGE AN LR ARM AT EPOCH 1.** The x3 arm is the WORST cell at epoch 1 (centre
   +0.0109, t=+0.5, ns -- indistinguishable from baseline) and the BEST at epoch 2 (-0.0976,
