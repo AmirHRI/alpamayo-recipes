@@ -220,6 +220,39 @@ def transition_velocity(
     return (x_lo.float() - x_hi.float()) / dt
 
 
+@torch.no_grad()
+def sample_two_step_teacher_transition(
+    noise: torch.Tensor,
+    velocity,
+    *,
+    generator: torch.Generator | None = None,
+):
+    """Sample either edge of a fresh, fixed-teacher two-step Euler rollout.
+
+    ``velocity(state, tau)`` reads the same frozen conditioning on both calls.
+    The lower edge anchors the consistency boundary to the teacher's endpoint;
+    the upper edge propagates that endpoint through the EMA consistency target.
+    No ground-truth interpolation or cached trajectories enter the rollout.
+    """
+    noise = noise.float()
+    batch = noise.shape[0]
+    tau_noise = noise.new_ones(batch, 1, 1)
+    tau_mid = tau_noise * 0.5
+    velocity_noise = velocity(noise, tau_noise).float()
+    midpoint = teacher_step(noise, velocity_noise, tau_mid)
+    velocity_mid = velocity(midpoint, tau_mid).float()
+    endpoint = teacher_step(midpoint, velocity_mid, tau_mid)
+    _, tau_lo, tau_hi = sample_rungs(batch, 2, noise.device, generator=generator)
+    upper = tau_lo > 0
+    return (
+        torch.where(upper, noise, midpoint),
+        torch.where(upper, midpoint, endpoint),
+        tau_lo,
+        tau_hi,
+        torch.where(upper, velocity_noise, velocity_mid),
+    )
+
+
 def needs_target(tau_lo: torch.Tensor) -> torch.Tensor:
     """``[B]`` bool: does this sample's target term have a nonzero coefficient?
 

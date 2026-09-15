@@ -213,6 +213,8 @@ class EMACallback(TrainerCallback):
 
     def on_step_end(self, args, state, control, model=None, **kw):
         """Once per OPTIMIZER step -- not per micro-batch. See the module docstring."""
+        if getattr(kw.get("optimizer"), "step_was_skipped", False):
+            return
         ema = self._ensure(model)
         step = int(getattr(state, "global_step", 0))
         # A short warmup lets the model move before the average starts tracking it; during it

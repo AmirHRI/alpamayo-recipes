@@ -51,7 +51,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import torch
@@ -66,6 +66,7 @@ from alpamayo1_5_distill.models.consistency_losses import (
     needs_target,
     sample_cached_teacher_transition,
     sample_rungs,
+    sample_two_step_teacher_transition,
     tau_to_s,
     teacher_step,
     transition_velocity,
@@ -227,10 +228,19 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
             raise ValueError(
                 f"x0_gt_normalizer must be positive, got {self.x0_gt_normalizer}"
             )
-        if self.teacher_source not in ("online", "cached_full"):
+        if self.teacher_source not in ("online", "cached_full", "online_eos2"):
             raise ValueError(
-                "teacher_source must be 'online' or 'cached_full', got "
+                "teacher_source must be 'online', 'cached_full' or 'online_eos2', got "
                 f"{self.teacher_source!r}"
+            )
+        if self.teacher_source == "online_eos2" and (
+            self.m_rungs != 2 or self.cd_weight <= 0.0
+            or self.x0_gt_weight != 0.0 or self.x0_teacher_weight != 0.0
+            or self.x0_source != "gt"
+        ):
+            raise ValueError(
+                "online_eos2 requires m_rungs=2, cd_weight>0, zero endpoint weights "
+                "and the default x0_source='gt' (unused)"
             )
         if x0_source not in ("gt", "teacher"):
             raise ValueError(f"x0_source must be 'gt' or 'teacher', got {x0_source!r}")
@@ -310,6 +320,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         cd: dict[str, Any] | None = None,
         cotrain_vlm: bool = False,
         stop_grad_from_vlm: bool = True,
+        expert_precision: str = "checkpoint",
     ):
         """Start CD from an expert already trained on the student VLM (EoS).
 
@@ -325,6 +336,8 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         while either teacher reference remains fixed would make the student expert's
         conditioning distribution move during CD.
         """
+        if expert_precision not in ("checkpoint", "fp32", "fp16"):
+            raise ValueError(f"unknown expert_precision: {expert_precision!r}")
         if cotrain_vlm:
             raise ValueError(
                 "EoS consistency training requires a frozen student VLM; "
@@ -380,6 +393,15 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
             teacher_checkpoint_path=str(eos_checkpoint_path),
             **cd_cfg,
         )
+        if expert_precision != "checkpoint":
+            model._cd_reference_dtype = next(model.expert.parameters()).dtype
+            model._cd_compute_dtype = (
+                torch.float32 if expert_precision == "fp32" else torch.float16
+            )
+            for module in (model.expert, model.action_in_proj, model.action_out_proj):
+                module.float()
+            print(f"[cd-precision] expert compute={model._cd_compute_dtype}; "
+                  "trainable parameters and EMA=fp32; frozen reference unchanged", flush=True)
         return model
 
     @property
@@ -393,14 +415,17 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         ⚠️ Unregistered means ``Trainer``, ``.to()`` and accelerate all skip it. Left on CPU
         it dies at the first matmul with "Expected all tensors to be on the same device".
         """
-        if self.teacher_source != "online":
+        if self.teacher_source not in ("online", "online_eos2"):
             raise RuntimeError(
                 "_ensure_teacher_expert called in cached_full mode; the full teacher "
                 "must remain offline"
             )
         if not self._teacher_expert_holder:
             self._teacher_expert_holder.append(
-                FrozenExpert(self._cd_ckpt, self.vlm.config.text_config)
+                FrozenExpert(
+                    self._cd_ckpt, self.vlm.config.text_config,
+                    expert_num_layers=self._teacher_num_layers,
+                )
             )
         e = self._teacher_expert_holder[0]
         if next(e.parameters()).device != device:
@@ -411,6 +436,38 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
 
     # ------------------------------------------------------------------ velocity
     def _velocity(
+        self, module, x, tau, cache, conditioning: ExpertConditioning, dtype,
+    ):
+        compute_dtype = getattr(self, "_cd_compute_dtype", None) if module is self else None
+        if compute_dtype is None:
+            reference_autocast = (
+                torch.autocast(x.device.type, dtype=dtype, enabled=x.device.type == "cuda")
+                if hasattr(self, "_cd_reference_dtype") else nullcontext()
+            )
+            with reference_autocast:
+                return self._velocity_impl(module, x, tau, cache, conditioning, dtype)
+        originals = [(layer.keys, layer.values) for layer in cache.layers]
+        try:
+            for layer in cache.layers:
+                layer.keys = layer.keys.to(compute_dtype)
+                layer.values = layer.values.to(compute_dtype)
+            if conditioning.attention_mask.is_floating_point():
+                conditioning = replace(
+                    conditioning, attention_mask=conditioning.attention_mask.to(compute_dtype),
+                )
+            with torch.autocast(
+                x.device.type, dtype=compute_dtype if compute_dtype != torch.float32 else torch.bfloat16,
+                enabled=x.device.type == "cuda" and compute_dtype != torch.float32,
+                cache_enabled=False,
+            ):
+                return self._velocity_impl(
+                    module, x, tau, cache, conditioning, compute_dtype,
+                )
+        finally:
+            for layer, (keys, values) in zip(cache.layers, originals):
+                layer.keys, layer.values = keys, values
+
+    def _velocity_impl(
         self,
         module,
         x,
@@ -434,7 +491,8 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         s = tau_to_s(tau)
         device_type = x.device.type
         with torch.autocast(
-            device_type, dtype=dtype, enabled=device_type == "cuda"
+            device_type, dtype=dtype if dtype != torch.float32 else torch.bfloat16,
+            enabled=device_type == "cuda" and dtype != torch.float32,
         ):
             emb = module.action_in_proj(x, s)
         emb = emb.to(dtype)
@@ -451,7 +509,8 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         cache.crop(conditioning.prefix_len)
         h = out.last_hidden_state[:, -n_act:]
         with torch.autocast(
-            device_type, dtype=dtype, enabled=device_type == "cuda"
+            device_type, dtype=dtype if dtype != torch.float32 else torch.bfloat16,
+            enabled=device_type == "cuda" and dtype != torch.float32,
         ):
             # Qwen3VLTextModel.forward applies `expert.norm` before returning
             # `last_hidden_state`. Applying it again here changes the vector field relative
@@ -554,10 +613,15 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         teacher_trajectory_states: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> CDVLAOutput:
+        if self.teacher_source == "online_eos2":
+            if getattr(self, "_ema_ref", None) is None:
+                raise RuntimeError("online_eos2 requires callbacks.ema bound before forward")
+            if self.cotrain_vlm:
+                raise RuntimeError("online_eos2 requires a frozen VLM conditioning cache")
         input_ids = tokenized_data.pop("input_ids")
         b = input_ids.shape[0]
         device = input_ids.device
-        dtype = next(self.expert.parameters()).dtype
+        dtype = getattr(self, "_cd_reference_dtype", next(self.expert.parameters()).dtype)
         traj_data = {
             "ego_history_xyz": ego_history_xyz, "ego_history_rot": ego_history_rot,
             "ego_future_xyz": ego_future_xyz, "ego_future_rot": ego_future_rot,
@@ -567,7 +631,11 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         # 1) frozen VLM prefill. no_grad because cotrain_vlm is false in this arm; the cache
         #    is also detached below so no graph survives into the expert.
         ctx = nullcontext() if self.cotrain_vlm else torch.no_grad()
-        with _Phase.t("vlm_prefill"), ctx:
+        reference_autocast = (
+            torch.autocast(device.type, dtype=dtype, enabled=device.type == "cuda")
+            if hasattr(self, "_cd_reference_dtype") else nullcontext()
+        )
+        with _Phase.t("vlm_prefill"), ctx, reference_autocast:
             vlm_outputs = self.vlm(input_ids=input_ids, use_cache=True, **tokenized_data)
 
         n_act = self.action_space.get_action_space_dims()[0]
@@ -599,17 +667,34 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         #    x0_gt_weight > 0, the same dataset action also directly supervises the online
         #    one-step endpoint. This aligns the objective with one-step ADE, at the cost of
         #    encouraging the conditional mean and potentially reducing sample diversity.
-        with _Phase.t("traj_to_action"):
-            x0 = self.action_space.traj_to_action(
-                traj_history_xyz=ego_history_xyz, traj_history_rot=ego_history_rot,
-                traj_future_xyz=ego_future_xyz, traj_future_rot=ego_future_rot,
-            ).reshape(b, n_act, 2).to(device=device, dtype=torch.float32)
+        x0 = None
+        if self.teacher_source != "online_eos2":
+            with _Phase.t("traj_to_action"):
+                x0 = self.action_space.traj_to_action(
+                    traj_history_xyz=ego_history_xyz, traj_history_rot=ego_history_rot,
+                    traj_future_xyz=ego_future_xyz, traj_future_rot=ego_future_rot,
+                ).reshape(b, n_act, 2).to(device=device, dtype=torch.float32)
 
         gen = None
         x0_teacher = None
         if self._cd_seed is not None:
             gen = torch.Generator(device=device).manual_seed(self._cd_seed)
-        if self.teacher_source == "cached_full":
+        if self.teacher_source == "online_eos2":
+            teacher = self._ensure_teacher_expert(device, dtype)
+            noise = torch.randn(
+                (b, n_act, 2), device=device, dtype=torch.float32, generator=gen,
+            )
+            with _Phase.t("expert_teacher"):
+                x_hi, x_lo, tau_lo, tau_hi, v_teacher = (
+                    sample_two_step_teacher_transition(
+                        noise,
+                        lambda state, tau: self._velocity(
+                            teacher, state, tau, cache, conditioning, dtype,
+                        ),
+                        generator=gen,
+                    )
+                )
+        elif self.teacher_source == "cached_full":
             if teacher_trajectory_states is None:
                 raise ValueError(
                     "teacher_source='cached_full' requires teacher_trajectory_states in "

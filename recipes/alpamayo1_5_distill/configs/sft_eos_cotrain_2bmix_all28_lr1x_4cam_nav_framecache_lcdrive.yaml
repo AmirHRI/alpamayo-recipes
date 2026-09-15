@@ -1,0 +1,90 @@
+defaults:
+  - sft_base
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.stitched_model.TrainableStitchedAlpamayoR1.from_student
+  checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_kd_2b_mixspan2b4camnavfc_m1-9-18-36_framecache4cam1080p_lcdrive/checkpoint-13752
+  vlm_name_or_path: /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
+  teacher_checkpoint_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  attn_implementation: sdpa
+  cotrain_vlm: false
+  cotrain_vlm_layers: "0-27"
+  cotrain_vlm_ce: false
+  layer_mix: true
+  layer_mix_expert_layers: 36
+  layer_mix_blocks: 4
+  layer_mix_gain: false
+  layer_mix_sharpen: 0.75
+
+data:
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [0, 1, 2, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+    frame_cache_root: /temp/achahe/physical_ai_av/framecache_nav4cam_1080p
+    strip_nav_turn_distance: true
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    cameras: [0, 1, 2, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    strip_nav_turn_distance: true
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      _target_: alpamayo.processor.qwen_processor.get_preprocess_data_fn_from_model_config
+      chat_template_version: r1_5
+      components_order: ["image", "traj_history", "route", "prompt", "traj_future"]
+      components_prompt: ["traj_future"]
+      label_components: ["traj_future"]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  ddp_find_unused_parameters: true
+  deepspeed: null
+  gradient_checkpointing: false
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2e-5
+  warmup_steps: 430
+  num_train_epochs: 2
+  save_strategy: epoch
+  save_total_limit: 10
+
+paths:
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_eos_cotrain_2bmix_all28_lr1x_4cam_nav_framecache
+
+task_name: alpamayo_1_5_eos_cotrain_2bmix_all28_lr1x_4cam_nav_framecache_lcdrive
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-expert-on-student
+  group: expert_on_student_4b_all
+
+evaluate:
+  eval_ckpt: null

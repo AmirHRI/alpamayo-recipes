@@ -1,0 +1,106 @@
+defaults:
+  - sft_base
+  - /wandb: default
+  - _self_
+
+hydra:
+  searchpath:
+    - pkg://alpamayo1_5_sft/configs
+
+model:
+  _target_: alpamayo1_5_distill.models.consistency_expert.ConsistencyExpertVLA.from_eos_checkpoint
+  eos_checkpoint_path: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_eos_cotrain_2bmix_all28_lr1x_nav_framecache/checkpoint-6876
+  vlm_name_or_path: /temp/achahe/hf_cache/hub/Cosmos-Reason2-2B
+  alpamayo_config_path: /temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
+  cotrain_vlm: false
+  stop_grad_from_vlm: true
+  expert_precision: fp16
+  cd:
+    teacher_source: online_eos2
+    teacher_num_layers: 36
+    student_prune_layers: null
+    layer_mix: true
+    layer_mix_blocks: 4
+    layer_mix_gain: false
+    layer_mix_sharpen: 0.75
+    m_rungs: 2
+    cd_weight: 1.0
+    x0_gt_weight: 0.0
+    x0_teacher_weight: 0.0
+    metric: mse
+    normalizer: 1.0
+
+callbacks:
+  ema:
+    _target_: alpamayo1_5_distill.models.ema.EMACallback
+    decay: 0.99
+    warmup_steps: 0
+    save_ema_weights: true
+    liveness_check_at: 20
+
+data:
+  train_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    cameras: [1, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+    frame_cache_root: /temp/achahe/physical_ai_av/framecache_nav2cam_1080p
+    strip_nav_turn_distance: true
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_train_clip_uuids.txt
+    vla_preprocess_args:
+      components_order: [image, traj_history, route, prompt, traj_future]
+      components_prompt: [traj_future]
+      label_components: [traj_future]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  val_dataset:
+    _target_: alpamayo1_5_distill.data.camera_subset.CameraSubsetPAIDataset
+    local_dir: /temp/achahe/physical_ai_av/
+    chunk_ids: "0-3146"
+    cameras: [1, 3]
+    annotations_path: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_val_mysubset_1k.json
+    strip_nav_turn_distance: true
+    clip_uuid_filter: /temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/lcdrive_val_mysubset_1k_clip_uuids.txt
+    vla_preprocess_args:
+      components_order: [image, traj_history, route, prompt, traj_future]
+      components_prompt: [traj_future]
+      label_components: [traj_future]
+      include_camera_ids: true
+      include_frame_nums: true
+      generation_mode: false
+  collate_fn:
+    include_camera_ids: true
+    include_frame_nums: true
+
+trainer:
+  report_to: wandb
+  ddp_find_unused_parameters: false
+  deepspeed: null
+  gradient_checkpointing: false
+  bf16: false
+  fp16: true
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  dataloader_num_workers: 4
+  learning_rate: 2e-5
+  warmup_steps: 430
+  num_train_epochs: 2
+  eval_strategy: "no"
+  save_strategy: epoch
+  save_total_limit: 3
+
+paths:
+  output_dir: /temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training/output_cd_eos2bmix_all28_consistency2to1_fp16_master32_2cam_nav
+
+wandb:
+  team: zrb20
+  project: alpamayo1_5-consistency-distill
+  group: cd_eos2bmix_all28_consistency2to1_fp16_master32
+
+evaluate:
+  eval_ckpt: null
+
+task_name: alpamayo_1_5_cd_eos2bmix_consistency2to1
+run_name: cd_eos2bmix_all28_fp16_master32_${now:%m%d-%H%M}

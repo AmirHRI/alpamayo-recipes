@@ -36,6 +36,7 @@ from alpamayo1_5_distill.models.consistency_losses import (
     cached_teacher_endpoint,
     sample_cached_teacher_transition,
     sample_rungs,
+    sample_two_step_teacher_transition,
     tau_to_s,
     teacher_step,
     transition_velocity,
@@ -162,6 +163,37 @@ def test_grid_and_rungs_have_the_right_shapes_and_range():
     assert lo.shape == (B, 1, 1) and hi.shape == (B, 1, 1)
     assert torch.all(hi > lo) and torch.all(lo >= 0.0) and torch.all(hi <= 1.0)
     assert int(n.min()) >= 0 and int(n.max()) <= 9
+
+
+def test_two_step_rollout_consistency_fixed_point_is_teacher_nfe2():
+    noise = torch.randn(B, T, C, requires_grad=True)
+    calls = []
+
+    def velocity(state, tau):
+        calls.append((state.clone(), tau.clone()))
+        return state.square() * 0.1 + tau
+
+    x_hi, x_lo, tau_lo, tau_hi, v_teacher = sample_two_step_teacher_transition(
+        noise, velocity, generator=torch.Generator().manual_seed(7),
+    )
+    midpoint = noise.detach() + 0.5 * (noise.detach().square() * 0.1 + 1.0)
+    endpoint = midpoint + 0.5 * (midpoint.square() * 0.1 + 0.5)
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[0][1], _tau(1.0))
+    torch.testing.assert_close(calls[1][0], midpoint)
+    torch.testing.assert_close(calls[1][1], _tau(0.5))
+    assert bool((tau_lo == 0).any()) and bool((tau_lo == 0.5).any())
+    torch.testing.assert_close(teacher_step(x_hi, v_teacher, tau_hi - tau_lo), x_lo)
+    assert not x_hi.requires_grad and not v_teacher.requires_grad
+    v_target = (endpoint - x_lo) / tau_lo.clamp_min(0.5)
+    v_online = ((endpoint - x_hi) / tau_hi).requires_grad_()
+    loss, _ = cd_loss(v_online, v_teacher, v_target, tau_lo, tau_hi)
+    torch.testing.assert_close(loss, torch.zeros_like(loss), atol=1e-12, rtol=0)
+    torch.testing.assert_close(consistency_fn(x_hi, tau_hi, v_online), endpoint)
+    wrong_loss, _ = cd_loss(v_online + 0.1, v_teacher, v_target, tau_lo, tau_hi)
+    wrong_loss.backward()
+    assert v_online.grad is not None and bool((v_online.grad != 0).any())
+    assert noise.grad is None
 
 
 def test_cached_teacher_transition_preserves_rollout_order_and_time_orientation():
@@ -593,6 +625,81 @@ def test_cd_forward_preserves_fp32_action_states(teacher_source, cd_weight, monk
     assert float(parameter.grad.abs()) > 0.0
 
 
+def test_eos2_forward_uses_fixed_rollout_ema_and_no_gt(monkeypatch):
+    from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
+
+    monkeypatch.delenv("CD_SELFTEST", raising=False)
+    batch, n_action, seed = 8, 3, 17
+    cache = SimpleNamespace(layers=(), crop=lambda length: None)
+    expert = torch.nn.Linear(2, 2, bias=False)
+    expert.config = SimpleNamespace(_attn_implementation="sdpa")
+    owner = torch.nn.Module()
+    owner.expert = expert
+    ema = ExpertEMA(owner, decay=0.9)
+    with torch.no_grad():
+        expert.weight.add_(0.1)
+    online_weight = expert.weight.detach().clone()
+    teacher = object()
+    calls = []
+
+    def velocity(module, state, tau, shared_cache, conditioning, dtype):
+        assert shared_cache is cache
+        assert state.dtype == torch.float32
+        calls.append((module, state.clone(), tau.clone(), torch.is_grad_enabled(), conditioning))
+        if module is teacher:
+            assert not torch.is_grad_enabled()
+            return 0.1 * state.square() + tau
+        expected = online_weight if torch.is_grad_enabled() else ema.shadow["expert.weight"]
+        torch.testing.assert_close(expert.weight, expected)
+        return state * expert.weight.mean() + tau
+
+    def forbidden_gt(**kwargs):
+        raise AssertionError("two-step consistency must not use GT action targets")
+
+    owner.action_space = SimpleNamespace(
+        get_action_space_dims=lambda: (n_action, 2), traj_to_action=forbidden_gt,
+    )
+    owner.config = SimpleNamespace(traj_token_ids={"future_start": 9})
+    owner.cotrain_vlm = False
+    owner.fuse_traj_tokens = lambda input_ids, data: input_ids
+    owner.vlm = lambda **kwargs: SimpleNamespace(
+        past_key_values=cache, rope_deltas=torch.zeros(batch, 1, dtype=torch.long),
+    )
+    owner._cd_seed = seed
+    owner.teacher_source = "online_eos2"
+    owner.m_rungs = 2
+    owner.cd_weight = 1.0
+    owner.x0_teacher_weight = owner.x0_gt_weight = 0.0
+    owner.cd_metric = "mse"
+    owner.cd_huber_c = None
+    owner.cd_normalizer = 1.0
+    owner.keep_loss_terms = False
+    owner._velocity = velocity
+    owner._ensure_teacher_expert = lambda device, dtype: teacher
+
+    def batch_inputs():
+        return {"input_ids": torch.tensor([[1, 9]]).repeat(batch, 1),
+                "attention_mask": torch.ones(batch, 2)}
+
+    with pytest.raises(RuntimeError, match="callbacks.ema"):
+        ConsistencyExpertVLA.forward(owner, tokenized_data=batch_inputs())
+    owner._ema_ref = ema
+    output = ConsistencyExpertVLA.forward(owner, tokenized_data=batch_inputs())
+    assert len(calls) == 4
+    assert [call[3] for call in calls] == [False, False, False, True]
+    assert all(call[4] is calls[0][4] for call in calls)
+    torch.testing.assert_close(calls[1][1], calls[0][1] + 0.5 * (
+        0.1 * calls[0][1].square() + calls[0][2]))
+    torch.testing.assert_close(expert.weight, online_weight)
+    assert not ema._backup
+    assert output.x0_gt_loss == 0 and output.x0_teacher_loss == 0
+    assert output.cd_loss_anchor is not None and output.cd_loss_noise is not None
+    output.loss.backward()
+    assert expert.weight.grad is not None
+    assert bool(torch.isfinite(expert.weight.grad).all())
+    assert bool((expert.weight.grad != 0).any())
+
+
 @pytest.mark.parametrize("expert_dtype", [torch.float32, torch.bfloat16])
 def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice(expert_dtype):
     """Teacher/student calls must see the deployment mask and post-norm hidden state."""
@@ -654,7 +761,7 @@ def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice(expert_d
 
     for arm in (Arm(), Arm()):  # frozen teacher and online/EMA share this exact path
         cache = Cache()
-        velocity = ConsistencyExpertVLA._velocity(
+        velocity = ConsistencyExpertVLA._velocity_impl(
             owner, arm, x, tau, cache, conditioning, expert_dtype
         )
         torch.testing.assert_close(velocity, x.to(expert_dtype))
@@ -663,6 +770,93 @@ def test_velocity_uses_shared_conditioning_and_does_not_normalize_twice(expert_d
         assert arm.expert.kwargs["position_ids"] is conditioning.position_ids
         assert arm.expert.kwargs["is_causal"] is False
         assert cache.crops == [conditioning.prefix_len]
+
+
+@pytest.mark.parametrize("compute_dtype", [torch.float32, torch.float16])
+@pytest.mark.parametrize("fail", [False, True])
+def test_precision_velocity_restores_cache_and_preserves_teacher(compute_dtype, fail):
+    from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
+    from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
+
+    original = torch.ones(1, 1, 2, 2, dtype=torch.bfloat16)
+    cache = SimpleNamespace(layers=[SimpleNamespace(keys=original, values=original)])
+    conditioning = build_expert_conditioning(
+        traj_future_start_mask=torch.tensor([[False, True]]),
+        tokenizer_attention_mask=torch.ones(1, 2), rope_deltas=torch.zeros(1, 1),
+        n_action_tokens=2, dtype=torch.bfloat16, attention_implementation="sdpa",
+    )
+    owner = SimpleNamespace(_cd_compute_dtype=compute_dtype, _cd_reference_dtype=torch.bfloat16)
+
+    def impl(module, state, tau, shared_cache, cond, dtype):
+        expected = compute_dtype if module is owner else torch.bfloat16
+        assert dtype == expected
+        assert shared_cache.layers[0].keys.dtype == expected
+        assert cond.attention_mask.dtype == expected
+        if fail:
+            raise RuntimeError("probe failure")
+        return state + 1
+
+    owner._velocity_impl = impl
+    for module in (owner, object()):
+        if fail:
+            with pytest.raises(RuntimeError, match="probe failure"):
+                ConsistencyExpertVLA._velocity(
+                    owner, module, torch.ones(1, 2, 2), _tau(1, 1), cache,
+                    conditioning, torch.bfloat16,
+                )
+        else:
+            result = ConsistencyExpertVLA._velocity(
+                owner, module, torch.ones(1, 2, 2), _tau(1, 1), cache,
+                conditioning, torch.bfloat16,
+            )
+            torch.testing.assert_close(result, torch.full_like(result, 2))
+        assert cache.layers[0].keys is original and cache.layers[0].values is original
+
+
+def test_precision_ema_swap_does_not_reuse_autocast_weight_cache():
+    from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
+    from alpamayo1_5_distill.models.expert_conditioning import build_expert_conditioning
+
+    projection = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        projection.weight.fill_(1.0)
+    owner = SimpleNamespace(_cd_compute_dtype=torch.float16, _cd_reference_dtype=torch.bfloat16)
+    cache = SimpleNamespace(layers=[])
+    conditioning = build_expert_conditioning(
+        traj_future_start_mask=torch.tensor([[False, True]]),
+        tokenizer_attention_mask=torch.ones(1, 2), rope_deltas=torch.zeros(1, 1),
+        n_action_tokens=2, dtype=torch.bfloat16, attention_implementation="sdpa",
+    )
+
+    def impl(module, state, tau, shared_cache, cond, dtype):
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            return projection(state)
+
+    owner._velocity_impl = impl
+    inputs = torch.ones(1, 2, 2, requires_grad=True)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        with torch.no_grad():
+            target = ConsistencyExpertVLA._velocity(
+                owner, owner, inputs, _tau(1, 1), cache, conditioning, torch.bfloat16,
+            )
+            projection.weight.fill_(2.0)
+        online = ConsistencyExpertVLA._velocity(
+            owner, owner, inputs, _tau(1, 1), cache, conditioning, torch.bfloat16,
+        )
+    torch.testing.assert_close(target.float(), torch.full_like(inputs, 2.0))
+    torch.testing.assert_close(online.float(), torch.full_like(inputs, 4.0))
+    online.float().sum().backward()
+    assert projection.weight.grad is not None
+    assert bool((projection.weight.grad != 0).all())
+
+
+def test_ema_does_not_update_on_scaler_skipped_step():
+    from alpamayo1_5_distill.models.ema import EMACallback
+
+    callback = EMACallback()
+    callback.on_step_end(None, SimpleNamespace(global_step=1), None,
+                         optimizer=SimpleNamespace(step_was_skipped=True))
+    assert callback.ema is None
 
 
 def test_pruned_consistency_student_requires_an_exact_explicit_map():
@@ -700,6 +894,35 @@ def test_consistency_teacher_must_have_all_real_layers():
         raise AssertionError("a teacher with an identity-pruned layer should fail")
 
 
+def test_layer_mix_online_teacher_keeps_36_layers_for_28_layer_vlm(monkeypatch):
+    from alpamayo1_5_distill.models import consistency_expert
+
+    calls = {}
+
+    def factory(checkpoint, text_config, expert_num_layers=None):
+        calls.update(checkpoint=checkpoint, vlm_depth=text_config.num_hidden_layers,
+                     expert_depth=expert_num_layers)
+        teacher = torch.nn.Module()
+        teacher.expert = torch.nn.Module()
+        teacher.expert.layers = torch.nn.ModuleList(
+            [torch.nn.Linear(1, 1) for _ in range(expert_num_layers)]
+        )
+        return teacher
+
+    monkeypatch.setattr(consistency_expert, "FrozenExpert", factory)
+    owner = SimpleNamespace(
+        teacher_source="online_eos2", _teacher_expert_holder=[], _cd_ckpt="/eos2b",
+        _teacher_num_layers=36,
+        vlm=SimpleNamespace(config=SimpleNamespace(
+            text_config=SimpleNamespace(num_hidden_layers=28))),
+    )
+    teacher = consistency_expert.ConsistencyExpertVLA._ensure_teacher_expert(
+        owner, torch.device("cpu"), torch.float32,
+    )
+    assert calls == {"checkpoint": "/eos2b", "vlm_depth": 28, "expert_depth": 36}
+    assert len(teacher.expert.layers) == 36
+
+
 def test_cached_full_teacher_mode_cannot_construct_an_online_teacher():
     from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
 
@@ -712,6 +935,74 @@ def test_cached_full_teacher_mode_cannot_construct_an_online_teacher():
         assert "must remain offline" in str(ex)
     else:
         raise AssertionError("cached teacher mode attempted to build an online teacher")
+
+
+@pytest.mark.parametrize("overrides", [
+    {"m_rungs": 10}, {"cd_weight": 0.0}, {"x0_gt_weight": 0.5},
+    {"x0_teacher_weight": 1.0}, {"x0_source": "teacher"},
+])
+def test_eos2_rejects_non_consistency_objectives(overrides):
+    from alpamayo1_5_distill.models.consistency_expert import ConsistencyExpertVLA
+
+    owner = SimpleNamespace()
+    options = {"teacher_source": "online_eos2", "m_rungs": 2, **overrides}
+    with pytest.raises(ValueError, match="online_eos2 requires"):
+        ConsistencyExpertVLA.init_cd(owner, teacher_checkpoint_path="/eos", **options)
+
+
+def test_eos2_recipe_composes_without_cached_or_gt_targets():
+    from pathlib import Path
+
+    from hydra import compose, initialize_config_dir
+
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "configs"), version_base="1.3",
+    ):
+        config = compose(config_name="sft_cd_eos_4b_consistency2to1_2cam_nav_lcdrive")
+    assert config.model.eos_checkpoint_path.endswith(
+        "output_eos_cotrain_4b_all36_lr1x_2cam_nav_framecache/checkpoint-6876"
+    )
+    assert config.model.cd.teacher_source == "online_eos2"
+    assert config.model.cd.teacher_num_layers == 36 and config.model.cd.m_rungs == 2
+    assert config.model.cd.cd_weight == 1.0
+    assert config.model.cd.x0_gt_weight == config.model.cd.x0_teacher_weight == 0.0
+    assert not config.model.cotrain_vlm
+    assert config.callbacks.ema.save_ema_weights
+    assert config.callbacks.ema.decay == 0.99
+    assert config.trainer.per_device_train_batch_size * config.trainer.gradient_accumulation_steps * 4 == 32
+    for dataset in (config.data.train_dataset, config.data.val_dataset):
+        assert list(dataset.cameras) == [1, 3]
+        assert dataset.strip_nav_turn_distance
+        assert "route" in dataset.vla_preprocess_args.components_order
+        assert "teacher_trajectory_cache_root" not in dataset
+
+
+def test_2b_consistency_recipe_preserves_cotrained_mixer_and_precision():
+    from pathlib import Path
+    from hydra import compose, initialize_config_dir
+
+    with initialize_config_dir(
+        config_dir=str(Path(__file__).resolve().parents[1] / "configs"), version_base="1.3",
+    ):
+        config = compose(config_name="sft_cd_eos_2b_consistency2to1_2cam_nav_lcdrive")
+    assert config.model.eos_checkpoint_path.endswith(
+        "output_eos_cotrain_2bmix_all28_lr1x_nav_framecache/checkpoint-6876"
+    )
+    assert config.model.cd.layer_mix and config.model.cd.layer_mix_blocks == 4
+    assert not config.model.cd.layer_mix_gain and config.model.cd.layer_mix_sharpen == 0.75
+    assert config.model.cd.teacher_num_layers == 36
+    assert config.model.cd.teacher_source == "online_eos2" and config.model.cd.m_rungs == 2
+    assert config.model.cd.cd_weight == 1
+    assert config.model.cd.x0_gt_weight == config.model.cd.x0_teacher_weight == 0
+    assert config.model.expert_precision == "fp16" and not config.model.cotrain_vlm
+    assert config.trainer.fp16 and not config.trainer.bf16
+    assert config.trainer.per_device_train_batch_size * config.trainer.gradient_accumulation_steps * 4 == 32
+    assert config.trainer.num_train_epochs == 2 and config.trainer.warmup_steps == 430
+    assert config.callbacks.ema.decay == 0.99
+    for dataset in (config.data.train_dataset, config.data.val_dataset):
+        assert list(dataset.cameras) == [1, 3] and dataset.strip_nav_turn_distance
+        assert "route" in dataset.vla_preprocess_args.components_order
+        assert "teacher_trajectory_cache_root" not in dataset
 
 
 def test_eos_factory_uses_one_checkpoint_for_online_and_frozen_teacher(monkeypatch):

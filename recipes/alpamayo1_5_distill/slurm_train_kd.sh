@@ -804,6 +804,73 @@ case "$ARM" in
                 ++trainer.dataloader_prefetch_factor=4
                 ++trainer.dataloader_persistent_workers=true)
         ARM="${ARM}_m1-9-18-36_framecache1080p" ;;
+    mixspan2b4camnavfc)
+        # The 4B's CURRICULUM objective on the 2B LAYER-MIX student. Deliberately NOT mix2bnav:
+        # that arm runs the simultaneous pair (teacher-forced m=1 PLUS span m=9, weighted mean)
+        # every step, while this one runs ONE span per epoch, [1, 9, 18, 36], exactly as
+        # nav4bspan2camallfc did. block_span_mix=0 is what selects the schedule over the mix;
+        # BlockSpanScheduleCallback RAISES if it is left >1, so the two cannot be run by accident.
+        #
+        # Held identical to the 4B run so the 2B and 4B students are comparable end to end:
+        # same manifest (anchors_all, 109,997), same nav format (distance stripped, so the
+        # model-visible route is "<|route_start|>Turn left<|route_end|>"), same generation-mode
+        # prompt ending at <traj_future_start>, same effective batch 32 -> 3,438 steps/epoch,
+        # 13,752 total, warmup 733 = 21.3% of one epoch. ⚠️ That warmup is only correct BECAUSE
+        # the effective batch is 32 on this manifest; the config's shipped 333 is for the 50k
+        # manifest and must not be reused here.
+        #
+        # ⚠️ BS=2/ACCUM=4, not the 4B's BS=8/ACCUM=1, for the same effective 32. The config
+        # measured 38.6 GB at bs=1 and projects ~66 GB at bs=2 for THIS stack -- a 2B student
+        # carrying a 36-layer expert whose m=9 span chain is UNCHECKPOINTED (SPAN_CKPT_MIN=14).
+        # Extrapolating that line puts bs=8 near 230 GB, well past even an H200. Gradient
+        # accumulation is mathematically equivalent here, so only memory and step timing change.
+        # Peak is epoch 2 (m=9, uncheckpointed); epochs 3-4 checkpoint the chain and cost less.
+        unset PRUNE_EXPERT_LAYERS
+        MODEL_TAG=2b
+        CONFIG_NAME=sft_kd_cosmos2b_4cam_nav_layermix_lcdrive
+        PREFLIGHT_MANIFEST=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests/nav_lcdrive_train_anchors_all.json
+        REQUIRE_APPROVAL=1
+        # The 4B's cache serves this run unchanged: cameras [1,3] match, and the 50k manifest
+        # this config ships is a strict subset of anchors_all (verified: 0 anchors and 0 clips
+        # outside it), so every (clip, t0) the loader asks for is already materialised.
+        FRAME_CACHE="${FRAME_CACHE:-/temp/achahe/physical_ai_av/framecache_nav4cam_1080p}"
+        [[ -f "$FRAME_CACHE/_index.json" ]] || {
+            echo "[slurm] no frame-cache index at $FRAME_CACHE/_index.json." >&2
+            echo "        Build it:  sbatch slurm_build_frame_cache.sh" >&2
+            exit 1; }
+        # ⚠️ BS=4/ACCUM=2 for FOUR cameras: 16 images per sample instead of 8, so the vision
+        # activations roughly double. Effective batch stays 4 x 4 x 2 = 32, which is what
+        # keeps warmup 733 and 3,438 steps/epoch identical to the 2-camera runs.
+        [[ -n "$BS" ]] || BS=4
+        [[ -n "$ACCUM" ]] || ACCUM=2    # effective batch = 4 GPUs x 4 x 2 = 32
+        [[ -n "$WARMUP" ]] || WARMUP=733
+        [[ -n "${WORKERS:-}" ]] || WORKERS=8
+        [[ -n "$AUTO_RESUME_LATEST" ]] || AUTO_RESUME_LATEST=1
+        [[ -n "$MAX_RESTARTS" ]] || MAX_RESTARTS=3
+        EXTRA+=(++data.train_dataset.frame_cache_root="$FRAME_CACHE"
+                ++data.train_dataset.annotations_path="$PREFLIGHT_MANIFEST"
+                ++data.train_dataset.strip_nav_turn_distance=true
+                ++data.train_dataset.vla_preprocess_args.generation_mode=true
+                ++model.kd.ce_weight=0.0 ++model.kd.kd_weight=0.0 ++model.kd.kv_weight=0.0
+                ++model.kd.layer_mix=true
+                ++model.kd.block_weight=1.0 ++model.kd.block_timestep=beta
+                ++model.kd.block_norm=teacher ++model.kd.block_span=1
+                ++model.kd.block_span_mix=0
+                ++callbacks.block_span_schedule._target_=alpamayo1_5_distill.callbacks.BlockSpanScheduleCallback
+                "++callbacks.block_span_schedule.spans=[1,9,18,36]"
+                ++callbacks.block_span_schedule.strict_num_train_epochs=true
+                ++trainer.num_train_epochs=4
+                # ⚠️ 0.125 = 1,719 steps = HALF AN EPOCH. The alignment is the point: these 8
+                # saves land on all four epoch boundaries (3,438/6,876/10,314/13,752) plus the
+                # four midpoints, and save_total_limit=8 keeps exactly that set. An interval of
+                # 500 divides none of the boundaries and prunes to the last 8, which is how the
+                # 4B run finished with only its epoch-4 checkpoint -- useless for the per-epoch
+                # 2B-vs-4B comparison this arm exists to enable.
+                ++trainer.save_strategy=steps ++trainer.save_steps=0.125
+                ++trainer.save_total_limit=8
+                ++trainer.dataloader_prefetch_factor=4
+                ++trainer.dataloader_persistent_workers=true)
+        ARM="${ARM}_m1-9-18-36_framecache4cam1080p" ;;
     field2b)
         # L_FIELD ALONE on the 2B/pruned-expert 2-camera stack: chain all 28 layers on the
         # STUDENT's own cache (no teacher forcing anywhere), take expert.norm +
@@ -979,7 +1046,7 @@ case "$ARM" in
         # and holding it fixed keeps this arm comparable to the others.
         EXTRA+=(++model.kd.kd_weight=0.0 ++model.kd.ce_weight=0.0) ;;
     *)
-        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam|nav4bspan2camall|nav4bspan2camallfc|nav4bspan4camallfc|nav4bspan2camallfc_cachenorm|nav4bspan2camallfc_freerun|mixspan2bnavfc|nav4bspanmix2camallfc|mixspanmix2bnavfc)" >&2; exit 1 ;;
+        echo "[slurm] unknown ARM=$ARM (expected ce|kd|kv|cekv|kvonly|kvband|blockonly|blockrandt|blockfr|block2b|nav2bmix|nav4bmix|nav4bmix2cam|nav4bspan2camall|nav4bspan2camallfc|nav4bspan4camallfc|nav4bspan2camallfc_cachenorm|nav4bspan2camallfc_freerun|mixspan2bnavfc|mixspan2b4camnavfc|nav4bspanmix2camallfc|mixspanmix2bnavfc)" >&2; exit 1 ;;
 esac
 
 # The requested run has a deliberate human gate. Running this file directly prints a real turn
