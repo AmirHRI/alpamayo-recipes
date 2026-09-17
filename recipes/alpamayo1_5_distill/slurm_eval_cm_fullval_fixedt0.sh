@@ -16,12 +16,18 @@ OUT=/temp/achahe/alpamayo-recipes/recipes/alpamayo1_5_distill/training
 MANIFEST_DIR=/temp/achahe/physical_ai_av/lcdrive_physicalai_av_manifests
 ANNOTATIONS="$MANIFEST_DIR/nav_lcdrive_val_available_fixedt0_23331_stripped.json"
 CLIP_LIST="$MANIFEST_DIR/lcdrive_val_available_23331_clip_uuids.txt"
+NFE=${NFE:-1}
+ARM=${ARM:-cm}
+[[ "$NFE" =~ ^[1-9][0-9]*$ ]] || { echo "NFE must be a positive integer" >&2; exit 1; }
+[[ "$ARM" == "cm" || "$ARM" == "eos" ]] || { echo "ARM must be cm or eos" >&2; exit 1; }
 MODEL_ARGS=()
 case "${MODEL:?Set MODEL=4b, MODEL=2b or MODEL=teacher}" in
     4b) RUN=output_cd_eos4b_consistency2to1_fp16_master32_2cam_nav
+        if [[ "$ARM" == "eos" ]]; then RUN=output_eos_cotrain_4b_all36_lr1x_2cam_nav_framecache; fi
         CONFIG=sft_eval_eos_4b_2cam_nav_lcdrive
         CKPT="$OUT/$RUN/checkpoint-6876" ;;
     2b) RUN=output_cd_eos2bmix_all28_consistency2to1_fp16_master32_2cam_nav
+        if [[ "$ARM" == "eos" ]]; then RUN=output_eos_cotrain_2bmix_all28_lr1x_nav_framecache; fi
         CONFIG=sft_eval_eos_2b_mix_nav_lcdrive
         CKPT="$OUT/$RUN/checkpoint-6876" ;;
     teacher) CONFIG=sft_eval_eos_4b_2cam_nav_lcdrive
@@ -32,9 +38,9 @@ case "${MODEL:?Set MODEL=4b, MODEL=2b or MODEL=teacher}" in
         ) ;;
     *) echo "MODEL must be 4b, 2b or teacher" >&2; exit 1 ;;
 esac
-TAG="cm${MODEL}_availableval23331_fixedt0_stripped_ep2_nfe1_${SLURM_JOB_ID}"
+TAG="${ARM}${MODEL}_availableval23331_fixedt0_stripped_ep2_nfe${NFE}_${SLURM_JOB_ID}"
 if [[ "$MODEL" == "teacher" ]]; then
-    TAG="teacher15_availableval23331_fixedt0_stripped_nfe1_${SLURM_JOB_ID}"
+    TAG="teacher15_availableval23331_fixedt0_stripped_nfe${NFE}_${SLURM_JOB_ID}"
 fi
 [[ -f "$CKPT/model.safetensors.index.json" && -f "$ANNOTATIONS" ]] || {
     echo "Missing checkpoint or prepared full validation manifest" >&2; exit 1;
@@ -57,7 +63,7 @@ assert all(row["nav_text"] in {"Continue straight", "Turn left", "Turn right", "
 print("Preflight: 23,331 available validation clips; 427 missing-index clips excluded; t0=5.1s, distance-free navigation")
 PY
 cd "$REPO/recipes/alpamayo1_5_distill"
-echo "[fullval] MODEL=$MODEL VLM/expert/mixer checkpoint=$CKPT NFE=1 cameras=[1,3]"
+echo "[fullval] MODEL=$MODEL ARM=$ARM VLM/expert/mixer checkpoint=$CKPT NFE=$NFE cameras=[1,3]"
 echo "[fullval] output=$OUT/$TAG.npz"
 srun "$VENV/torchrun" --nproc_per_node=1 --master_port="$((29900 + SLURM_JOB_ID % 20000))" \
     -m alpamayo1_5_sft.evaluate_hf \
@@ -66,7 +72,7 @@ srun "$VENV/torchrun" --nproc_per_node=1 --master_port="$((29900 + SLURM_JOB_ID 
     "++data.val_dataset.annotations_path=$ANNOTATIONS" \
     "++data.val_dataset.clip_uuid_filter=$CLIP_LIST" \
     ++data.val_dataset.chunk_ids=0-3146 ++data.val_dataset.strip_nav_turn_distance=true \
-    ++evaluate.max_eval_steps=-1 ++evaluate.metric_runner.metrics.0.diffusion_kwargs.inference_step=1 \
+    ++evaluate.max_eval_steps=-1 "++evaluate.metric_runner.metrics.0.diffusion_kwargs.inference_step=$NFE" \
     ++trainer.per_device_eval_batch_size=4 \
     "++evaluate.per_clip_output=$OUT/$TAG.json" "++evaluate.trajectory_output=$OUT/$TAG.npz" \
     "paths.output_dir=$OUT/$TAG" "${MODEL_ARGS[@]}"
