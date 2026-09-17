@@ -133,6 +133,7 @@ def sample_cached_teacher_transition(
     states: torch.Tensor,
     m: int,
     *,
+    terminal_rung_frac: float = 0.0,
     generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample an adjacent transition from cached full-teacher rollouts.
@@ -141,6 +142,16 @@ def sample_cached_teacher_transition(
         states: ``[B,K,M+1,T,C]`` states in the repository sampler's native
             order: index 0 is noise at ``s=0``, index M is data at ``s=1``.
         m: number of Euler steps used to generate the cache.
+        terminal_rung_frac: probability of FORCING ``s_index = 0``, i.e. ``tau_hi = 1``,
+            the pure-noise rung. Uniform sampling gives that rung only ``1/m`` of the mass
+            (10% at M=10), yet it is the ONLY rung a 1-NFE sampler ever evaluates:
+            ``flow_matching._euler`` at ``inference_step=1`` computes exactly
+            ``x + 1.0 * v(x, s=0)``, which is ``f(eps, tau=1)``. Raising this trades
+            mid-path supervision (what 2 NFE needs) for terminal supervision (what 1 NFE
+            needs), so it is expected to help 1 NFE and cost 2 NFE.
+
+            ⚠️ Left at 0.0 the extra RNG draw is SKIPPED, not merely ignored, so every run
+            predating this argument reproduces bit-for-bit off the same seed.
 
     Returns:
         ``(s_index, noise_index, x_hi, x_lo, tau_lo, tau_hi)``.  ``x_hi``
@@ -163,8 +174,15 @@ def sample_cached_teacher_transition(
         raise ValueError(
             f"cached teacher states have {n_states - 1} steps but model.cd.m_rungs={m}"
         )
+    if not 0.0 <= terminal_rung_frac <= 1.0:
+        raise ValueError(
+            f"terminal_rung_frac must be in [0, 1], got {terminal_rung_frac}"
+        )
     device = states.device
     s_index = torch.randint(0, m, (batch,), device=device, generator=generator)
+    if terminal_rung_frac > 0.0:
+        force = torch.rand(batch, device=device, generator=generator) < terminal_rung_frac
+        s_index = torch.where(force, torch.zeros_like(s_index), s_index)
     noise_index = torch.randint(
         0, num_noise, (batch,), device=device, generator=generator
     )

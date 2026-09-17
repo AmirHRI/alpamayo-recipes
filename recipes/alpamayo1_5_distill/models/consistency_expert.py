@@ -186,6 +186,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         teacher_checkpoint_path: str,
         teacher_source: str = "online",
         m_rungs: int = DEFAULT_M,
+        terminal_rung_frac: float = 0.0,
         cd_weight: float = 1.0,
         x0_gt_weight: float = 0.0,
         x0_teacher_weight: float = 0.0,
@@ -199,6 +200,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         teacher_num_layers: int = 36,
     ) -> None:
         self.m_rungs = int(m_rungs)
+        self.terminal_rung_frac = float(terminal_rung_frac)
         self.cd_weight = float(cd_weight)
         self.x0_gt_weight = float(x0_gt_weight)
         self.x0_teacher_weight = float(x0_teacher_weight)
@@ -219,6 +221,15 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
         self._teacher_num_layers = int(teacher_num_layers)
         if self.x0_gt_weight < 0:
             raise ValueError(f"x0_gt_weight must be non-negative, got {self.x0_gt_weight}")
+        if not 0.0 <= self.terminal_rung_frac <= 1.0:
+            raise ValueError(
+                f"terminal_rung_frac must be in [0, 1], got {self.terminal_rung_frac}"
+            )
+        if self.terminal_rung_frac > 0.0 and self.teacher_source != "cached_full":
+            raise ValueError(
+                "terminal_rung_frac only applies to the cached-rollout rung sampler; "
+                "set teacher_source='cached_full'"
+            )
         if self.x0_teacher_weight < 0:
             raise ValueError(
                 f"x0_teacher_weight must be non-negative, got {self.x0_teacher_weight}"
@@ -279,13 +290,15 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
             else f"{self._teacher_num_layers}-layer online expert"
         )
         logger.warning(
-            "[cd] M=%d cd_w=%.3g x0_teacher_w=%.3g x0_gt_w=%.3g metric=%s "
+            "[cd] M=%d cd_w=%.3g x0_teacher_w=%.3g x0_gt_w=%.3g term_frac=%.3g metric=%s "
             "student=%d/%d active teacher=%s",
             self.m_rungs, self.cd_weight, self.x0_teacher_weight, self.x0_gt_weight,
-            self.cd_metric, n_active, len(self.expert.layers), teacher_label,
+            self.terminal_rung_frac, self.cd_metric, n_active, len(self.expert.layers),
+            teacher_label,
         )
         print(f"[cd] M={self.m_rungs} cd_w={self.cd_weight} "
               f"x0_teacher_w={self.x0_teacher_weight} x0_gt_w={self.x0_gt_weight} "
+              f"term_frac={self.terminal_rung_frac} "
               f"metric={self.cd_metric} student={n_active}/{len(self.expert.layers)} active "
               f"skipped={list(self._student_prune_layers)}; "
               f"teacher={teacher_label}", flush=True)
@@ -618,6 +631,7 @@ class ConsistencyExpertVLA(KaVaExpertTeacher):
                     sample_cached_teacher_transition(
                         states,
                         self.m_rungs,
+                        terminal_rung_frac=self.terminal_rung_frac,
                         generator=gen,
                     )
                 )

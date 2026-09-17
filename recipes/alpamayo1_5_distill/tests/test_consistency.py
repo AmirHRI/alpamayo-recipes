@@ -252,6 +252,46 @@ def test_endpoint_loss_is_uniform_in_tau_not_tau_squared():
     assert max(got) - min(got) < 1e-5 * max(got)
 
 
+def test_terminal_rung_frac_zero_is_bit_identical_to_no_argument():
+    """The default must not perturb the RNG stream, or every earlier run stops reproducing."""
+    states = torch.randn(64, 6, 11, T, C)
+    a = sample_cached_teacher_transition(
+        states, 10, generator=torch.Generator().manual_seed(3))
+    b = sample_cached_teacher_transition(
+        states, 10, terminal_rung_frac=0.0, generator=torch.Generator().manual_seed(3))
+    for x, y in zip(a, b):
+        torch.testing.assert_close(x, y)
+
+
+def test_terminal_rung_frac_raises_the_tau_one_mass():
+    """tau_hi == 1 is the ONLY rung a 1-NFE sampler evaluates; uniform gives it 1/m."""
+    states = torch.randn(4000, 2, 11, T, C)
+    seen = {}
+    for frac in (0.0, 0.5):
+        _, _, _, _, _, tau_hi = sample_cached_teacher_transition(
+            states, 10, terminal_rung_frac=frac, generator=torch.Generator().manual_seed(5))
+        seen[frac] = float((tau_hi.flatten() == 1.0).float().mean())
+    assert 0.07 < seen[0.0] < 0.13, seen           # ~1/m
+    assert 0.50 < seen[0.5] < 0.60, seen           # frac + (1-frac)/m = 0.55
+    # ...and the forced rung really is the pure-noise state, not just a relabelled tau.
+    _, k, x_hi, _, _, tau_hi = sample_cached_teacher_transition(
+        states, 10, terminal_rung_frac=1.0, generator=torch.Generator().manual_seed(6))
+    assert bool((tau_hi.flatten() == 1.0).all())
+    rows = torch.arange(states.shape[0])
+    torch.testing.assert_close(x_hi, states[rows, k, 0])
+
+
+def test_terminal_rung_frac_rejects_out_of_range():
+    states = torch.randn(2, 2, 11, T, C)
+    for bad in (-0.1, 1.5):
+        try:
+            sample_cached_teacher_transition(states, 10, terminal_rung_frac=bad)
+        except ValueError as ex:
+            assert "terminal_rung_frac" in str(ex)
+        else:
+            raise AssertionError(f"terminal_rung_frac={bad} must be rejected")
+
+
 def test_cached_teacher_transition_rejects_wrong_grid():
     states = torch.randn(2, 3, 11, T, C)
     try:
