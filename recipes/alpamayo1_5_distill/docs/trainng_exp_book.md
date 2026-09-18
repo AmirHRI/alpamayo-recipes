@@ -60,7 +60,7 @@ All included KD runs have **CE=0, logit-KD=0, direct-KV=0, block-output weight=1
 | K10 | `output_kd_4b_nav4bspan4camallfc_m1-9-18-36_framecache4cam1080p_lcdrive` | T110 / 0123 | 4 / 13752 | 4B; same curriculum, four cameras |
 | K11 | `output_kd_4b_nav4bspanmix2camallfc_m1-9-18-36mix_w1.0_framecache1080p_lcdrive` | T110 / 13 | 4 / 13752 | 4B; fixed span 1 plus scheduled span-mix 1,9,18,36, mix weight 1 |
 
-**K04 provenance correction:** its root configuration was overwritten by later navigation/span-mix probes. The completed checkpoint belongs to the earlier three-epoch, no-route run. Use the [original training config](recipes/alpamayo1_5_distill/outputs/2026-08-17/18-24-24/.hydra/config.yaml) and [original evaluation config](recipes/alpamayo1_5_distill/outputs/2026-08-19/10-17-48/.hydra/config.yaml), not the newer root config, to describe it.
+**K04 provenance correction:** its root configuration was overwritten by later navigation/span-mix probes. The completed checkpoint belongs to the earlier three-epoch, no-route run. Use the [original training config](../outputs/2026-08-17/18-24-24/.hydra/config.yaml) and [original evaluation config](../outputs/2026-08-19/10-17-48/.hydra/config.yaml), not the newer root config, to describe it.
 
 ### EoS and VLM Cotraining
 
@@ -316,10 +316,10 @@ Exact sweep provenance (all student/expert checkpoints are step 6876, epoch 2):
 
 | Eval rows | Config | Existing log under R |
 |---|---|---|
-| V161-V163 | [2B student-conditioned sweep](recipes/alpamayo1_5_distill/outputs/2026-09-09/18-01-42/.hydra/config.yaml) | `stepsweep/nav_cd_span2b_e2_studentvlm_0909-1801.log` |
-| V164-V166 | [4B expert with teacher VLM](recipes/alpamayo1_5_distill/outputs/2026-09-09/10-49-47/.hydra/config.yaml) | `stepsweep/nav_cd_span4b_e2_0909-1049.log` |
-| V167-V169 | [4B student-conditioned sweep](recipes/alpamayo1_5_distill/outputs/2026-09-09/17-55-59/.hydra/config.yaml) | `stepsweep/nav_cd_span4b_e2_studentvlm_0909-1755.log` |
-| V170 | [Teacher two-step sweep](recipes/alpamayo1_5_distill/outputs/2026-09-10/14-03-03/.hydra/config.yaml) | `stepsweep/teachernav_0910-1402.log` |
+| V161-V163 | [2B student-conditioned sweep](../outputs/2026-09-09/18-01-42/.hydra/config.yaml) | `stepsweep/nav_cd_span2b_e2_studentvlm_0909-1801.log` |
+| V164-V166 | [4B expert with teacher VLM](../outputs/2026-09-09/10-49-47/.hydra/config.yaml) | `stepsweep/nav_cd_span4b_e2_0909-1049.log` |
+| V167-V169 | [4B student-conditioned sweep](../outputs/2026-09-09/17-55-59/.hydra/config.yaml) | `stepsweep/nav_cd_span4b_e2_studentvlm_0909-1755.log` |
+| V170 | [Teacher two-step sweep](../outputs/2026-09-10/14-03-03/.hydra/config.yaml) | `stepsweep/teachernav_0910-1402.log` |
 | V171-V174 | No corresponding original config/log recovered; exact dataset, cameras, and stripping unknown | JSON/NPZ only; Euler-step counts confirmed by embedded archive descriptions |
 
 The earlier 4B sweep launch at 10:46 used a different manifest and failed; the successful 10:49 config and completed result files are the provenance used here. The 2B sweep's config specifies a historical Cosmos-Reason2-2B base path with the C04 VLM checkpoint and layer mixer; retain that config when reproducing the old harness, rather than silently replacing it with a current launcher.

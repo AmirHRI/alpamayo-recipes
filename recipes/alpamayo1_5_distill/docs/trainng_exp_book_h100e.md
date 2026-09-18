@@ -14,7 +14,7 @@ Local artifact audit, 2026-09-17. Metrics recomputed from saved per-clip JSON, n
 - A retained checkpoint supplies the epoch. If deleted, estimate it from a retained step/epoch ratio and flag the CSV row. This estimate assumes unchanged steps per epoch.
 - ADE and minADE are metres, lower is better. Different heads, cameras, expert depth, annotation timing, prompt flags, or NFE are separate protocols, not clean loss-only comparisons.
 - NFE is the number of denoising steps. Token-head rows have no NFE. Expert rows without an explicit override use the documented 10-step default, marked in the CSV.
-- Navigation annotations use GT future direction (`--horizon-start 0` in the recorded study). These are annotation-conditioned, potentially label-leaking evaluations, not leak-free planner-route results. See [NAVTEXT_SAMPLING.md](../NAVTEXT_SAMPLING.md#12-comparability-and-the-label-leak).
+- Navigation annotations use GT future direction (`--horizon-start 0` in the recorded study). These are annotation-conditioned, potentially label-leaking evaluations, not leak-free planner-route results. See [NAVTEXT_SAMPLING.md](../archive/NAVTEXT_SAMPLING.md).
 - Repeated evaluation filenames/trajectory-export reruns are retained as separate artifacts, not independent seeds. Shared clip IDs do not imply shared timestamps or prompts.
 - The KAVA directory was reused: checkpoint-7191 belongs to a historical three-epoch run; checkpoint-2397 belongs to the later one-epoch rerun. An `e3_` evaluation filename does not prove three epochs.
 - Raw configs/logs can disagree. Completed training logs take precedence where recovered; CSV source columns identify the evidence. Five trained-model sweep protocols use a sibling config with checkpoint identity verified in the launch log. Two teacher camera references lack recoverable dataset configs and are explicitly marked unknown.
@@ -359,7 +359,7 @@ No local training dataset is asserted for released teacher weights. These refere
 ## Exclusions And Evidence Gaps
 
 - Original root configs and logs are untouched. Full exclusions remain in the CSVs with status/reason, but are omitted from the study tables above.
-- Historical pre-fix runs are retained as history, not certified as clean experiments. In particular, use the `clean_maskfix` navigation runs as the fixed baseline and consult [COMPARE_EVAL.md](../COMPARE_EVAL.md) for protocol retractions.
+- Historical pre-fix runs are retained as history, not certified as clean experiments. In particular, use the `clean_maskfix` navigation runs as the fixed baseline and consult [COMPARE_EVAL.md](../archive/COMPARE_EVAL.md) for protocol retractions.
 - `structinit_*` files are post-training weight-edit diagnostics, not separately completed training runs.
 
 | Excluded training directory | Observed epoch | Reason |
@@ -416,11 +416,14 @@ No local training dataset is asserted for released teacher weights. These refere
 
 ## Files And Regeneration
 
-- [training_runs.csv](training_runs.csv): one record per retained or excluded training history.
-- [evaluations.csv](evaluations.csv): all discovered per-clip evaluations, including exclusions and source paths.
-- [audit_issues.json](audit_issues.json): malformed/unreadable evidence.
+The original inventory references the following audit sidecars, which are not
+included in this checkout:
 
-- [completed_log_audit.csv](completed_log_audit.csv): completion-log coverage, including smoke jobs reporting >1 epoch.
+- `training_runs.csv`: one record per retained or excluded training history.
+- `evaluations.csv`: all discovered per-clip evaluations, including exclusions and source paths.
+- `audit_issues.json`: malformed/unreadable evidence.
+
+- `completed_log_audit.csv`: completion-log coverage, including smoke jobs reporting >1 epoch.
 
 From the repository root:
 

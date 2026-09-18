@@ -34,6 +34,8 @@ removed.
    and one-step evaluation commands.
 3. **Compare saved metrics:** [NPZ metrics notebook](notebooks/npz_metrics_comparison.ipynb).
    It loads saved trajectories without loading models or using a GPU.
+4. **Resources and methods:** [Resources and Training](docs/RESOURCES_AND_TRAINING.md),
+   covering data provenance, licenses, final-run hyperparameters, and loss equations.
 
 ## Final Models
 
