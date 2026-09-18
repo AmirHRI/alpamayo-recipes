@@ -18,18 +18,34 @@ ANNOTATIONS="$MANIFEST_DIR/nav_lcdrive_val_available_fixedt0_23331_stripped.json
 CLIP_LIST="$MANIFEST_DIR/lcdrive_val_available_23331_clip_uuids.txt"
 NFE=${NFE:-1}
 ARM=${ARM:-cm}
+TEACHER=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
 [[ "$NFE" =~ ^[1-9][0-9]*$ ]] || { echo "NFE must be a positive integer" >&2; exit 1; }
-[[ "$ARM" == "cm" || "$ARM" == "eos" ]] || { echo "ARM must be cm or eos" >&2; exit 1; }
+[[ "$ARM" == "cm" || "$ARM" == "eos" || "$ARM" == "kd" ]] || {
+    echo "ARM must be cm, eos or kd" >&2; exit 1; }
+# KD is the STITCHED control: the student VLM (+ the 2B's layer_mixer) comes from the KD
+# checkpoint, but the action expert is the TEACHER's frozen one -- a KD checkpoint has no
+# expert of its own. cm/eos trained an expert INTO their checkpoint, so for those the two
+# paths coincide; pointing the expert at a KD checkpoint would load 0 expert tensors and
+# score a randomly-initialised head. KD also finishes at epoch 4, not the cm/eos epoch 2.
+if [[ "$ARM" == "kd" ]]; then
+    CKPT_NAME=checkpoint-13752
+    EPOCH_TAG=ep4
+else
+    CKPT_NAME=checkpoint-6876
+    EPOCH_TAG=ep2
+fi
 MODEL_ARGS=()
 case "${MODEL:?Set MODEL=4b, MODEL=2b or MODEL=teacher}" in
     4b) RUN=output_cd_eos4b_consistency2to1_fp16_master32_2cam_nav
         if [[ "$ARM" == "eos" ]]; then RUN=output_eos_cotrain_4b_all36_lr1x_2cam_nav_framecache; fi
+        if [[ "$ARM" == "kd"  ]]; then RUN=output_kd_4b_nav4bspan2camallfc_m1-9-18-36_framecache1080p_lcdrive; fi
         CONFIG=sft_eval_eos_4b_2cam_nav_lcdrive
-        CKPT="$OUT/$RUN/checkpoint-6876" ;;
+        CKPT="$OUT/$RUN/$CKPT_NAME" ;;
     2b) RUN=output_cd_eos2bmix_all28_consistency2to1_fp16_master32_2cam_nav
         if [[ "$ARM" == "eos" ]]; then RUN=output_eos_cotrain_2bmix_all28_lr1x_nav_framecache; fi
+        if [[ "$ARM" == "kd"  ]]; then RUN=output_kd_2b_mixspan2bnavfc_m1-9-18-36_framecache1080p_lcdrive; fi
         CONFIG=sft_eval_eos_2b_mix_nav_lcdrive
-        CKPT="$OUT/$RUN/checkpoint-6876" ;;
+        CKPT="$OUT/$RUN/$CKPT_NAME" ;;
     teacher) CONFIG=sft_eval_eos_4b_2cam_nav_lcdrive
         CKPT=/temp/achahe/hf_cache/hub/models--nvidia--Alpamayo-1.5-10B-A1-format
         MODEL_ARGS=(
@@ -38,13 +54,17 @@ case "${MODEL:?Set MODEL=4b, MODEL=2b or MODEL=teacher}" in
         ) ;;
     *) echo "MODEL must be 4b, 2b or teacher" >&2; exit 1 ;;
 esac
-TAG="${ARM}${MODEL}_availableval23331_fixedt0_stripped_ep2_nfe${NFE}_${SLURM_JOB_ID}"
+# The expert the stitch reads. Identical to CKPT for cm/eos; the teacher for kd.
+EXPERT_CKPT="$CKPT"
+[[ "$ARM" == "kd" ]] && EXPERT_CKPT="$TEACHER"
+TAG="${ARM}${MODEL}_availableval23331_fixedt0_stripped_${EPOCH_TAG}_nfe${NFE}_${SLURM_JOB_ID}"
 if [[ "$MODEL" == "teacher" ]]; then
     TAG="teacher15_availableval23331_fixedt0_stripped_nfe${NFE}_${SLURM_JOB_ID}"
 fi
-[[ -f "$CKPT/model.safetensors.index.json" && -f "$ANNOTATIONS" ]] || {
-    echo "Missing checkpoint or prepared full validation manifest" >&2; exit 1;
-}
+[[ -f "$CKPT/model.safetensors.index.json" || -f "$CKPT/model.safetensors" ]] || {
+    echo "Missing checkpoint weights under $CKPT" >&2; exit 1; }
+[[ -f "$ANNOTATIONS" ]] || {
+    echo "Missing prepared full validation manifest $ANNOTATIONS" >&2; exit 1; }
 export PYTHONPATH="$REPO/recipes:$REPO/src"
 export HF_HOME=/temp/achahe/hf_cache
 export HF_HUB_OFFLINE=1
@@ -63,12 +83,13 @@ assert all(row["nav_text"] in {"Continue straight", "Turn left", "Turn right", "
 print("Preflight: 23,331 available validation clips; 427 missing-index clips excluded; t0=5.1s, distance-free navigation")
 PY
 cd "$REPO/recipes/alpamayo1_5_distill"
-echo "[fullval] MODEL=$MODEL ARM=$ARM VLM/expert/mixer checkpoint=$CKPT NFE=$NFE cameras=[1,3]"
+echo "[fullval] MODEL=$MODEL ARM=$ARM student checkpoint=$CKPT NFE=$NFE cameras=[1,3]"
+echo "[fullval] action expert from=$EXPERT_CKPT"
 echo "[fullval] output=$OUT/$TAG.npz"
 srun "$VENV/torchrun" --nproc_per_node=1 --master_port="$((29900 + SLURM_JOB_ID % 20000))" \
     -m alpamayo1_5_sft.evaluate_hf \
     --config-path pkg://alpamayo1_5_distill/configs --config-name "$CONFIG" \
-    "++evaluate.eval_ckpt=$CKPT" "++model.teacher_checkpoint_path=$CKPT" \
+    "++evaluate.eval_ckpt=$CKPT" "++model.teacher_checkpoint_path=$EXPERT_CKPT" \
     "++data.val_dataset.annotations_path=$ANNOTATIONS" \
     "++data.val_dataset.clip_uuid_filter=$CLIP_LIST" \
     ++data.val_dataset.chunk_ids=0-3146 ++data.val_dataset.strip_nav_turn_distance=true \
