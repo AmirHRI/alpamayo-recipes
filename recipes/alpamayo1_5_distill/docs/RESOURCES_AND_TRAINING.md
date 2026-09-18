@@ -225,6 +225,8 @@ sum over the action horizon or hidden width.
 
 ### 1. Knowledge Distillation: Expert Block/Span Matching
 
+![Stage 1: distill the student VLM and optional 2B KV mixer using frozen-expert block/span matching.](pipeline_digrams/stage1_kd_block_span_matching.png)
+
 The teacher VLM and action expert are frozen. The student is trained to produce
 a cache that drives that same expert similarly to the teacher cache. Teacher
 and student receive matching prompt inputs; supervision is through expert
@@ -293,6 +295,8 @@ gain. The expert is not pruned. See [KD implementation](../models/kd_model.py),
 
 ### 2. VLM and Action-Expert Cotraining: GT Flow Matching
 
+![Stage 2: jointly train the VLM text layers and full action expert with ground-truth flow matching.](pipeline_digrams/stage2_action_expert_alignment_gt_flow_matching.png)
+
 Initialize the student from its epoch-4 KD checkpoint and the expert from the
 released Alpamayo weights. Train all VLM **text layers** (2B: 0-27; 4B: 0-35),
 the expert, and action input/output projections jointly. Vision, embeddings,
@@ -322,6 +326,8 @@ though the configs use `cotrain_vlm=false`: the explicit
 [the stitched model](../models/stitched_model.py).
 
 ### 3. Consistency Training: Two-Step EoS to One Step
+
+![Stage 3: distill a frozen two-step EoS teacher into a one-step action expert using an EMA consistency target.](pipeline_digrams/stage3_consistency_two_step_to_one_step_renamed.png)
 
 Initialize from each model's own epoch-2 EoS checkpoint. Freeze its VLM and 2B
 mixer. Let $\phi$ be a fixed copy of that EoS expert, $\theta$ the trainable

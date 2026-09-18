@@ -57,6 +57,8 @@ camera/frame labels, and `strip_nav_turn_distance=true`.
 
 ## 1. KD: Block/Span Matching
 
+![Stage 1: distill the student VLM and optional 2B KV mixer using frozen-expert block/span matching.](pipeline_digrams/stage1_kd_block_span_matching.png)
+
 The teacher runs online. The student learns to supply a cache that reproduces
 the frozen teacher expert's block/span outputs. Spans grow **1 -> 9 -> 18 -> 36**,
 one per epoch; CE, logit KD, and elementwise KV losses are disabled. The 2B also
@@ -102,6 +104,8 @@ its existing run directory by default; do not reuse another experiment's path.
 
 ## 2. Cotrain EoS: Adapt the VLM and Expert
 
+![Stage 2: jointly train the VLM text layers and full action expert with ground-truth flow matching.](pipeline_digrams/stage2_action_expert_alignment_gt_flow_matching.png)
+
 Initialize from KD plus the released action expert. Train all **text layers**
 (4B: `0-35`; 2B: `0-27`) and the expert with GT flow matching. The vision encoder,
 embeddings, LM head, and 2B mixer remain frozen; gradients still pass through the
@@ -131,6 +135,8 @@ Then run the full two epochs at LR `2e-5`, warmup 430, effective batch 32.
 The expected final checkpoint is `checkpoint-6876`.
 
 ## 3. Consistency: Two Steps to One
+
+![Stage 3: distill a frozen two-step EoS teacher into a one-step action expert using an EMA consistency target.](pipeline_digrams/stage3_consistency_two_step_to_one_step_renamed.png)
 
 Initialize each run from **its own cotrained EoS checkpoint**. Freeze the VLM and
 2B mixer. A frozen copy of the EoS expert generates the actual two-step Euler path
